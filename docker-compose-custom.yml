@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.custom
-    container_name: codechat
+    container_name: codechat-rc-9
     restart: unless-stopped
     volumes:
       - instances_connecteds:/codechat/instances
