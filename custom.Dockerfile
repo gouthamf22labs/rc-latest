@@ -1,0 +1,63 @@
+# Use a slim Node.js base image for building
+FROM node:20-bullseye-slim AS base
+
+# Install Git and other dependencies
+RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+
+# Set the working directory
+WORKDIR /codechat
+
+# Copy package.json and package-lock.json files
+COPY package*.json ./
+
+# Install dependencies
+RUN npm install --force
+
+# Copy the remaining application files
+COPY tsconfig.json .
+COPY ./src ./src
+COPY ./public ./public
+COPY ./docs ./docs
+COPY ./prisma ./prisma
+COPY ./views ./views
+COPY .env.dev .env
+
+# Environment variables will be loaded from .env file
+
+# Generate Prisma client
+RUN npx prisma generate
+
+# Build the application
+RUN npm run build
+
+# Use a slim Node.js base image for production
+FROM node:20-bullseye-slim AS production
+
+# Set the working directory
+WORKDIR /codechat
+
+# Copy built files and necessary directories from the builder stage
+COPY --from=base /codechat/dist ./dist
+COPY --from=base /codechat/docs ./docs
+COPY --from=base /codechat/prisma ./prisma
+COPY --from=base /codechat/views ./views
+COPY --from=base /codechat/node_modules ./node_modules
+COPY --from=base /codechat/package*.json ./
+COPY --from=base /codechat/.env ./
+COPY --from=base /codechat/public ./public
+COPY ./deploy_db.sh ./
+
+# Make the deploy_db.sh script executable
+RUN chmod +x ./deploy_db.sh
+
+# Create a directory for instances
+RUN mkdir instances
+
+# Environment variables will be loaded from .env file
+
+# Expose the application port
+EXPOSE 8084
+
+# Define the entrypoint
+
+ENTRYPOINT [ "/bin/bash", "-c", ". ./deploy_db.sh && node ./dist/src/main" ]
