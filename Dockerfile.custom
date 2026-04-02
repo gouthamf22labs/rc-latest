@@ -21,6 +21,7 @@ COPY ./docs ./docs
 COPY ./prisma ./prisma
 COPY ./views ./views
 COPY .env.dev .env
+COPY prisma.config.mjs .
 
 # Environment variables will be loaded from .env file
 
@@ -44,6 +45,7 @@ COPY --from=base /codechat/views ./views
 COPY --from=base /codechat/node_modules ./node_modules
 COPY --from=base /codechat/package*.json ./
 COPY --from=base /codechat/.env ./
+COPY --from=base /codechat/prisma.config.mjs ./
 COPY --from=base /codechat/public ./public
 COPY ./deploy_db.sh ./
 
