@@ -1928,6 +1928,15 @@ export class WAStartupService {
     return await this.sendMessageWithTyping(data.number, { ...message }, data?.options);
   }
 
+  public async fetchAllGroups() {
+    try {
+      const groups = await this.client.groupFetchAllParticipating();
+      return Object.values(groups);
+    } catch (error) {
+      throw new BadRequestException('Error fetching groups', error.toString());
+    }
+  }
+
   public async reactionMessage(data: SendReactionDto) {
     return await this.sendMessageWithTyping<AnyMessageContent>(
       data.reactionMessage.key.remoteJid,
