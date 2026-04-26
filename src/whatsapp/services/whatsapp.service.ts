@@ -1931,9 +1931,16 @@ export class WAStartupService {
   public async fetchAllGroups() {
     try {
       const groups = await this.client.groupFetchAllParticipating();
-      return Object.values(groups);
+      return Object.values(groups).filter((g) => g?.id);
     } catch (error) {
-      throw new BadRequestException('Error fetching groups', error.toString());
+      // groupFetchAllParticipating can fail when a deleted group remains in the Baileys
+      // socket's in-memory state. Return empty list instead of 500 so the caller is not
+      // blocked — the stale state clears itself on the next reconnect.
+      this.logger.warn(
+        'fetchAllGroups: groupFetchAllParticipating failed (stale deleted group in socket state?): ' +
+          error.toString(),
+      );
+      return [];
     }
   }
 
