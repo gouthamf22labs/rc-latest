@@ -1,0 +1,20 @@
+diff --git a/node_modules/@whiskeysockets/baileys/lib/Socket/groups.js b/node_modules/@whiskeysockets/baileys/lib/Socket/groups.js
+index 5853648..80c64ca 100644
+--- a/node_modules/@whiskeysockets/baileys/lib/Socket/groups.js
++++ b/node_modules/@whiskeysockets/baileys/lib/Socket/groups.js
+@@ -60,8 +60,13 @@ export const makeGroupsSocket = (config) => {
+         if (attrs.type !== 'groups') {
+             return;
+         }
+-        await groupFetchAllParticipating();
+-        await sock.cleanDirtyBits('groups');
++        try {
++            await groupFetchAllParticipating();
++            await sock.cleanDirtyBits('groups');
++        } catch (err) {
++            // groupFetchAllParticipating throws when a deleted/stale group is in the
++            // socket state; swallow here so the WS handler does not crash the socket
++        }
+     });
+     return {
+         ...sock,
