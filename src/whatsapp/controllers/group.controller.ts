@@ -86,6 +86,10 @@ export class GroupController {
     return await this.waMonitor.waInstances.get(instanceName).updateGParticipant(update);
   }
 
+  public async fetchAllGroups({ instanceName }: InstanceDto) {
+    return await this.waMonitor.waInstances.get(instanceName).fetchAllGroups();
+  }
+
   public async leaveGroup({ instanceName }: InstanceDto, groupJid: GroupJid) {
     return await this.waMonitor.waInstances.get(instanceName).leaveGroup(groupJid);
   }

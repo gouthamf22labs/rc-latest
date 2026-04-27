@@ -1690,7 +1690,7 @@ export class WAStartupService {
           responseType: 'arraybuffer',
         });
 
-        mimetype = response.headers['content-type'];
+        mimetype = response.headers['content-type'] as string;
         if (!ext) {
           ext = mime.extension(mimetype) as string;
         }
@@ -1926,6 +1926,22 @@ export class WAStartupService {
     }
 
     return await this.sendMessageWithTyping(data.number, { ...message }, data?.options);
+  }
+
+  public async fetchAllGroups() {
+    try {
+      const groups = await this.client.groupFetchAllParticipating();
+      return Object.values(groups).filter((g) => g?.id);
+    } catch (error) {
+      // groupFetchAllParticipating can fail when a deleted group remains in the Baileys
+      // socket's in-memory state. Return empty list instead of 500 so the caller is not
+      // blocked — the stale state clears itself on the next reconnect.
+      this.logger.warn(
+        'fetchAllGroups: groupFetchAllParticipating failed (stale deleted group in socket state?): ' +
+          error.toString(),
+      );
+      return [];
+    }
   }
 
   public async reactionMessage(data: SendReactionDto) {

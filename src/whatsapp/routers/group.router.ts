@@ -34,6 +34,7 @@
  * └──────────────────────────────────────────────────────────────────────────────┘
  */
 
+import compression from 'compression';
 import { RequestHandler, Router } from 'express';
 import {
   createGroupSchema,
@@ -50,6 +51,7 @@ import {
 import { HttpStatus } from '../../app.module';
 import { GroupController } from '../controllers/group.controller';
 import { routerPath, dataValidate, groupValidate } from '../../validate/router.validate';
+import { InstanceDto } from '../dto/instance.dto';
 
 export function GroupRouter(
   groupController: GroupController,
@@ -126,6 +128,15 @@ export function GroupRouter(
       });
 
       res.status(HttpStatus.CREATED).json(response);
+    })
+    .get(routerPath('fetchAllGroups'), ...guards, compression(), async (req, res) => {
+      const response = await dataValidate<InstanceDto>({
+        request: req,
+        schema: {},
+        execute: (instance) => groupController.fetchAllGroups(instance),
+      });
+
+      res.status(HttpStatus.OK).json(response);
     })
     .delete(routerPath('leaveGroup'), ...guards, async (req, res) => {
       const response = await groupValidate<GroupJid>({
