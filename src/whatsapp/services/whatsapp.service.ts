@@ -1530,9 +1530,17 @@ export class WAStartupService {
 
   // Send Message Controller
   public async textMessage(data: SendTextDto) {
+    let mentions: string[] | undefined;
+    if (data.textMessage.mentionAll) {
+      const groupId = this.createJid(data.number);
+      const meta = await this.client.groupMetadata(groupId);
+      mentions = meta.participants.map((p) => (p as any).phoneNumber ?? p.id);
+    } else {
+      mentions = data.textMessage.mentions?.map((m) => this.createJid(m));
+    }
     return await this.sendMessageWithTyping<AnyMessageContent>(
       data.number,
-      { text: data.textMessage.text },
+      { text: data.textMessage.text, mentions },
       data?.options,
     );
   }
@@ -1911,7 +1919,25 @@ export class WAStartupService {
   public async fetchAllGroups() {
     try {
       const groups = await this.client.groupFetchAllParticipating();
-      return Object.values(groups).filter((g) => g?.id);
+      const groupList = Object.values(groups).filter((g) => g?.id);
+
+      const contacts = await this.repository.contact.findMany({
+        where: { instanceId: this.instance.id },
+        select: { remoteJid: true, pushName: true },
+      });
+      const nameMap = new Map(contacts.map((c) => [c.remoteJid, c.pushName]));
+
+      return groupList.map((g) => ({
+        ...g,
+        participants: g.participants.map((p) => {
+          const jid = (p as any).phoneNumber ?? p.id;
+          const inMemory = (this.client as any).contacts?.[jid];
+          return {
+            ...p,
+            name: nameMap.get(jid) ?? inMemory?.name ?? inMemory?.notify ?? null,
+          };
+        }),
+      }));
     } catch (error) {
       // groupFetchAllParticipating can fail when a deleted group remains in the Baileys
       // socket's in-memory state. Return empty list instead of 500 so the caller is not

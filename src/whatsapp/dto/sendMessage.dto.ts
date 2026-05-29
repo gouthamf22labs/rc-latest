@@ -60,6 +60,8 @@ export class Metadata extends OptionsMessage {
 
 class TextMessage {
   text: string;
+  mentions?: string[];
+  mentionAll?: boolean;
 }
 export class SendTextDto extends Metadata {
   textMessage: TextMessage;
