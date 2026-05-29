@@ -9,6 +9,7 @@ WORKDIR /codechat
 
 # Copy package.json and package-lock.json files
 COPY package*.json ./
+COPY ./patches ./patches
 
 # Install dependencies
 RUN npm install --force

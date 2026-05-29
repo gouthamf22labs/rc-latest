@@ -187,7 +187,7 @@ export class WAMonitoringService {
           });
           if (files.length === 0) {
             rmSync(join(INSTANCE_DIR, dirent.name), { recursive: true, force: true });
-            break;
+            continue;
           }
 
           await set(dirent.name);
