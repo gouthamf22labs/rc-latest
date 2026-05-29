@@ -34,12 +34,10 @@
  * └──────────────────────────────────────────────────────────────────────────────┘
  */
 
-import axios, { Axios, AxiosError } from 'axios';
+import axios, { AxiosInstance } from 'axios';
 import { Auth, ConfigService, ProviderSession } from '../config/env.config';
 import { Logger } from '../config/logger.config';
 import { execSync } from 'child_process';
-import { writeFileSync } from 'fs';
-import { join } from 'path';
 
 type ResponseSuccess = { status: number; data?: any };
 type ResponseProvider = Promise<[ResponseSuccess?, Error?]>;
@@ -49,7 +47,7 @@ export class ProviderFiles {
 
   private readonly logger = new Logger(this.configService, ProviderFiles.name);
 
-  private _client: Axios;
+  private _client: AxiosInstance;
 
   public get client() {
     return this._client;
@@ -81,11 +79,7 @@ export class ProviderFiles {
           { headers: { apikey: globalApiToken } },
         );
       } catch (error) {
-        this.logger.error([
-          'Failed to connect to the file server',
-          error?.message,
-          error?.stack,
-        ]);
+        this.logger.error('Failed to connect to the file server', error);
         const pid = process.pid;
         execSync(`kill -9 ${pid}`);
       }

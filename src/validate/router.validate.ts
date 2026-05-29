@@ -50,7 +50,7 @@ class DataValidate<T> {
   execute: (instance: InstanceDto, data: T, file?: Express.Multer.File) => Promise<any>;
 }
 
-const logger = new Logger(new ConfigService(), 'Validate');
+const logger = new Logger(new ConfigService(), 'validate');
 
 export function routerPath(path: string, param = true) {
   let route = '/' + path;
@@ -67,7 +67,7 @@ export async function dataValidate<T>(args: DataValidate<T>) {
   const body = request.body ?? {};
   const instance = request.params as unknown as InstanceDto;
 
-  const isNotEmptyQuery = request?.query && Object.keys(request.query).length > 0;
+  const isNotEmptyQuery = Object.keys(request?.query ?? {}).length > 0;
 
   if (isNotEmptyQuery) {
     Object.assign(instance, request.query);
@@ -137,7 +137,7 @@ export async function groupValidate<T>(args: DataValidate<T>) {
         message,
       };
     });
-    logger.error([...message]);
+    logger.trace('', message);
     throw new BadRequestException(...message);
   }
 
