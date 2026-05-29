@@ -199,7 +199,12 @@ export class ConfigService {
         PREFIX: process.env?.PROVIDER_PREFIX,
       },
       LOG: {
-        LEVEL: (process.env?.LOG_LEVEL?.toLowerCase() as LogLevel) ?? 'debug',
+        LEVEL: (() => {
+          const raw = process.env?.LOG_LEVEL ?? 'debug';
+          // Handle legacy pipe-separated format: "error|warn|info|debug|log"
+          if (raw.includes('|')) return 'debug' as LogLevel;
+          return raw.toLowerCase() as LogLevel;
+        })(),
         COLOR: process.env?.LOG_COLOR === 'true',
       },
       INSTANCE_EXPIRATION_TIME:
