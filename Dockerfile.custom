@@ -1,5 +1,5 @@
 # Use a slim Node.js base image for building
-FROM node:20-bullseye-slim AS base
+FROM node:22-bullseye-slim AS base
 
 # Install Git and other dependencies
 RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
@@ -33,7 +33,7 @@ RUN npx prisma generate
 RUN npm run build
 
 # Use a slim Node.js base image for production
-FROM node:20-bullseye-slim AS production
+FROM node:22-bullseye-slim AS production
 
 # Set the working directory
 WORKDIR /codechat
