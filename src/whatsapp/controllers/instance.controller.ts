@@ -102,7 +102,7 @@ export class InstanceController {
     }
   }
 
-  public async connectToWhatsapp({ instanceName }: InstanceDto) {
+  public async connectToWhatsapp({ instanceName }: InstanceDto, res: Response) {
     const find = await this.repository.instance.findUnique({
       where: { name: instanceName },
     });
@@ -136,12 +136,15 @@ export class InstanceController {
       switch (state) {
         case 'close':
           await instance.connectToWhatsapp();
-          await delay(3000);
-          return instance.qrCode;
+          this.eventEmitter.once('qrcode.updated', (data: any) => {
+            res.status(HttpStatus.OK).json(data);
+          });
+          break;
         case 'connecting':
-          return instance.qrCode;
+          res.status(HttpStatus.OK).json(instance.qrCode);
+          break;
         default:
-          return info?.status;
+          res.status(HttpStatus.OK).json(info?.status);
       }
     } catch (error) {
       this.logger.error(error);
@@ -191,12 +194,12 @@ export class InstanceController {
         case 'close':
           await instance.setPhoneNumber(phoneNumber);
           await instance.connectToWhatsapp();
-          this.eventEmitter.once('code.connection', (data: { code: string }) => {
-            res.status(HttpStatus.OK).json(data);
+          this.eventEmitter.once('qrcode.updated', (data: { paringCode: string }) => {
+            res.status(HttpStatus.OK).json({ code: data?.paringCode });
           });
           break;
         case 'connecting':
-          res.status(HttpStatus.OK).json(instance.qrCode);
+          res.status(HttpStatus.OK).json({ code: instance.qrCode?.paringCode });
           break;
         default:
           res.status(HttpStatus.OK).json(info?.status || {});
@@ -302,5 +305,7 @@ export class InstanceController {
     req.session[instance.instanceName] = Buffer.from(JSON.stringify(token)).toString(
       'base64',
     );
+
+    return token;
   }
 }

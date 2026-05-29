@@ -63,6 +63,8 @@ import makeWASocket, {
   proto,
   useMultiFileAuthState,
   UserFacingSocketConfig,
+  USyncQuery,
+  USyncUser,
   WABrowserDescription,
   WACallEvent,
   WAConnectionState,
@@ -79,6 +81,7 @@ import {
   QrCode,
   ProviderSession,
   EnvProxy,
+  LogLevel,
 } from '../../config/env.config';
 import { Logger } from '../../config/logger.config';
 import { INSTANCE_DIR, ROOT_DIR } from '../../config/path.config';
@@ -198,7 +201,7 @@ export class WAStartupService {
     );
   }
 
-  private readonly logger = new Logger(this.configService, WAStartupService.name);
+  private logger = new Logger(this.configService, 'wa-startup-service');
   private readonly instance: Partial<Instance> = {};
   private readonly webhook: Partial<Webhook> & { events?: WebhookEvents } = {};
   private readonly msgRetryCounterCache: CacheStore = new NodeCache();
@@ -238,7 +241,7 @@ export class WAStartupService {
       status: 'loaded',
     });
 
-    this.logger.subContext(`${i.id}:${i.name}`);
+    this.logger = this.logger.setCtx(`${i.id}:${i.name}`);
   }
 
   public get instanceName() {
@@ -337,8 +340,7 @@ export class WAStartupService {
       }
     } catch (error) {
       const axiosError = error as AxiosError;
-      const records = this.logger.error({
-        local: 'sendDataWebhook-local',
+      this.logger.error('sendDataWebhook-local', {
         message: axiosError?.message,
         hostName: error?.hostname,
         code: axiosError?.code,
@@ -346,12 +348,6 @@ export class WAStartupService {
         data: JSON.stringify(axiosError?.response?.data || {}),
         stack: error?.stack,
         name: error?.name,
-      });
-      this.repository.createLogs(this.instance.name, {
-        content: records,
-        type: 'error',
-        context: WAStartupService.name,
-        description: 'Error on send data to webhook',
       });
     }
 
@@ -370,8 +366,7 @@ export class WAStartupService {
       }
     } catch (error) {
       const axiosError = error as AxiosError;
-      const records = this.logger.error({
-        local: 'sendDataWebhook-global',
+      this.logger.error('sendDataWebhook-global', {
         message: axiosError?.message,
         hostName: error?.hostname,
         code: axiosError?.code,
@@ -379,12 +374,6 @@ export class WAStartupService {
         data: JSON.stringify(axiosError?.response?.data || {}),
         stack: error?.stack,
         name: error?.name,
-      });
-      this.repository.createLogs(this.instance.name, {
-        content: records,
-        type: 'error',
-        context: WAStartupService.name,
-        description: 'Error on send data to webhook',
       });
     }
 
@@ -437,34 +426,39 @@ export class WAStartupService {
         );
       }
 
-      qrcode.toDataURL(qr, optsQrcode, (error, base64) => {
+      let toQrcode = qr;
+      if (qr.startsWith('https://wa.me/settings/linked_devices#')) {
+        const values = qr.split('#');
+        toQrcode = values[1];
+      }
+
+      qrcode.toDataURL(toQrcode, optsQrcode, (error, base64) => {
         if (error) {
           this.logger.error('Qrcode generate failed:' + error.toString());
           return;
         }
 
-        this.instanceQr.base64 = base64;
         this.instanceQr.code = qr;
+        this.instanceQr.base64 = base64;
 
-        this.ws.send(this.instance.name, 'qrcode.updated', this.instanceQr);
+        this.ws.send(this.instance.name, 'qrcode.updated', { ...this.instanceQr });
 
         this.sendDataWebhook('qrcodeUpdated', {
           qrcode: { instance: this.instance.name, ...this.instanceQr },
         });
+
+        this.eventEmitter.emit('qrcode.updated', { ...this.instanceQr });
       });
 
-      qrcodeTerminal.generate(qr, { small: true }, (qrcode) =>
-        this.logger.log(
-          `\n${JSON.stringify(
-            {
-              instanceName: this.instance.name,
-              ...this.instanceQr,
-            },
-            null,
-            2,
-          )}\n` + qrcode,
-        ),
-      );
+      if (process.env.NODE_ENV === 'development') {
+        qrcodeTerminal.generate(qr, { small: true }, (display) => {
+          this.logger.info(`qrcode[${this.instanceName}]`, {
+            count: this.instanceQr.count,
+            paringCode: this.instanceQr?.paringCode,
+          });
+          console.log(display);
+        });
+      }
     }
 
     if (connection) {
@@ -513,12 +507,7 @@ export class WAStartupService {
         })
         .catch((err) => this.logger.error(err));
 
-      this.logger.info(
-        `
-        ┌──────────────────────────────┐
-        │    CONNECTED TO WHATSAPP     │
-        └──────────────────────────────┘`.replace(/^ +/gm, '  '),
-      );
+      this.logger.info('instance started');
     }
   }
 
@@ -561,7 +550,6 @@ export class WAStartupService {
     this.authState = await this.defineAuthState();
 
     const { version } = fetchLatestBaileysVersionV2();
-    console.log({ version });
     const session = this.configService.get<ConfigSessionPhone>('CONFIG_SESSION_PHONE');
     const browser: WABrowserDescription = !this.phoneNumber
       ? [session.CLIENT, session.NAME, release()]
@@ -577,17 +565,20 @@ export class WAStartupService {
     const proxy = this.configService.get<EnvProxy>('PROXY');
     const agents = createProxyAgents(proxy?.WS, proxy?.FETCH);
 
+    const log = this.logger.log.child({ context: 'baileys' });
+    log.level = this.configService.get<LogLevel>('BAILEYS_LOG_LEVEL');
+
     const socketConfig: UserFacingSocketConfig = {
       auth: {
         creds: this.authState.state.creds,
         keys: makeCacheableSignalKeyStore(
           this.authState.state.keys,
-          P({ level: 'silent' }) as any,
+          log.child({ 'auth-creds': true }),
         ),
       },
       agent: agents?.wsAgent,
       fetchAgent: agents?.fetchAgent,
-      logger: P({ level: 'silent' }) as any,
+      logger: log,
       browser,
       version,
       connectTimeoutMs: CONNECTION_TIMEOUT * 1000,
@@ -1057,17 +1048,7 @@ export class WAStartupService {
               messageRaw.content['mediaUrl'] = await getObjectUrl(created.fileName);
             }
           } catch (error) {
-            this.logger.error([
-              'Error on upload file to s3',
-              error?.message,
-              error?.stack,
-            ]);
-            this.repository.createLogs(this.instance.name, {
-              content: [error?.message, JSON.stringify(error?.stack ?? {})],
-              type: 'error',
-              context: WAStartupService.name,
-              description: 'Error on upload file to s3',
-            });
+            this.logger.error(error, { desc: 'Error on upload file to s3' });
           }
         }
 
@@ -1091,8 +1072,7 @@ export class WAStartupService {
         this.ws.send(this.instance.name, 'messages.upsert', messageRaw);
         await this.sendDataWebhook('messagesUpsert', messageRaw);
 
-        this.logger.log('Type: ' + type);
-        console.log(messageRaw);
+        this.logger.trace(`type[${type}] - received`, messageRaw);
       }
     },
 
@@ -1402,7 +1382,7 @@ export class WAStartupService {
       throw new BadRequestException(isWA);
     }
 
-    const recipient = isJidGroup(jid) ? jid : isWA.jid;
+    const recipient = isJidGroup(jid) ? jid : isLidUser(jid) ? jid : isWA.jid;
 
     if (isJidGroup(recipient)) {
       try {
@@ -2024,26 +2004,55 @@ export class WAStartupService {
     for await (const number of data.numbers) {
       const jid = this.createJid(number);
       if (isLidUser(jid)) {
-        onWhatsapp.push(new OnWhatsAppDto(jid, true, jid));
+        onWhatsapp.push(new OnWhatsAppDto(true, '', jid));
       }
       if (isJidGroup(jid)) {
         const group = await this.findGroup({ groupJid: jid }, 'inner');
-        onWhatsapp.push(new OnWhatsAppDto(group.id, !!group?.id, '', group?.subject));
+        onWhatsapp.push(new OnWhatsAppDto(!!group?.id, group.id, '', group?.subject));
       } else if (jid.includes('@broadcast')) {
-        onWhatsapp.push(new OnWhatsAppDto(jid, true));
+        onWhatsapp.push(new OnWhatsAppDto(true, jid));
       } else {
         try {
           const result = (await this.client.onWhatsApp(jid))[0];
-          onWhatsapp.push(
-            new OnWhatsAppDto(result.jid, !!result.exists, result?.['lid'] as string),
-          );
+
+          let lid: string | undefined;
+          if (result?.exists) {
+            const item = (await this.getLid(result.jid))[0];
+            lid = item?.lid;
+          }
+          onWhatsapp.push(new OnWhatsAppDto(!!result.exists, result.jid, lid));
         } catch (error) {
-          onWhatsapp.push(new OnWhatsAppDto(number, false));
+          onWhatsapp.push(new OnWhatsAppDto(false, number));
         }
       }
     }
 
     return onWhatsapp;
+  }
+
+  public async getLid(...jids: string[]): Promise<{ id: string; lid: string }[]> {
+    const q = new USyncQuery().withLIDProtocol().withContext('background');
+
+    for (const jid of jids) {
+      if (isLidUser(jid)) {
+        continue;
+      }
+
+      q.withUser(new USyncUser().withId(jid));
+    }
+
+    if (q.users.length === 0) {
+      return [];
+    }
+
+    const results = await this.client.executeUSyncQuery(q);
+    if (results) {
+      return results.list
+        .filter((i) => !!i?.lid)
+        .map(({ lid, id }) => ({ lid, id }) as { id: string; lid: string });
+    }
+
+    return [];
   }
 
   /**

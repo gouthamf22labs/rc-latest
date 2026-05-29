@@ -57,13 +57,11 @@ export function InstanceRouter(
       res.status(HttpStatus.CREATED).json(response);
     })
     .get(routerPath('connect'), ...guards, async (req, res) => {
-      const response = await dataValidate<InstanceDto>({
+      await dataValidate<InstanceDto>({
         request: req,
         schema: instanceNameSchema,
-        execute: (instance) => instanceController.connectToWhatsapp(instance),
+        execute: (instance) => instanceController.connectToWhatsapp(instance, res),
       });
-
-      res.status(HttpStatus.OK).json(response);
     })
     .get(routerPath('connect') + '/code/:phoneNumber', async (req, res) => {
       await dataValidate<InstanceDto>({
