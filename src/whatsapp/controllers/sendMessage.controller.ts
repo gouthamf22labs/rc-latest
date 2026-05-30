@@ -42,10 +42,14 @@ import {
   MediaFileDto,
   SendAudioDto,
   SendContactDto,
+  SendEventDto,
   SendLinkDto,
   SendLocationDto,
   SendMediaDto,
+  SendPollDto,
+  SendQuizDto,
   SendReactionDto,
+  SendStickerDto,
   SendTextDto,
 } from '../dto/sendMessage.dto';
 import { WAMonitoringService } from '../services/monitor.service';
@@ -144,5 +148,33 @@ export class SendMessageController {
 
   public async sendLinkPreview({ instanceName }: InstanceDto, data: SendLinkDto) {
     return await this.waMonitor.waInstances.get(instanceName).linkMessage(data);
+  }
+
+  public async sendPoll({ instanceName }: InstanceDto, data: SendPollDto) {
+    if (
+      data.pollMessage.selectableCount !== undefined &&
+      data.pollMessage.selectableCount > data.pollMessage.values.length
+    ) {
+      throw new BadRequestException('selectableCount cannot exceed the number of values');
+    }
+    return await this.waMonitor.waInstances.get(instanceName).pollMessage(data);
+  }
+
+  public async sendQuiz({ instanceName }: InstanceDto, data: SendQuizDto) {
+    if (!data.quizMessage.values.includes(data.quizMessage.correctAnswer)) {
+      throw new BadRequestException('correctAnswer must exactly match one of the provided values');
+    }
+    return await this.waMonitor.waInstances.get(instanceName).quizMessage(data);
+  }
+
+  public async sendSticker({ instanceName }: InstanceDto, data: SendStickerDto) {
+    if (!isURL(data.stickerMessage.sticker, { protocols: ['http', 'https'] })) {
+      throw new BadRequestException('Sticker must be a valid http/https URL');
+    }
+    return await this.waMonitor.waInstances.get(instanceName).stickerMessage(data);
+  }
+
+  public async sendEvent({ instanceName }: InstanceDto, data: SendEventDto) {
+    return await this.waMonitor.waInstances.get(instanceName).eventMessage(data);
   }
 }

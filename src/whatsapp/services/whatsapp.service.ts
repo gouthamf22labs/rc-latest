@@ -55,6 +55,7 @@ import makeWASocket, {
   GroupMetadata,
   GroupParticipant,
   isJidGroup,
+  isJidNewsletter,
   isLidUser,
   makeCacheableSignalKeyStore,
   MessageUpsertType,
@@ -101,10 +102,14 @@ import {
   Options,
   SendAudioDto,
   SendContactDto,
+  SendEventDto,
   SendLinkDto,
   SendLocationDto,
   SendMediaDto,
+  SendPollDto,
+  SendQuizDto,
   SendReactionDto,
+  SendStickerDto,
   SendTextDto,
 } from '../dto/sendMessage.dto';
 import { isArray, isBase64, isInt, isNotEmpty, isURL } from 'class-validator';
@@ -153,6 +158,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'fs';
+import { randomBytes } from 'crypto';
 import { createProxyAgents } from '../../utils/proxy';
 import { fetchLatestBaileysVersionV2 } from '../../utils/wa-version';
 import { getJidUser, getUserGroup } from '../../utils/extract-id';
@@ -1429,7 +1435,7 @@ export class WAStartupService {
 
         const messageId = options?.messageId || ulid(Date.now());
 
-        if (message?.['react'] || message?.['edit'] || message?.['text']) {
+        if (message?.['react'] || message?.['edit'] || message?.['text'] || message?.['poll']) {
           m = await this.client.sendMessage(recipient, message as AnyMessageContent, {
             quoted: q,
             messageId,
@@ -1442,7 +1448,24 @@ export class WAStartupService {
             quoted: q,
           });
 
-          const id = await this.client.relayMessage(recipient, m.message, { messageId });
+          // Polls and events need a meta node in the wire stanza.
+          // client.sendMessage adds these automatically; we must inject them manually
+          // when building proto directly and calling relayMessage.
+          const isPollProto =
+            message?.['pollCreationMessage'] ||
+            message?.['pollCreationMessageV2'] ||
+            message?.['pollCreationMessageV3'];
+
+          const additionalNodes = isPollProto
+            ? [{ tag: 'meta' as const, attrs: { polltype: 'creation' }, content: undefined }]
+            : message?.['eventMessage']
+              ? [{ tag: 'meta' as const, attrs: { event_type: 'creation' }, content: undefined }]
+              : undefined;
+
+          const id = await this.client.relayMessage(recipient, m.message, {
+            messageId,
+            additionalNodes,
+          });
 
           m.key = {
             id: id,
@@ -1993,6 +2016,118 @@ export class WAStartupService {
         })(),
       },
     });
+  }
+
+  public async pollMessage(data: SendPollDto) {
+    const selectableCount = data.pollMessage.selectableCount ?? 0;
+
+    const pollData = {
+      name: data.pollMessage.name,
+      selectableOptionsCount: selectableCount,
+      options: data.pollMessage.values.map((v) => ({ optionName: v })),
+      pollType: proto.Message.PollType.POLL,
+      pollContentType: proto.Message.PollContentType.TEXT,
+    };
+
+    // selectableCount === 1 → single-select → V3; otherwise multi-select → V1
+    const pollKey = selectableCount === 1 ? 'pollCreationMessageV3' : 'pollCreationMessage';
+    const message: proto.IMessage = {
+      [pollKey]: pollData,
+      messageContextInfo: { messageSecret: randomBytes(32) },
+    };
+
+    return await this.sendMessageWithTyping(data.number, message, data?.options);
+  }
+
+  public async quizMessage(data: SendQuizDto) {
+    const jid = this.createJid(data.number);
+    if (!isJidNewsletter(jid)) {
+      throw new BadRequestException('Quiz can only be sent to channels (@newsletter)');
+    }
+
+    const message: proto.IMessage = {
+      pollCreationMessageV3: {
+        name: data.quizMessage.name,
+        selectableOptionsCount: 1,
+        options: data.quizMessage.values.map((v) => ({ optionName: v })),
+        pollType: proto.Message.PollType.QUIZ,
+        pollContentType: proto.Message.PollContentType.TEXT,
+        correctAnswer: { optionName: data.quizMessage.correctAnswer },
+      },
+      messageContextInfo: { messageSecret: randomBytes(32) },
+    };
+
+    return await this.sendMessageWithTyping(data.number, message, data?.options);
+  }
+
+  public async eventMessage(data: SendEventDto) {
+    const startDate = new Date(data.eventMessage.startDate);
+    if (isNaN(startDate.getTime())) {
+      throw new BadRequestException('Invalid startDate — must be a valid ISO date string');
+    }
+
+    const endDate = data.eventMessage.endDate ? new Date(data.eventMessage.endDate) : undefined;
+    if (endDate && isNaN(endDate.getTime())) {
+      throw new BadRequestException('Invalid endDate — must be a valid ISO date string');
+    }
+
+    const startTime = Math.floor(startDate.getTime() / 1000);
+
+    // When call type is provided, auto-generate the WhatsApp call link via the socket
+    let joinLink: string | undefined;
+    if (data.eventMessage.call) {
+      const prefix =
+        data.eventMessage.call === 'audio'
+          ? 'https://call.whatsapp.com/voice/'
+          : 'https://call.whatsapp.com/video/';
+      const token = await this.client.createCallLink(data.eventMessage.call, { startTime });
+      if (token) {
+        joinLink = prefix + token;
+      }
+    }
+
+    const location = data.eventMessage.location
+      ? { name: data.eventMessage.location }
+      : undefined;
+
+    // Build proto directly — hasReminder/reminderOffsetSec exist in the proto but are
+    // not exposed in Baileys' high-level EventMessageOptions
+    const message: proto.IMessage = {
+      eventMessage: {
+        name: data.eventMessage.name,
+        description: data.eventMessage.description,
+        startTime,
+        endTime: endDate ? Math.floor(endDate.getTime() / 1000) : undefined,
+        location,
+        joinLink,
+        isCanceled: data.eventMessage.isCancelled ?? false,
+        // isScheduleCall is only meaningful when a call link is generated
+        isScheduleCall: !!data.eventMessage.call,
+        // WA defaults: reminder ON at 1 hour, guests OFF
+        hasReminder: data.eventMessage.hasReminder ?? true,
+        reminderOffsetSec: data.eventMessage.reminderOffsetSec ?? 3600,
+        extraGuestsAllowed: data.eventMessage.extraGuestsAllowed ?? false,
+      },
+      messageContextInfo: {
+        messageSecret: randomBytes(32),
+      },
+    };
+
+    return await this.sendMessageWithTyping(data.number, message, data?.options);
+  }
+
+  public async stickerMessage(data: SendStickerDto) {
+    const generate = await this.prepareMediaMessage({
+      media: data.stickerMessage.sticker,
+      mediatype: 'sticker' as any,
+      mimetype: 'image/webp',
+    });
+
+    return await this.sendMessageWithTyping(
+      data.number,
+      { ...generate.message },
+      data?.options,
+    );
   }
 
   public async editMessage(data: EditMessage) {

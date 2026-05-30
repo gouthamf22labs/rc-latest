@@ -1087,6 +1087,171 @@ paths:
         '500':
           description: Internal Server Error - Error in processing the request.
   
+  /message/sendPoll/{instanceName}:
+    post:
+      tags:
+        - Send Message Controller
+      summary: Send Poll
+      description: |
+        Send a poll message to a WhatsApp number or group.
+        Set `selectableCount` to `0` (default) to allow multiple answers, or a specific number to limit selections.
+        Polls work in individual chats, groups, and channels.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              example:
+                number: <string> - required
+                options:
+                  delay: <integer> - optional
+                  quotedMessageId: 1
+                pollMessage:
+                  name: What is your favorite color?
+                  values:
+                    - Red
+                    - Green
+                    - Blue
+                    - Yellow
+                  selectableCount: 0
+      parameters:
+        - name: instanceName
+          in: path
+          schema:
+            type: string
+          required: true
+          description: '- required'
+          example: 'codechat_v1'
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+
+  /message/sendQuiz/{instanceName}:
+    post:
+      tags:
+        - Send Message Controller
+      summary: Send Quiz
+      description: |
+        Send a quiz message to a WhatsApp **channel** (`@newsletter` JID only).
+        A quiz is a single-answer poll with a designated correct answer.
+        The `correctAnswer` must exactly match one of the provided `values`.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              example:
+                number: <string> - required (must be a @newsletter channel JID)
+                options:
+                  delay: <integer> - optional
+                quizMessage:
+                  name: What is the capital of France?
+                  values:
+                    - Paris
+                    - London
+                    - Berlin
+                    - Madrid
+                  correctAnswer: Paris
+      parameters:
+        - name: instanceName
+          in: path
+          schema:
+            type: string
+          required: true
+          description: '- required'
+          example: 'codechat_v1'
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+
+  /message/sendSticker/{instanceName}:
+    post:
+      tags:
+        - Send Message Controller
+      summary: Send Sticker
+      description: |
+        Send a sticker message via a `.webp` URL (static or animated).
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              example:
+                number: <string> - required
+                options:
+                  delay: <integer> - optional
+                  quotedMessageId: 1
+                stickerMessage:
+                  sticker: https://example.com/sticker.webp
+      parameters:
+        - name: instanceName
+          in: path
+          schema:
+            type: string
+          required: true
+          description: '- required'
+          example: 'codechat_v1'
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+
+  /message/sendEvent/{instanceName}:
+    post:
+      tags:
+        - Send Message Controller
+      summary: Send Event
+      description: |
+        Send a scheduled event message to a WhatsApp group or channel.
+        When `call` is provided, a WhatsApp call link is automatically generated.
+        Defaults: `hasReminder: true`, `reminderOffsetSec: 3600` (1 hour), `extraGuestsAllowed: false`.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              example:
+                number: <string> - required
+                options:
+                  delay: <integer> - optional
+                eventMessage:
+                  name: Team Meeting
+                  description: Monthly sync - optional
+                  startDate: '2026-06-15T10:00:00.000Z'
+                  endDate: '2026-06-15T11:00:00.000Z'
+                  location: Conference Room A - optional
+                  call: video
+                  hasReminder: true
+                  reminderOffsetSec: 3600
+                  extraGuestsAllowed: false
+                  isCancelled: false
+      parameters:
+        - name: instanceName
+          in: path
+          schema:
+            type: string
+          required: true
+          description: '- required'
+          example: 'codechat_v1'
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+
   /message/sendButtons/{instanceName}:
     post:
       tags:

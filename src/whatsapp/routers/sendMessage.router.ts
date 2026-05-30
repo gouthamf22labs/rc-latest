@@ -39,11 +39,15 @@ import {
   audioFileMessageSchema,
   audioMessageSchema,
   contactMessageSchema,
+  eventMessageSchema,
   locationMessageSchema,
   mediaFileMessageSchema,
   mediaMessageSchema,
+  pollMessageSchema,
+  quizMessageSchema,
   reactionMessageSchema,
   sendLinkSchema,
+  stickerMessageSchema,
   textMessageSchema,
 } from '../../validate/validate.schema';
 import {
@@ -51,10 +55,14 @@ import {
   MediaFileDto,
   SendAudioDto,
   SendContactDto,
+  SendEventDto,
   SendLinkDto,
   SendLocationDto,
   SendMediaDto,
+  SendPollDto,
+  SendQuizDto,
   SendReactionDto,
+  SendStickerDto,
   SendTextDto,
 } from '../dto/sendMessage.dto';
 import multer from 'multer';
@@ -245,6 +253,42 @@ export function MessageRouter(
         schema: sendLinkSchema,
         execute: (instance, data) =>
           sendMessageController.sendLinkPreview(instance, data),
+      });
+
+      res.status(HttpStatus.CREATED).json(response);
+    })
+    .post(routerPath('sendPoll'), ...guards, async (req, res) => {
+      const response = await dataValidate<SendPollDto>({
+        request: req,
+        schema: pollMessageSchema,
+        execute: (instance, data) => sendMessageController.sendPoll(instance, data),
+      });
+
+      res.status(HttpStatus.CREATED).json(response);
+    })
+    .post(routerPath('sendQuiz'), ...guards, async (req, res) => {
+      const response = await dataValidate<SendQuizDto>({
+        request: req,
+        schema: quizMessageSchema,
+        execute: (instance, data) => sendMessageController.sendQuiz(instance, data),
+      });
+
+      res.status(HttpStatus.CREATED).json(response);
+    })
+    .post(routerPath('sendSticker'), ...guards, async (req, res) => {
+      const response = await dataValidate<SendStickerDto>({
+        request: req,
+        schema: stickerMessageSchema,
+        execute: (instance, data) => sendMessageController.sendSticker(instance, data),
+      });
+
+      res.status(HttpStatus.CREATED).json(response);
+    })
+    .post(routerPath('sendEvent'), ...guards, async (req, res) => {
+      const response = await dataValidate<SendEventDto>({
+        request: req,
+        schema: eventMessageSchema,
+        execute: (instance, data) => sendMessageController.sendEvent(instance, data),
       });
 
       res.status(HttpStatus.CREATED).json(response);

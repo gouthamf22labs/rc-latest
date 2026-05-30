@@ -336,3 +336,48 @@ export class LinkMessage {
 export class SendLinkDto extends Metadata {
   linkMessage: LinkMessage;
 }
+
+class PollContent {
+  name: string;
+  values: string[];
+  selectableCount?: number;
+}
+
+export class SendPollDto extends Metadata {
+  pollMessage: PollContent;
+}
+
+class QuizContent {
+  name: string;
+  values: string[];
+  correctAnswer: string;
+}
+
+export class SendQuizDto extends Metadata {
+  quizMessage: QuizContent;
+}
+
+class StickerContent {
+  sticker: string;
+}
+
+export class SendStickerDto extends Metadata {
+  stickerMessage: StickerContent;
+}
+
+class EventContent {
+  name: string;
+  description?: string;
+  startDate: string;
+  endDate?: string;
+  location?: string;
+  call?: 'audio' | 'video';
+  hasReminder?: boolean;
+  reminderOffsetSec?: number;
+  extraGuestsAllowed?: boolean;
+  isCancelled?: boolean;
+}
+
+export class SendEventDto extends Metadata {
+  eventMessage: EventContent;
+}

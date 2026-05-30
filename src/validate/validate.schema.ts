@@ -432,6 +432,119 @@ export const sendLinkSchema: JSONSchema7 = {
   required: ['linkMessage', 'number'],
 };
 
+export const pollMessageSchema: JSONSchema7 = {
+  $id: ulid(),
+  type: 'object',
+  properties: {
+    number: { ...numberDefinition },
+    options: { ...optionsSchema },
+    pollMessage: {
+      type: 'object',
+      properties: {
+        name: { type: 'string' },
+        values: {
+          type: 'array',
+          items: { type: 'string', minLength: 1 },
+          minItems: 2,
+          maxItems: 12,
+        },
+        selectableCount: {
+          type: 'integer',
+          minimum: 0,
+          description: '0 = unlimited (allow multiple answers), N = select up to N options',
+        },
+      },
+      required: ['name', 'values'],
+      ...isNotEmpty('name'),
+    },
+  },
+  required: ['pollMessage', 'number'],
+};
+
+export const quizMessageSchema: JSONSchema7 = {
+  $id: ulid(),
+  type: 'object',
+  properties: {
+    number: { ...numberDefinition },
+    options: { ...optionsSchema },
+    quizMessage: {
+      type: 'object',
+      properties: {
+        name: { type: 'string' },
+        values: {
+          type: 'array',
+          items: { type: 'string', minLength: 1 },
+          minItems: 2,
+          maxItems: 12,
+        },
+        correctAnswer: {
+          type: 'string',
+          description: 'Must exactly match one of the values',
+        },
+      },
+      required: ['name', 'values', 'correctAnswer'],
+      ...isNotEmpty('name', 'correctAnswer'),
+    },
+  },
+  required: ['quizMessage', 'number'],
+};
+
+export const eventMessageSchema: JSONSchema7 = {
+  $id: ulid(),
+  type: 'object',
+  properties: {
+    number: { ...numberDefinition },
+    options: { ...optionsSchema },
+    eventMessage: {
+      type: 'object',
+      properties: {
+        name: { type: 'string' },
+        description: { type: 'string' },
+        startDate: { type: 'string', description: 'ISO 8601 date string' },
+        endDate: { type: 'string', description: 'ISO 8601 date string' },
+        location: { type: 'string', description: 'Location text shown on the event' },
+        call: {
+          type: 'string',
+          enum: ['audio', 'video'],
+          description: 'WhatsApp call link toggle — auto-generates the call link when set',
+        },
+        hasReminder: { type: 'boolean', description: 'Enable reminder for the event' },
+        reminderOffsetSec: {
+          type: 'integer',
+          minimum: 0,
+          description: 'Seconds before event to remind — e.g. 3600 = 1 hour before',
+        },
+        extraGuestsAllowed: {
+          type: 'boolean',
+          description: 'Allow participants to bring one additional guest',
+        },
+        isCancelled: { type: 'boolean', description: 'Cancel the event' },
+      },
+      required: ['name', 'startDate'],
+      ...isNotEmpty('name', 'startDate'),
+    },
+  },
+  required: ['eventMessage', 'number'],
+};
+
+export const stickerMessageSchema: JSONSchema7 = {
+  $id: ulid(),
+  type: 'object',
+  properties: {
+    number: { ...numberDefinition },
+    options: { ...optionsSchema },
+    stickerMessage: {
+      type: 'object',
+      properties: {
+        sticker: { type: 'string' },
+      },
+      required: ['sticker'],
+      ...isNotEmpty('sticker'),
+    },
+  },
+  required: ['stickerMessage', 'number'],
+};
+
 // Chat Schema
 export const whatsappNumberSchema: JSONSchema7 = {
   $id: ulid(),
