@@ -61,6 +61,7 @@ model Instance {
   Webhook            Webhook?
   ActivityLogs       ActivityLogs[]
   Message            Message[]
+  Session            Session[]
 }
 
 model Auth {
@@ -167,4 +168,17 @@ model ActivityLogs {
   description String?   @db.VarChar(500)
   Instance    Instance? @relation(fields: [instanceId], references: [id], onDelete: Cascade)
   instanceId  Int?      @db.Integer
+}
+
+model Session {
+  id         Int      @id @default(autoincrement())
+  sessionKey String   @db.VarChar(300)
+  data       Json     @db.JsonB
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  Instance   Instance @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  instanceId Int
+
+  @@unique([instanceId, sessionKey])
+  @@index([instanceId])
 }

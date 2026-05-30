@@ -159,6 +159,7 @@ import {
   writeFileSync,
 } from 'fs';
 import { randomBytes } from 'crypto';
+import { useDatabaseAuthState } from '../../utils/use-database-auth-state';
 import { createProxyAgents } from '../../utils/proxy';
 import { fetchLatestBaileysVersionV2 } from '../../utils/wa-version';
 import { getJidUser, getUserGroup } from '../../utils/extract-id';
@@ -229,7 +230,14 @@ export class WAStartupService {
       if (this.configService.get<ProviderSession>('PROVIDER')?.ENABLED) {
         await this.providerFiles.removeSession(this.instance.name);
       } else {
-        rmSync(join(INSTANCE_DIR, this.instance.name));
+        // Clear DB session so re-pairing starts a fresh login.
+        // Guard against undefined id (Partial<Instance>) — an undefined filter would wipe all sessions.
+        if (this.instance?.id) {
+          await this.repository.session
+            .deleteMany({ where: { instanceId: this.instance.id } })
+            .catch((err) => this.logger.warn('session-cleanup-failed', err));
+        }
+        rmSync(join(INSTANCE_DIR, this.instance.name), { recursive: true, force: true });
       }
     } catch {
       //
@@ -545,6 +553,12 @@ export class WAStartupService {
   private async defineAuthState() {
     if (this.configService.get<ProviderSession>('PROVIDER')?.ENABLED) {
       return await this.authStateProvider.authStateProvider(this.instance.name);
+    }
+
+    // Store session in PostgreSQL so it survives Docker restarts/crashes.
+    // Falls back to file system only when instance.id is unavailable (should not happen in practice).
+    if (this.instance?.id) {
+      return await useDatabaseAuthState(this.repository, this.instance.id);
     }
 
     return await useMultiFileAuthState(join(INSTANCE_DIR, this.instance.name));
@@ -1175,14 +1189,14 @@ export class WAStartupService {
   };
 
   private eventHandler() {
-    this.client.ev.process((events) => {
+    this.client.ev.process(async (events) => {
       if (!this.endSession) {
         if (events?.['connection.update']) {
           this.connectionUpdate(events['connection.update']);
         }
 
         if (events?.['creds.update']) {
-          this.authState.saveCreds();
+          await this.authState.saveCreds();
         }
 
         if (events?.['messaging-history.set']) {
@@ -1384,11 +1398,11 @@ export class WAStartupService {
 
     const jid = this.createJid(number);
     const isWA = (await this.whatsappNumber({ numbers: [jid] }))[0];
-    if (!isWA.exists && !isJidGroup(isWA.jid)) {
+    if (!isWA.exists && !isJidGroup(isWA.jid) && !isJidNewsletter(isWA.jid)) {
       throw new BadRequestException(isWA);
     }
 
-    const recipient = isJidGroup(jid) ? jid : isLidUser(jid) ? jid : isWA.jid;
+    const recipient = isJidGroup(jid) ? jid : isLidUser(jid) ? jid : isJidNewsletter(jid) ? jid : isWA.jid;
 
     if (isJidGroup(recipient)) {
       try {

@@ -119,6 +119,10 @@ export class WAMonitoringService {
     if (this.providerSession?.ENABLED) {
       await this.providerFiles.removeSession(name);
     } else {
+      // Remove DB session rows so the next connect forces a fresh login
+      await this.repository.session
+        .deleteMany({ where: { Instance: { name } } })
+        .catch((err) => this.logger.warn('session-cleanup-failed', err));
       rmSync(join(INSTANCE_DIR, name), { recursive: true, force: true });
     }
 
@@ -179,19 +183,39 @@ export class WAMonitoringService {
         return;
       }
 
-      const dir = opendirSync(INSTANCE_DIR, { encoding: 'utf-8' });
-      for await (const dirent of dir) {
-        if (dirent.isDirectory()) {
-          const files = readdirSync(join(INSTANCE_DIR, dirent.name), {
-            encoding: 'utf-8',
-          });
-          if (files.length === 0) {
-            rmSync(join(INSTANCE_DIR, dirent.name), { recursive: true, force: true });
-            continue;
-          }
+      // Prefer DB-based discovery: reconnect all instances that have session keys
+      // in the Session table (DB auth state). Falls back to filesystem scan for
+      // any legacy file-based sessions.
+      const dbInstances = await this.repository.instance
+        .findMany({
+          where: { Session: { some: {} } },
+          select: { name: true },
+        })
+        .catch(() => []);
 
-          await set(dirent.name);
+      const dbNames = new Set(dbInstances.filter((i) => i?.name).map((i) => i.name));
+
+      for (const name of dbNames) {
+        await set(name);
+      }
+
+      // Also scan filesystem for any remaining file-based sessions not in DB
+      try {
+        const dir = opendirSync(INSTANCE_DIR, { encoding: 'utf-8' });
+        for await (const dirent of dir) {
+          if (dirent.isDirectory() && !dbNames.has(dirent.name)) {
+            const files = readdirSync(join(INSTANCE_DIR, dirent.name), {
+              encoding: 'utf-8',
+            });
+            if (files.length === 0) {
+              rmSync(join(INSTANCE_DIR, dirent.name), { recursive: true, force: true });
+              continue;
+            }
+            await set(dirent.name);
+          }
         }
+      } catch {
+        // INSTANCE_DIR may not exist on a fresh container — that's fine
       }
     } catch (error) {
       this.logger.error(error);
