@@ -155,6 +155,22 @@ export function GroupRouter(
       });
 
       res.status(HttpStatus.OK).json(response);
+    })
+    .post(routerPath('createChannel'), ...guards, async (req, res) => {
+      const response = await dataValidate<InstanceDto>({
+        request: req,
+        schema: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', minLength: 1 },
+            description: { type: 'string' },
+          },
+          required: ['name'],
+        },
+        execute: (instance, data) => groupController.createChannel(instance, data as any),
+      });
+
+      res.status(HttpStatus.CREATED).json(response);
     });
 
   return router;

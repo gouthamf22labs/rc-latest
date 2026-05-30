@@ -50,6 +50,7 @@ import makeWASocket, {
   DisconnectReason,
   downloadMediaMessage,
   generateWAMessageFromContent,
+  getBinaryNodeChild,
   getContentType,
   getDevice,
   GroupMetadata,
@@ -866,7 +867,7 @@ export class WAStartupService {
           } as PrismType.Chat;
         });
         await this.sendDataWebhook('chatsSet', chatsRaw);
-        await this.repository.chat.createMany({ data: chatsRaw });
+        await this.repository.chat.createMany({ data: chatsRaw, skipDuplicates: true });
       }
 
       if (messages && messages?.length > 0) {
@@ -1189,6 +1190,53 @@ export class WAStartupService {
   };
 
   private eventHandler() {
+    // Baileys discards NotificationNewsletterJoin as "unhandled" without emitting any event.
+    // We intercept the raw mex notification on the same ws event bus Baileys itself uses.
+    //
+    // CB: event format: `CB:${tag},${attrKey}:${attrVal},${firstChildTag}`
+    // For mex notifications: tag=notification, attrs.type=mex → fires 'CB:notification,type:mex'
+    //
+    // The legacy mex handler (which handles Join/Leave) stores operation in JSON content body,
+    // not in attrs.op_name. Payload node is either child 'mex' (with content) or child 'update'.
+    this.client.ws.on('CB:notification,type:mex', async (node: any) => {
+      try {
+        // Mirror Baileys' handleLegacyMexNewsletterNotification node-parsing exactly
+        const mexNode = getBinaryNodeChild(node, 'mex');
+        const updateNode = mexNode?.content
+          ? null
+          : getBinaryNodeChild(node, 'update') ?? node;
+        const payloadNode = mexNode?.content ? mexNode : updateNode;
+        if (!payloadNode?.content || Array.isArray(payloadNode.content)) return;
+
+        const contentBuf = Buffer.isBuffer(payloadNode.content)
+          ? payloadNode.content
+          : Buffer.from(payloadNode.content as any);
+        const data = JSON.parse(contentBuf.toString());
+
+        // operation is in data.operation or payloadNode.attrs.op_name (newer format)
+        const operation: string = data?.operation ?? payloadNode?.attrs?.op_name ?? '';
+        if (operation !== 'NotificationNewsletterJoin') return;
+
+        const updates: { jid?: string }[] = data?.updates ?? [];
+        for (const update of updates) {
+          const jid = update?.jid;
+          if (!jid || !isJidNewsletter(jid)) continue;
+
+          const existing = await this.repository.chat.findFirst({
+            where: { instanceId: this.instance.id, remoteJid: jid },
+          });
+          if (!existing) {
+            await this.repository.chat.create({
+              data: { remoteJid: jid, instanceId: this.instance.id },
+            });
+            this.logger.info(`newsletter joined/created from phone saved: ${jid}`);
+          }
+        }
+      } catch (err) {
+        this.logger.warn('newsletter-join-sync failed', err);
+      }
+    });
+
     this.client.ev.process(async (events) => {
       if (!this.endSession) {
         if (events?.['connection.update']) {
@@ -2587,9 +2635,34 @@ export class WAStartupService {
     };
   }
 
+  public async createChannel(name: string, description?: string) {
+    const meta = await this.client.newsletterCreate(name, description);
+
+    // newsletterCreate emits no Baileys events — save to Chat table manually so
+    // fetchChannels picks it up immediately without waiting for a reconnect sync
+    const existing = await this.repository.chat.findFirst({
+      where: { instanceId: this.instance.id, remoteJid: meta.id },
+    });
+    if (existing) {
+      await this.repository.chat.update({
+        where: { id: existing.id },
+        data: { content: meta as any },
+      });
+    } else {
+      await this.repository.chat.create({
+        data: { remoteJid: meta.id, instanceId: this.instance.id, content: meta as any },
+      });
+    }
+
+    return meta;
+  }
+
   public async fetchChannels() {
+    // Deduplicate by remoteJid — reconnects can create duplicate Chat rows via createMany
     const chats = await this.repository.chat.findMany({
       where: { instanceId: this.instance.id, remoteJid: { contains: '@newsletter' } },
+      distinct: ['remoteJid'],
+      orderBy: { id: 'desc' },
     });
 
     const results = await Promise.all(
@@ -2598,12 +2671,13 @@ export class WAStartupService {
           const meta = await this.client.newsletterMetadata('jid', chat.remoteJid);
           return { ...chat, metadata: meta };
         } catch {
-          return { ...chat, metadata: null };
+          return null;
         }
       }),
     );
 
-    return results;
+    // Filter out channels that returned null — no longer followed or deleted
+    return results.filter(Boolean);
   }
 
   public async fetchChats(type?: string) {

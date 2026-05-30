@@ -2337,6 +2337,79 @@ paths:
           content:
             application/json: {}
   
+  /group/fetchAllGroups/{instanceName}:
+    get:
+      tags:
+        - Group Controller
+      summary: Fetch All Groups
+      description: Returns all groups the instance is participating in, with full metadata and participant list. Live call to WhatsApp — always up to date.
+      parameters:
+        - name: instanceName
+          in: path
+          schema:
+            type: string
+          required: true
+          description: '- required'
+          example: 'codechat_v1'
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json: {}
+
+  /group/fetchChannels/{instanceName}:
+    get:
+      tags:
+        - Group Controller
+      summary: Fetch All Channels
+      description: |
+        Returns all WhatsApp Channels (newsletters) the instance follows or owns.
+        Reads from the local Chat table (populated on each connection sync) and enriches each with live metadata.
+        Channels no longer followed or deleted are automatically filtered out.
+      parameters:
+        - name: instanceName
+          in: path
+          schema:
+            type: string
+          required: true
+          description: '- required'
+          example: 'codechat_v1'
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json: {}
+
+  /group/createChannel/{instanceName}:
+    post:
+      tags:
+        - Group Controller
+      summary: Create Channel
+      description: |
+        Creates a new WhatsApp Channel (newsletter) and immediately registers it in the local Chat table
+        so it appears in `fetchChannels` without requiring a reconnect.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              example:
+                name: My Channel
+                description: Optional channel description
+      parameters:
+        - name: instanceName
+          in: path
+          schema:
+            type: string
+          required: true
+          description: '- required'
+          example: 'codechat_v1'
+      responses:
+        '201':
+          description: Channel created
+          content:
+            application/json: {}
+
   /instance/refreshToken/:
     put:
       tags:

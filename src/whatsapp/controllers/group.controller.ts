@@ -97,4 +97,11 @@ export class GroupController {
   public async fetchChannels({ instanceName }: InstanceDto) {
     return await this.waMonitor.waInstances.get(instanceName).fetchChannels();
   }
+
+  public async createChannel(
+    { instanceName }: InstanceDto,
+    body: { name: string; description?: string },
+  ) {
+    return await this.waMonitor.waInstances.get(instanceName).createChannel(body.name, body.description);
+  }
 }
