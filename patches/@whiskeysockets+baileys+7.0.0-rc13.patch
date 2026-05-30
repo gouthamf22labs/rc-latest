@@ -1,8 +1,30 @@
+diff --git a/node_modules/@whiskeysockets/baileys/lib/Socket/chats.js b/node_modules/@whiskeysockets/baileys/lib/Socket/chats.js
+index 9a7947f..0063450 100644
+--- a/node_modules/@whiskeysockets/baileys/lib/Socket/chats.js
++++ b/node_modules/@whiskeysockets/baileys/lib/Socket/chats.js
+@@ -58,7 +58,7 @@ export const makeChatsSocket = (config) => {
+     };
+     const fetchPrivacySettings = async (force = false) => {
+         if (!privacySettings || force) {
+-            const { content } = await query({
++            const result = await query({
+                 tag: 'iq',
+                 attrs: {
+                     xmlns: 'privacy',
+@@ -67,7 +67,7 @@ export const makeChatsSocket = (config) => {
+                 },
+                 content: [{ tag: 'privacy', attrs: {} }]
+             });
+-            privacySettings = reduceBinaryNodeToDictionary(content?.[0], 'category');
++            privacySettings = reduceBinaryNodeToDictionary(result?.content?.[0], 'category');
+         }
+         return privacySettings;
+     };
 diff --git a/node_modules/@whiskeysockets/baileys/lib/Socket/groups.js b/node_modules/@whiskeysockets/baileys/lib/Socket/groups.js
-index 5853648..80c64ca 100644
+index df19870..992e0fd 100644
 --- a/node_modules/@whiskeysockets/baileys/lib/Socket/groups.js
 +++ b/node_modules/@whiskeysockets/baileys/lib/Socket/groups.js
-@@ -60,8 +60,13 @@ export const makeGroupsSocket = (config) => {
+@@ -61,8 +61,13 @@ export const makeGroupsSocket = (config) => {
          if (attrs.type !== 'groups') {
              return;
          }
