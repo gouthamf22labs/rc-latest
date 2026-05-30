@@ -1534,7 +1534,7 @@ export class WAStartupService {
     if (data.textMessage.mentionAll) {
       const groupId = this.createJid(data.number);
       const meta = await this.client.groupMetadata(groupId);
-      mentions = meta.participants.map((p) => (p as any).phoneNumber ?? p.id);
+      mentions = meta.participants.map((p) => p.id);
     } else {
       mentions = data.textMessage.mentions?.map((m) => this.createJid(m));
     }
