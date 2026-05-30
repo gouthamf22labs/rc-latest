@@ -1534,7 +1534,8 @@ export class WAStartupService {
     if (data.textMessage.mentionAll) {
       const groupId = this.createJid(data.number);
       const meta = await this.client.groupMetadata(groupId);
-      mentions = meta.participants.map((p) => p.id);
+      // WhatsApp's mentionedJid requires @s.whatsapp.net format — use phoneNumber for LID groups
+      mentions = meta.participants.map((p) => p.phoneNumber ?? p.id);
     } else {
       mentions = data.textMessage.mentions?.map((m) => this.createJid(m));
     }
