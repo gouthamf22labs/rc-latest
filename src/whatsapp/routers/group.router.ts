@@ -146,6 +146,15 @@ export function GroupRouter(
       });
 
       res.status(HttpStatus.OK).json(response);
+    })
+    .get(routerPath('fetchChannels'), ...guards, compression(), async (req, res) => {
+      const response = await dataValidate<InstanceDto>({
+        request: req,
+        schema: {},
+        execute: (instance) => groupController.fetchChannels(instance),
+      });
+
+      res.status(HttpStatus.OK).json(response);
     });
 
   return router;

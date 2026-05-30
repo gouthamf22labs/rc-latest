@@ -2438,6 +2438,25 @@ export class WAStartupService {
     };
   }
 
+  public async fetchChannels() {
+    const chats = await this.repository.chat.findMany({
+      where: { instanceId: this.instance.id, remoteJid: { contains: '@newsletter' } },
+    });
+
+    const results = await Promise.all(
+      chats.map(async (chat) => {
+        try {
+          const meta = await this.client.newsletterMetadata('jid', chat.remoteJid);
+          return { ...chat, metadata: meta };
+        } catch {
+          return { ...chat, metadata: null };
+        }
+      }),
+    );
+
+    return results;
+  }
+
   public async fetchChats(type?: string) {
     const where = { instanceId: this.instance.id };
     if (['chats', 'group'].includes(type)) {

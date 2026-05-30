@@ -93,4 +93,8 @@ export class GroupController {
   public async leaveGroup({ instanceName }: InstanceDto, groupJid: GroupJid) {
     return await this.waMonitor.waInstances.get(instanceName).leaveGroup(groupJid);
   }
+
+  public async fetchChannels({ instanceName }: InstanceDto) {
+    return await this.waMonitor.waInstances.get(instanceName).fetchChannels();
+  }
 }
