@@ -1958,12 +1958,27 @@ export class WAStartupService {
     const jid = this.createJid(data.number);
 
     if (isJidNewsletter(jid)) {
-      // For newsletters, pass raw media directly so client.sendMessage can use
-      // the newsletter-specific unencrypted upload path in prepareWAMessageMedia.
+      // For newsletters, pass raw media directly so client.sendMessage uses the
+      // newsletter-specific unencrypted upload path in prepareWAMessageMedia.
       // prepareMediaMessage uses encrypted upload which newsletters reject.
+      // We must also supply jpegThumbnail — Baileys' newsletter branch skips
+      // thumbnail generation, and WhatsApp won't display the image without it.
       const { mediatype, media, caption, fileName } = data.mediaMessage;
       const mediaContent = typeof media === 'string' ? { url: media } : media;
-      const content = { [mediatype]: mediaContent, caption, fileName } as any;
+      let jpegThumbnail: Buffer | undefined;
+      if (mediatype === 'image') {
+        try {
+          const isURL = typeof media === 'string' && /^https?:\/\//.test(media);
+          const srcBuffer = isURL
+            ? Buffer.from((await axios.get(media as string, { responseType: 'arraybuffer' })).data)
+            : (media as Buffer);
+          jpegThumbnail = await sharp(srcBuffer)
+            .resize(320, 240, { fit: 'contain' })
+            .toFormat('jpeg', { quality: 80 })
+            .toBuffer();
+        } catch { /* skip thumbnail if generation fails */ }
+      }
+      const content = { [mediatype]: mediaContent, caption, fileName, jpegThumbnail } as any;
       return await this.sendMessageWithTyping(data.number, content, data?.options);
     }
 
