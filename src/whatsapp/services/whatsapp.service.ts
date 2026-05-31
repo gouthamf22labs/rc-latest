@@ -93,7 +93,7 @@ import qrcode, { QRCodeToDataURLOptions } from 'qrcode';
 import qrcodeTerminal from 'qrcode-terminal';
 import { Boom } from '@hapi/boom';
 import EventEmitter2 from 'eventemitter2';
-import { release } from 'os';
+import { release, tmpdir } from 'os';
 import P from 'pino';
 import {
   AudioMessageFileDto,
@@ -159,7 +159,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'fs';
-import { randomBytes } from 'crypto';
+import { randomBytes, createHash } from 'crypto';
 import { useDatabaseAuthState } from '../../utils/use-database-auth-state';
 import { createProxyAgents } from '../../utils/proxy';
 import { fetchLatestBaileysVersionV2 } from '../../utils/wa-version';
@@ -1585,7 +1585,7 @@ export class WAStartupService {
           });
           if (isJidNewsletter(recipient)) {
             const imgMsg = m?.message?.['imageMessage'];
-            this.logger.info(`[newsletter-media] sendMessage returned keyId=${m?.key?.id} hasMessage=${!!m?.message} msgType=${Object.keys(m?.message || {}).join(',')} imgUrl=${imgMsg?.url} imgDirectPath=${imgMsg?.directPath}`);
+            this.logger.info(`[newsletter-media] sendMessage returned keyId=${m?.key?.id} msgType=${Object.keys(m?.message || {}).join(',')} imgUrl=${imgMsg?.url} imgDirectPath=${imgMsg?.directPath} thumbDirectPath=${imgMsg?.thumbnailDirectPath}`);
           }
         } else {
           m = generateWAMessageFromContent(recipient, message, {
@@ -1988,7 +1988,25 @@ export class WAStartupService {
             .toBuffer();
         } catch { /* skip if fails */ }
       }
-      const content = { [mediatype]: mediaContent, caption, fileName, jpegThumbnail, width, height } as any;
+      // Upload thumbnail to WA CDN separately — native WA newsletter requires thumbnailDirectPath
+      let thumbnailDirectPath: string | undefined;
+      let thumbnailSha256: Buffer | undefined;
+      if (jpegThumbnail) {
+        try {
+          const thumbPath = join(tmpdir(), `thumb-${ulid(Date.now())}.jpg`);
+          writeFileSync(thumbPath, jpegThumbnail);
+          const thumbSha256 = createHash('sha256').update(jpegThumbnail).digest();
+          const thumbSha256B64 = encodeURIComponent(thumbSha256.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''));
+          const thumbUpload = await (this.client as any).waUploadToServer(thumbPath, {
+            mediaType: 'image',
+            fileEncSha256B64: thumbSha256B64,
+          });
+          thumbnailDirectPath = thumbUpload?.directPath;
+          thumbnailSha256 = thumbSha256;
+          try { unlinkSync(thumbPath); } catch { /* ignore */ }
+        } catch { /* best-effort — proceed without thumbnailDirectPath */ }
+      }
+      const content = { [mediatype]: mediaContent, caption, fileName, jpegThumbnail, width, height, thumbnailDirectPath, thumbnailSha256 } as any;
       this.logger.info(`[newsletter-media] sending ${mediatype} to ${jid} url=${typeof mediaContent === 'object' && !Buffer.isBuffer(mediaContent) && (mediaContent as any).url ? (mediaContent as any).url : 'buffer'}`);
       const result = await this.sendMessageWithTyping(data.number, content, data?.options);
       this.logger.info(`[newsletter-media] sent keyId=${result?.keyId} messageType=${result?.messageType}`);
