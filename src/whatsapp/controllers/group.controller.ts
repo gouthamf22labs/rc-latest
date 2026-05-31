@@ -104,4 +104,11 @@ export class GroupController {
   ) {
     return await this.waMonitor.waInstances.get(instanceName).createChannel(body.name, body.description);
   }
+
+  public async addChannelByJid(
+    { instanceName }: InstanceDto,
+    body: { jids: string[] },
+  ) {
+    return await this.waMonitor.waInstances.get(instanceName).addChannelsByJid(body.jids);
+  }
 }

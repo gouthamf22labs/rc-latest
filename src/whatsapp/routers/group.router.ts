@@ -156,6 +156,18 @@ export function GroupRouter(
 
       res.status(HttpStatus.OK).json(response);
     })
+    .post(routerPath('addChannelByJid'), ...guards, async (req, res) => {
+      const response = await dataValidate<InstanceDto>({
+        request: req,
+        schema: {
+          type: 'object',
+          properties: { jids: { type: 'array', items: { type: 'string' }, minItems: 1 } },
+          required: ['jids'],
+        },
+        execute: (instance, data) => groupController.addChannelByJid(instance, data as any),
+      });
+      res.status(HttpStatus.OK).json(response);
+    })
     .post(routerPath('createChannel'), ...guards, async (req, res) => {
       const response = await dataValidate<InstanceDto>({
         request: req,

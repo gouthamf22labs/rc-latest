@@ -522,6 +522,25 @@ export class WAStartupService {
         })
         .catch((err) => this.logger.error(err));
 
+      // Subscribe to live updates for all known newsletter channels.
+      // This causes WhatsApp to push recent activity for each channel,
+      // which flows through upsertMessage → processMessage → chats.update
+      // → our handler saves/enriches them in DB automatically.
+      this.repository.chat
+        .findMany({
+          where: { instanceId: this.instance.id, remoteJid: { contains: '@newsletter' } },
+          select: { remoteJid: true },
+          distinct: ['remoteJid'],
+        })
+        .then(async (chats) => {
+          for (const { remoteJid } of chats) {
+            try {
+              await this.client.subscribeNewsletterUpdates(remoteJid);
+            } catch { /* best-effort */ }
+          }
+        })
+        .catch(() => {});
+
       this.logger.info('instance started');
     }
   }
@@ -863,10 +882,34 @@ export class WAStartupService {
     }
   }
 
+  private async enrichNewsletterChats(jids: string[]) {
+    for (const jid of jids) {
+      try {
+        const meta = await this.client.newsletterMetadata('jid', jid);
+        if (meta) {
+          const existing = await this.repository.chat.findFirst({
+            where: { instanceId: this.instance.id, remoteJid: jid },
+          });
+          if (existing) {
+            await this.repository.chat.update({
+              where: { id: existing.id },
+              data: { content: meta as any },
+            });
+          } else {
+            await this.repository.chat.create({
+              data: { remoteJid: jid, instanceId: this.instance.id, content: meta as any },
+            });
+          }
+        }
+      } catch { /* best-effort */ }
+    }
+  }
+
   private readonly messageHandle = {
     'messaging-history.set': async ({
       messages,
       chats,
+      isLatest,
     }: BaileysEventMap['messaging-history.set']) => {
       if (chats && chats.length > 0) {
         const chatsRaw: PrismType.Chat[] = chats.map((chat) => {
@@ -880,25 +923,24 @@ export class WAStartupService {
         await this.sendDataWebhook('chatsSet', chatsRaw);
         await this.repository.chat.createMany({ data: chatsRaw, skipDuplicates: true });
 
-        // Enrich newsletter chats with full metadata from WA and persist to DB
-        const newsletterJids = chatsRaw
+        // Enrich newsletter chats from this chunk
+        const chunkNewsletterJids = chatsRaw
           .map((c) => c.remoteJid)
           .filter((jid) => jid?.includes('@newsletter'));
-        for (const jid of newsletterJids) {
-          try {
-            const meta = await this.client.newsletterMetadata('jid', jid);
-            if (meta) {
-              const existing = await this.repository.chat.findFirst({
-                where: { instanceId: this.instance.id, remoteJid: jid },
-              });
-              if (existing) {
-                await this.repository.chat.update({
-                  where: { id: existing.id },
-                  data: { content: meta as any },
-                });
-              }
-            }
-          } catch { /* best-effort — enrich what we can */ }
+        if (chunkNewsletterJids.length) {
+          this.enrichNewsletterChats(chunkNewsletterJids).catch(() => {});
+        }
+      }
+
+      // On final sync chunk, re-enrich ALL newsletter chats in DB to catch any stale content
+      if (isLatest) {
+        const allNewsletterChats = await this.repository.chat.findMany({
+          where: { instanceId: this.instance.id, remoteJid: { contains: '@newsletter' } },
+          select: { remoteJid: true },
+        });
+        const allJids = allNewsletterChats.map((c) => c.remoteJid);
+        if (allJids.length) {
+          this.enrichNewsletterChats(allJids).catch(() => {});
         }
       }
 
@@ -2758,6 +2800,41 @@ export class WAStartupService {
       };
     }
     return await this.repository.chat.findMany({ where });
+  }
+
+  public async addChannelsByJid(channels: string[]) {
+    const results = [];
+    for (const channel of channels) {
+      // Detect if it's a JID or an invite code
+      const isJid = channel.includes('@newsletter');
+      const type: 'jid' | 'invite' = isJid ? 'jid' : 'invite';
+      const key = isJid ? channel : channel;
+      try {
+        const meta = await this.client.newsletterMetadata(type, key);
+        if (meta) {
+          const remoteJid = (meta as any).id;
+          const existing = await this.repository.chat.findFirst({
+            where: { instanceId: this.instance.id, remoteJid },
+          });
+          if (existing) {
+            await this.repository.chat.update({
+              where: { id: existing.id },
+              data: { content: meta as any },
+            });
+          } else {
+            await this.repository.chat.create({
+              data: { remoteJid, instanceId: this.instance.id, content: meta as any },
+            });
+          }
+          results.push({ jid: remoteJid, status: 'ok' });
+        } else {
+          results.push({ channel, status: 'not_found' });
+        }
+      } catch {
+        results.push({ channel, status: 'error' });
+      }
+    }
+    return results;
   }
 
   public async rejectCall(data: RejectCallDto) {
