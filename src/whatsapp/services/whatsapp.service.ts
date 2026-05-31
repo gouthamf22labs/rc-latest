@@ -1961,8 +1961,8 @@ export class WAStartupService {
       // For newsletters, pass raw media directly so client.sendMessage uses the
       // newsletter-specific unencrypted upload path in prepareWAMessageMedia.
       // prepareMediaMessage uses encrypted upload which newsletters reject.
-      // We must also supply jpegThumbnail — Baileys' newsletter branch skips
-      // thumbnail generation, and WhatsApp won't display the image without it.
+      // Caller (BE) is responsible for sending JPEG images — WhatsApp newsletter only renders JPEG.
+      // We supply jpegThumbnail since Baileys' newsletter branch skips thumbnail generation.
       const { mediatype, media, caption, fileName } = data.mediaMessage;
       const mediaContent = typeof media === 'string' ? { url: media } : media;
       let jpegThumbnail: Buffer | undefined;
