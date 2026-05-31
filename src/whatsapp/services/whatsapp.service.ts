@@ -1575,7 +1575,10 @@ export class WAStartupService {
 
         const messageId = options?.messageId || ulid(Date.now());
 
-        if (message?.['react'] || message?.['edit'] || message?.['text'] || message?.['poll']) {
+        if (message?.['react'] || message?.['edit'] || message?.['text'] || message?.['poll'] || isJidNewsletter(recipient)) {
+          // Newsletters: client.sendMessage internally calls prepareWAMessageMedia with the
+          // newsletter JID, which uses the correct unencrypted upload path for newsletters.
+          // relayMessage() skips this and sends the pre-built proto which WhatsApp rejects for media.
           m = await this.client.sendMessage(recipient, message as AnyMessageContent, {
             quoted: q,
             messageId,
@@ -1951,6 +1954,19 @@ export class WAStartupService {
     if (data.mediaMessage?.fileName) {
       data.mediaMessage.extension = data.mediaMessage.fileName.split('.').pop();
     }
+
+    const jid = this.createJid(data.number);
+
+    if (isJidNewsletter(jid)) {
+      // For newsletters, pass raw media directly so client.sendMessage can use
+      // the newsletter-specific unencrypted upload path in prepareWAMessageMedia.
+      // prepareMediaMessage uses encrypted upload which newsletters reject.
+      const { mediatype, media, caption, fileName } = data.mediaMessage;
+      const mediaContent = typeof media === 'string' ? { url: media } : media;
+      const content = { [mediatype]: mediaContent, caption, fileName } as any;
+      return await this.sendMessageWithTyping(data.number, content, data?.options);
+    }
+
     const generate = await this.prepareMediaMessage(data.mediaMessage);
 
     return await this.sendMessageWithTyping(
