@@ -1,3 +1,17 @@
+diff --git a/node_modules/@whiskeysockets/baileys/lib/Socket/messages-send.js b/node_modules/@whiskeysockets/baileys/lib/Socket/messages-send.js
+index abc1234..def5678 100644
+--- a/node_modules/@whiskeysockets/baileys/lib/Socket/messages-send.js
++++ b/node_modules/@whiskeysockets/baileys/lib/Socket/messages-send.js
+@@ -484,7 +484,8 @@ export const makeMessagesSocket = (config) => {
+                     attrs: {
+                         to: jid,
+                         id: msgId,
+                         type: getMessageType(message),
+-                        ...(additionalAttributes || {})
++                        ...(additionalAttributes || {}),
++                        ...extraAttrs
+                     },
+                     content: binaryNodeContent
 diff --git a/node_modules/@whiskeysockets/baileys/lib/Socket/chats.js b/node_modules/@whiskeysockets/baileys/lib/Socket/chats.js
 index 9a7947f..0063450 100644
 --- a/node_modules/@whiskeysockets/baileys/lib/Socket/chats.js
