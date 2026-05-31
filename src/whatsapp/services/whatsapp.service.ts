@@ -1968,45 +1968,53 @@ export class WAStartupService {
       // Caller (BE) is responsible for sending JPEG images — WhatsApp newsletter only renders JPEG.
       // We supply jpegThumbnail since Baileys' newsletter branch skips thumbnail generation.
       const { mediatype, media, caption, fileName } = data.mediaMessage;
-      const mediaContent = typeof media === 'string' ? { url: media } : media;
+      let mediaContent: any = typeof media === 'string' ? { url: media } : media;
+      let mimetype: string | undefined;
       let jpegThumbnail: Buffer | undefined;
       let width: number | undefined;
       let height: number | undefined;
+      let thumbnailDirectPath: string | undefined;
+      let thumbnailSha256: Buffer | undefined;
+
       if (mediatype === 'image') {
         try {
           const isURL = typeof media === 'string' && /^https?:\/\//.test(media);
           const srcBuffer = isURL
             ? Buffer.from((await axios.get(media as string, { responseType: 'arraybuffer' })).data)
             : (media as Buffer);
-          const img = sharp(srcBuffer);
-          const meta = await img.metadata();
+
+          // Convert main image to JPEG buffer — ensures uploaded bytes, fileSha256,
+          // fileLength and mimetype all agree. Passing { url } risks a PNG/JPEG mismatch.
+          const jpegBuffer = await sharp(srcBuffer).toFormat('jpeg', { quality: 90 }).toBuffer();
+          const meta = await sharp(jpegBuffer).metadata();
           width = meta.width;
           height = meta.height;
-          jpegThumbnail = await img
+          mimetype = 'image/jpeg';
+          mediaContent = jpegBuffer;
+
+          jpegThumbnail = await sharp(jpegBuffer)
             .resize(320, 240, { fit: 'contain' })
             .toFormat('jpeg', { quality: 80 })
             .toBuffer();
-        } catch { /* skip if fails */ }
-      }
-      // Upload thumbnail to WA CDN separately — native WA newsletter requires thumbnailDirectPath
-      let thumbnailDirectPath: string | undefined;
-      let thumbnailSha256: Buffer | undefined;
-      if (jpegThumbnail) {
-        try {
+
+          // Upload thumbnail to WA CDN — native newsletter requires thumbnailDirectPath
           const thumbPath = join(tmpdir(), `thumb-${ulid(Date.now())}.jpg`);
           writeFileSync(thumbPath, jpegThumbnail);
           const thumbSha256 = createHash('sha256').update(jpegThumbnail).digest();
           const thumbSha256B64 = encodeURIComponent(thumbSha256.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''));
-          const thumbUpload = await (this.client as any).waUploadToServer(thumbPath, {
-            mediaType: 'image',
-            fileEncSha256B64: thumbSha256B64,
-          });
-          thumbnailDirectPath = thumbUpload?.directPath;
-          thumbnailSha256 = thumbSha256;
+          try {
+            const thumbUpload = await (this.client as any).waUploadToServer(thumbPath, {
+              mediaType: 'image',
+              fileEncSha256B64: thumbSha256B64,
+            });
+            thumbnailDirectPath = thumbUpload?.directPath;
+            thumbnailSha256 = thumbSha256;
+          } catch { /* best-effort */ }
           try { unlinkSync(thumbPath); } catch { /* ignore */ }
-        } catch { /* best-effort — proceed without thumbnailDirectPath */ }
+        } catch { /* fall back to original if anything fails */ }
       }
-      const content = { [mediatype]: mediaContent, caption, fileName, jpegThumbnail, width, height, thumbnailDirectPath, thumbnailSha256 } as any;
+
+      const content = { [mediatype]: mediaContent, caption, fileName, mimetype, jpegThumbnail, width, height, thumbnailDirectPath, thumbnailSha256 } as any;
       this.logger.info(`[newsletter-media] sending ${mediatype} to ${jid} url=${typeof mediaContent === 'object' && !Buffer.isBuffer(mediaContent) && (mediaContent as any).url ? (mediaContent as any).url : 'buffer'}`);
       const result = await this.sendMessageWithTyping(data.number, content, data?.options);
       this.logger.info(`[newsletter-media] sent keyId=${result?.keyId} messageType=${result?.messageType}`);
