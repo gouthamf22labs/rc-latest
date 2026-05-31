@@ -1583,6 +1583,10 @@ export class WAStartupService {
             quoted: q,
             messageId,
           });
+          if (isJidNewsletter(recipient)) {
+            const imgMsg = m?.message?.['imageMessage'];
+            this.logger.info(`[newsletter-media] sendMessage returned keyId=${m?.key?.id} hasMessage=${!!m?.message} msgType=${Object.keys(m?.message || {}).join(',')} imgUrl=${imgMsg?.url} imgDirectPath=${imgMsg?.directPath}`);
+          }
         } else {
           m = generateWAMessageFromContent(recipient, message, {
             timestamp: new Date(),
@@ -1979,7 +1983,10 @@ export class WAStartupService {
         } catch { /* skip thumbnail if generation fails */ }
       }
       const content = { [mediatype]: mediaContent, caption, fileName, jpegThumbnail } as any;
-      return await this.sendMessageWithTyping(data.number, content, data?.options);
+      this.logger.info(`[newsletter-media] sending ${mediatype} to ${jid} url=${typeof mediaContent === 'object' && !Buffer.isBuffer(mediaContent) && (mediaContent as any).url ? (mediaContent as any).url : 'buffer'}`);
+      const result = await this.sendMessageWithTyping(data.number, content, data?.options);
+      this.logger.info(`[newsletter-media] sent keyId=${result?.keyId} messageType=${result?.messageType}`);
+      return result;
     }
 
     const generate = await this.prepareMediaMessage(data.mediaMessage);
