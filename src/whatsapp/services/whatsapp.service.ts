@@ -2693,15 +2693,61 @@ export class WAStartupService {
     return meta;
   }
 
+  private normalizeNewsletterMeta(meta: any) {
+    if (!meta) return null;
+    // Already flat (from parseNewsletterCreateResponse / createChannel)
+    if (typeof meta.name === 'string') return meta;
+    // Raw nested WA API response (from newsletterMetadata)
+    if (meta.thread_metadata) {
+      return {
+        id: meta.id,
+        name: meta.thread_metadata.name?.text ?? null,
+        description: meta.thread_metadata.description?.text ?? null,
+        invite: meta.thread_metadata.invite ?? null,
+        subscribers: parseInt(meta.thread_metadata.subscribers_count || '0', 10),
+        verification: meta.thread_metadata.verification ?? null,
+        creation_time: parseInt(meta.thread_metadata.creation_time || '0', 10),
+        picture: meta.thread_metadata.picture ?? null,
+        state: meta.state ?? null,
+        role: meta.viewer_metadata?.role ?? null,
+        mute_state: meta.viewer_metadata?.mute ?? null,
+      };
+    }
+    return null;
+  }
+
   public async fetchChannels() {
-    // Read from DB — metadata is saved during sync (messaging-history.set) and createChannel
     const chats = await this.repository.chat.findMany({
       where: { instanceId: this.instance.id, remoteJid: { contains: '@newsletter' } },
       distinct: ['remoteJid'],
       orderBy: { id: 'desc' },
     });
 
-    return chats.map((chat) => ({ ...chat, metadata: chat.content }));
+    const results = await Promise.all(
+      chats.map(async (chat) => {
+        const content = chat.content as any;
+        const normalized = this.normalizeNewsletterMeta(content);
+
+        if (normalized) {
+          return { ...chat, metadata: normalized };
+        }
+
+        // Content is stale chat data — fetch real metadata, normalize, and persist
+        try {
+          const meta = await this.client.newsletterMetadata('jid', chat.remoteJid);
+          if (meta) {
+            await this.repository.chat
+              .update({ where: { id: chat.id }, data: { content: meta as any } })
+              .catch(() => {});
+            return { ...chat, metadata: this.normalizeNewsletterMeta(meta) };
+          }
+        } catch { /* best-effort */ }
+
+        return { ...chat, metadata: null };
+      }),
+    );
+
+    return results.filter((r) => r.metadata !== null);
   }
 
   public async fetchChats(type?: string) {
