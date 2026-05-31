@@ -652,8 +652,17 @@ export class WAStartupService {
     'chats.upsert': async (chats: Chat[]) => {
       for (const chat of chats) {
         try {
-          const item = { ...chat };
+          let item: any = { ...chat };
           delete item.id;
+
+          // For newsletter chats, fetch full metadata (name, description, picture, role)
+          if (isJidNewsletter(chat.id)) {
+            try {
+              const meta = await this.client.newsletterMetadata('jid', chat.id);
+              if (meta) item = meta;
+            } catch { /* best-effort */ }
+          }
+
           const list: PrismType.Chat[] = [];
           const find = await this.repository.chat.findFirst({
             where: {
@@ -861,13 +870,36 @@ export class WAStartupService {
     }: BaileysEventMap['messaging-history.set']) => {
       if (chats && chats.length > 0) {
         const chatsRaw: PrismType.Chat[] = chats.map((chat) => {
+          const { id, ...item } = chat as any;
           return {
-            remoteJid: chat.id,
+            remoteJid: id,
             instanceId: this.instance.id,
+            content: item,
           } as PrismType.Chat;
         });
         await this.sendDataWebhook('chatsSet', chatsRaw);
         await this.repository.chat.createMany({ data: chatsRaw, skipDuplicates: true });
+
+        // Enrich newsletter chats with full metadata from WA and persist to DB
+        const newsletterJids = chatsRaw
+          .map((c) => c.remoteJid)
+          .filter((jid) => jid?.includes('@newsletter'));
+        for (const jid of newsletterJids) {
+          try {
+            const meta = await this.client.newsletterMetadata('jid', jid);
+            if (meta) {
+              const existing = await this.repository.chat.findFirst({
+                where: { instanceId: this.instance.id, remoteJid: jid },
+              });
+              if (existing) {
+                await this.repository.chat.update({
+                  where: { id: existing.id },
+                  data: { content: meta as any },
+                });
+              }
+            }
+          } catch { /* best-effort — enrich what we can */ }
+        }
       }
 
       if (messages && messages?.length > 0) {
@@ -1226,8 +1258,12 @@ export class WAStartupService {
             where: { instanceId: this.instance.id, remoteJid: jid },
           });
           if (!existing) {
+            let content: any = undefined;
+            try {
+              content = await this.client.newsletterMetadata('jid', jid);
+            } catch { /* best-effort */ }
             await this.repository.chat.create({
-              data: { remoteJid: jid, instanceId: this.instance.id },
+              data: { remoteJid: jid, instanceId: this.instance.id, content: content ?? undefined },
             });
             this.logger.info(`newsletter joined/created from phone saved: ${jid}`);
           }
@@ -2658,26 +2694,14 @@ export class WAStartupService {
   }
 
   public async fetchChannels() {
-    // Deduplicate by remoteJid — reconnects can create duplicate Chat rows via createMany
+    // Read from DB — metadata is saved during sync (messaging-history.set) and createChannel
     const chats = await this.repository.chat.findMany({
       where: { instanceId: this.instance.id, remoteJid: { contains: '@newsletter' } },
       distinct: ['remoteJid'],
       orderBy: { id: 'desc' },
     });
 
-    const results = await Promise.all(
-      chats.map(async (chat) => {
-        try {
-          const meta = await this.client.newsletterMetadata('jid', chat.remoteJid);
-          return { ...chat, metadata: meta };
-        } catch {
-          return null;
-        }
-      }),
-    );
-
-    // Filter out channels that returned null — no longer followed or deleted
-    return results.filter(Boolean);
+    return chats.map((chat) => ({ ...chat, metadata: chat.content }));
   }
 
   public async fetchChats(type?: string) {
