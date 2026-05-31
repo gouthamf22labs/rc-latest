@@ -1985,7 +1985,7 @@ export class WAStartupService {
 
           // Convert main image to JPEG buffer — ensures uploaded bytes, fileSha256,
           // fileLength and mimetype all agree. Passing { url } risks a PNG/JPEG mismatch.
-          const jpegBuffer = await sharp(srcBuffer).toFormat('jpeg', { quality: 90 }).toBuffer();
+          const jpegBuffer = await sharp(srcBuffer).toFormat('jpeg', { quality: 100 }).toBuffer();
           const meta = await sharp(jpegBuffer).metadata();
           width = meta.width;
           height = meta.height;
