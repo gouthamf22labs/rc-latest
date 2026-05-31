@@ -1970,19 +1970,25 @@ export class WAStartupService {
       const { mediatype, media, caption, fileName } = data.mediaMessage;
       const mediaContent = typeof media === 'string' ? { url: media } : media;
       let jpegThumbnail: Buffer | undefined;
+      let width: number | undefined;
+      let height: number | undefined;
       if (mediatype === 'image') {
         try {
           const isURL = typeof media === 'string' && /^https?:\/\//.test(media);
           const srcBuffer = isURL
             ? Buffer.from((await axios.get(media as string, { responseType: 'arraybuffer' })).data)
             : (media as Buffer);
-          jpegThumbnail = await sharp(srcBuffer)
+          const img = sharp(srcBuffer);
+          const meta = await img.metadata();
+          width = meta.width;
+          height = meta.height;
+          jpegThumbnail = await img
             .resize(320, 240, { fit: 'contain' })
             .toFormat('jpeg', { quality: 80 })
             .toBuffer();
-        } catch { /* skip thumbnail if generation fails */ }
+        } catch { /* skip if fails */ }
       }
-      const content = { [mediatype]: mediaContent, caption, fileName, jpegThumbnail } as any;
+      const content = { [mediatype]: mediaContent, caption, fileName, jpegThumbnail, width, height } as any;
       this.logger.info(`[newsletter-media] sending ${mediatype} to ${jid} url=${typeof mediaContent === 'object' && !Buffer.isBuffer(mediaContent) && (mediaContent as any).url ? (mediaContent as any).url : 'buffer'}`);
       const result = await this.sendMessageWithTyping(data.number, content, data?.options);
       this.logger.info(`[newsletter-media] sent keyId=${result?.keyId} messageType=${result?.messageType}`);
