@@ -45,8 +45,6 @@ RUN chmod +x ./deploy_db.sh
 
 RUN mkdir instances
 
-ENV NODE_ENV=production
-ENV DOCKER_ENV=true
 
 EXPOSE 8084
 
