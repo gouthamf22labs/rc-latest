@@ -40,36 +40,58 @@ import pino from 'pino';
 import { ConfigService, Log } from './env.config';
 import { join } from 'node:path';
 
+/**
+ * Shared root pino instance — built ONCE for the whole process.
+ *
+ * A pino `transport` does not log in-process; it spawns a dedicated worker
+ * thread (via thread-stream). Building a fresh pino() inside the Logger
+ * constructor meant every `new Logger()` / `setCtx()` leaked one worker
+ * thread that was never terminated. With a new WAStartupService created per
+ * instance and per `/instance/connect`, threads grew without bound (6k+ →
+ * ~90 GB RSS). We now create the transport once and derive every context via
+ * `.child({ context })`, which shares the single worker thread.
+ *
+ * @author goutham — Jun 01, 2026 — fix unbounded logger worker-thread leak
+ */
+let rootLogger: pino.Logger | undefined;
+
+function getRootLogger(configService: ConfigService): pino.Logger {
+  if (!rootLogger) {
+    rootLogger = pino({
+      level: configService.get<Log>('LOG').LEVEL,
+      timestamp: pino.stdTimeFunctions.isoTime,
+      transport: configService.get<boolean>('PRODUCTION')
+        ? {
+            target: 'pino/file',
+            options: {
+              destination: join(process.cwd(), 'logs', 'record'),
+              mkdir: true,
+              append: true,
+              sync: false,
+            },
+          }
+        : {
+            target: 'pino-pretty',
+            options: {
+              colorize: configService.get<Log>('LOG').COLOR,
+              translateTime: 'SYS:standard',
+              levelFirst: true,
+              singleLine: true,
+              ignore: 'pid,hostname',
+            },
+          },
+    });
+  }
+  return rootLogger;
+}
+
 export class Logger {
   constructor(
     private readonly configService: ConfigService,
     private readonly context = 'Logger',
   ) {
-    this.logger = pino({
-      level: configService.get<Log>('LOG').LEVEL,
-      timestamp: pino.stdTimeFunctions.isoTime,
-      transport:
-        configService.get<boolean>('PRODUCTION')
-          ? {
-              target: 'pino/file',
-              options: {
-                destination: join(process.cwd(), 'logs', 'record'),
-                mkdir: true,
-                append: true,
-                sync: false,
-              },
-            }
-          : {
-              target: 'pino-pretty',
-              options: {
-                colorize: configService.get<Log>('LOG').COLOR,
-                translateTime: 'SYS:standard',
-                levelFirst: true,
-                singleLine: true,
-                ignore: 'pid,hostname',
-              },
-            },
-    });
+    // Reuse the single shared transport — no new worker thread per instance.
+    this.logger = getRootLogger(configService);
   }
 
   private readonly logger: pino.Logger;
