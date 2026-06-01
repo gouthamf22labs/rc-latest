@@ -111,4 +111,8 @@ export class GroupController {
   ) {
     return await this.waMonitor.waInstances.get(instanceName).addChannelsByJid(body.jids);
   }
+
+  public async prewarmChannels({ instanceName }: InstanceDto) {
+    return await this.waMonitor.waInstances.get(instanceName).prewarmChannels();
+  }
 }

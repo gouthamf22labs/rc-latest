@@ -168,6 +168,14 @@ export function GroupRouter(
       });
       res.status(HttpStatus.OK).json(response);
     })
+    .post(routerPath('prewarmChannels'), ...guards, async (req, res) => {
+      const response = await dataValidate<InstanceDto>({
+        request: req,
+        schema: {},
+        execute: (instance) => groupController.prewarmChannels(instance),
+      });
+      res.status(HttpStatus.OK).json(response);
+    })
     .post(routerPath('createChannel'), ...guards, async (req, res) => {
       const response = await dataValidate<InstanceDto>({
         request: req,

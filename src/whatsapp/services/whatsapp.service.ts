@@ -533,10 +533,15 @@ export class WAStartupService {
           distinct: ['remoteJid'],
         })
         .then(async (chats) => {
-          for (const { remoteJid } of chats) {
+          const jids = chats.map((c) => c.remoteJid);
+          for (const remoteJid of jids) {
             try {
               await this.client.subscribeNewsletterUpdates(remoteJid);
             } catch { /* best-effort */ }
+          }
+          // Prewarm: fetch fresh metadata for all known channels and fire channelUpsert webhooks
+          if (jids.length > 0) {
+            this.enrichNewsletterChats(jids).catch(() => {});
           }
         })
         .catch(() => {});
@@ -2921,6 +2926,20 @@ export class WAStartupService {
       }
     }
     return results;
+  }
+
+  public async prewarmChannels() {
+    const chats = await this.repository.chat.findMany({
+      where: { instanceId: this.instance.id, remoteJid: { contains: '@newsletter' } },
+      select: { remoteJid: true },
+      distinct: ['remoteJid'],
+    });
+    const jids = chats.map((c) => c.remoteJid);
+    if (jids.length === 0) {
+      return { prewarmed: 0 };
+    }
+    await this.enrichNewsletterChats(jids);
+    return { prewarmed: jids.length };
   }
 
   public async rejectCall(data: RejectCallDto) {
