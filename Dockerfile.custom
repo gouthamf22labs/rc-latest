@@ -1,20 +1,14 @@
-# Use a slim Node.js base image for building
 FROM node:22-bullseye-slim AS base
 
-# Install Git and other dependencies
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y git ffmpeg && rm -rf /var/lib/apt/lists/*
 
-# Set the working directory
 WORKDIR /codechat
 
-# Copy package.json and package-lock.json files
 COPY package*.json ./
 COPY ./patches ./patches
 
-# Install dependencies
 RUN npm install --force
 
-# Copy the remaining application files
 COPY tsconfig.json .
 COPY ./src ./src
 COPY ./public ./public
@@ -24,21 +18,18 @@ COPY ./views ./views
 COPY .env.dev .env
 COPY prisma.config.mjs .
 
-# Environment variables will be loaded from .env file
-
-# Generate Prisma client
 RUN npx prisma generate
 
-# Build the application
 RUN npm run build
 
-# Use a slim Node.js base image for production
+RUN npm prune --production
+
 FROM node:22-bullseye-slim AS production
 
-# Set the working directory
+RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /codechat
 
-# Copy built files and necessary directories from the builder stage
 COPY --from=base /codechat/dist ./dist
 COPY --from=base /codechat/docs ./docs
 COPY --from=base /codechat/prisma ./prisma
@@ -50,17 +41,13 @@ COPY --from=base /codechat/prisma.config.mjs ./
 COPY --from=base /codechat/public ./public
 COPY ./deploy_db.sh ./
 
-# Make the deploy_db.sh script executable
 RUN chmod +x ./deploy_db.sh
 
-# Create a directory for instances
 RUN mkdir instances
 
-# Environment variables will be loaded from .env file
+ENV NODE_ENV=production
+ENV DOCKER_ENV=true
 
-# Expose the application port
 EXPOSE 8084
-
-# Define the entrypoint
 
 ENTRYPOINT [ "/bin/bash", "-c", ". ./deploy_db.sh && node ./dist/src/main" ]
