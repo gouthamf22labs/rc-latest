@@ -677,6 +677,17 @@ export class WAStartupService {
   }
 
   public async connectToWhatsapp(): Promise<WASocket> {
+    // In-flight guard (synchronous, before any await): if a connection attempt
+    // is already running for this instance, return the existing socket instead
+    // of opening a second one. The backend polls /instance/connect every ~90s;
+    // without this, a poll landing mid-(re)connect spawns a duplicate socket on
+    // the same creds → WhatsApp 'conflict: replaced' → endless flap storm.
+    if (this.stateConnection.state === 'connecting') {
+      this.logger.warn('connectToWhatsapp skipped — attempt already in progress');
+      return this.client;
+    }
+    this.stateConnection.state = 'connecting';
+
     try {
       // Tear down any existing socket first. Two live sockets on the same
       // session → WhatsApp sends 440 connectionReplaced → reconnect storm +

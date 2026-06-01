@@ -136,17 +136,23 @@ export class WAMonitoringService {
 
   private clearListeners(instanceName: string) {
     try {
-      const ev = this.waInstances.get(instanceName)?.client?.ev;
-      if (ev) {
-        ev.removeAllListeners('connection.update');
-        ev.removeAllListeners('messages.upsert');
-        ev.removeAllListeners('messages.update');
-        ev.removeAllListeners('messaging-history.set');
-        ev.removeAllListeners('contacts.upsert');
-        ev.removeAllListeners('chats.upsert');
-        ev.removeAllListeners('creds.update');
+      const client = this.waInstances.get(instanceName)?.client;
+      if (client?.ev) {
+        client.ev.removeAllListeners('connection.update');
+        client.ev.removeAllListeners('messages.upsert');
+        client.ev.removeAllListeners('messages.update');
+        client.ev.removeAllListeners('messaging-history.set');
+        client.ev.removeAllListeners('contacts.upsert');
+        client.ev.removeAllListeners('chats.upsert');
+        client.ev.removeAllListeners('creds.update');
+        client.ev.flush();
       }
-      this.waInstances.get(instanceName)?.client?.ev.flush();
+      // Close the underlying socket too. Removing listeners alone leaves the old
+      // WebSocket connected to WhatsApp; a replaced-but-still-live socket plus a
+      // freshly created one = two sockets on the same creds = WhatsApp
+      // 'conflict: replaced' → endless reconnect storm.
+      try { client?.ws?.close?.(); } catch { /* best-effort */ }
+      try { client?.end?.(undefined); } catch { /* best-effort */ }
       this.waInstances.delete(instanceName);
     } catch {
       this.logger.error(`Error clearing ${instanceName} instance listeners`);
