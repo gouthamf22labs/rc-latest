@@ -139,6 +139,7 @@ model Chat {
   Instance   Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
   instanceId Int
 
+  @@unique([instanceId, remoteJid])
   @@index([instanceId, remoteJid])
 }
 
