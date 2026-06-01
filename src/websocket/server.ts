@@ -74,6 +74,7 @@ export class Websocket {
         return;
       }
       this.hub.set(key, ws);
+      ws.on('close', () => this.hub.delete(key));
     });
 
     server.on('upgrade', (req, socket, head) => {

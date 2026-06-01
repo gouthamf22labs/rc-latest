@@ -51,6 +51,7 @@ import {
 import { Logger } from '../config/logger.config';
 import { ConfigService, Database } from '../config/env.config';
 import { PrismaPg } from '@prisma/adapter-pg';
+import pg from 'pg';
 
 type CreateLogs = {
   context: string;
@@ -63,7 +64,12 @@ export class Repository extends PrismaClient {
   constructor(private readonly configService: ConfigService) {
     super({
       adapter: new PrismaPg(
-        { connectionString: process.env.DATABASE_URL },
+        new pg.Pool({
+          connectionString: process.env.DATABASE_URL,
+          max: 100,
+          idleTimeoutMillis: 30000,
+          connectionTimeoutMillis: 5000,
+        }),
         {
           onConnectionError(err) {
             throw new InternalServerErrorException(err);

@@ -212,8 +212,8 @@ export class WAStartupService {
   private logger = new Logger(this.configService, 'wa-startup-service');
   private readonly instance: Partial<Instance> = {};
   private readonly webhook: Partial<Webhook> & { events?: WebhookEvents } = {};
-  private readonly msgRetryCounterCache: CacheStore = new NodeCache();
-  private readonly userDevicesCache: CacheStore = new NodeCache();
+  private readonly msgRetryCounterCache: CacheStore = new NodeCache({ stdTTL: 3600, maxKeys: 10000 });
+  private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 1800, maxKeys: 50000 });
   private readonly instanceQr: InstanceQrCode = { count: 0 };
   private readonly stateConnection: InstanceStateConnection = { state: 'close' };
   private readonly databaseOptions: Database =
@@ -540,6 +540,9 @@ export class WAStartupService {
           }
         })
         .catch(() => {});
+
+      this.instanceQr.base64 = undefined;
+      this.instanceQr.code = undefined;
 
       this.logger.info('instance started');
     }
@@ -1004,6 +1007,7 @@ export class WAStartupService {
         }
 
         messages = undefined;
+        messagesRaw.length = 0;
       }
     },
 
