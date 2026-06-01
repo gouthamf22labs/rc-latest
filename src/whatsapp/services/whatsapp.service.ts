@@ -224,6 +224,7 @@ export class WAStartupService {
   private authState: Partial<AuthState> = {};
   private authStateProvider: AuthStateProvider;
   private phoneNumber: string;
+  private reconnecting = false;
 
   public async setPhoneNumber(v: string) {
     this.phoneNumber = v;
@@ -490,10 +491,28 @@ export class WAStartupService {
     }
 
     if (connection === 'close') {
-      const shouldReconnect = (lastDisconnect.error as Boom)?.output?.statusCode !== 401;
+      const statusCode = (lastDisconnect.error as Boom)?.output?.statusCode;
+      // Canonical Baileys pattern: reconnect on everything except loggedOut (401).
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
       if (shouldReconnect) {
-        await this.connectToWhatsapp();
+        // Backoff + in-flight guard. Prevents the tight reconnect storm seen when
+        // two sockets share one session (e.g. 440 connectionReplaced during a
+        // rolling deploy): instead of hundreds of attempts/sec, one every few
+        // seconds. Self-heals once the duplicate socket dies.
+        if (!this.reconnecting) {
+          this.reconnecting = true;
+          setTimeout(async () => {
+            try {
+              await this.connectToWhatsapp();
+            } catch (err) {
+              this.logger.error('reconnect failed', err);
+            } finally {
+              this.reconnecting = false;
+            }
+          }, 3000);
+        }
       } else {
+        // 401 loggedOut — session is dead. Remove instance + delete session.
         this.sendDataWebhook('statusInstance', {
           instance: this.instance.name,
           status: 'removed',
@@ -658,6 +677,26 @@ export class WAStartupService {
 
   public async connectToWhatsapp(): Promise<WASocket> {
     try {
+      // Tear down any existing socket first. Two live sockets on the same
+      // session → WhatsApp sends 440 connectionReplaced → reconnect storm +
+      // RAM spike. Detach all listeners so the old socket's close event does
+      // NOT trigger our connectionUpdate/reconnect handler.
+      if (this.client) {
+        try {
+          this.client.ev.removeAllListeners('connection.update');
+          this.client.ev.removeAllListeners('creds.update');
+          this.client.ev.removeAllListeners('messaging-history.set');
+          this.client.ev.removeAllListeners('messages.upsert');
+          this.client.ws?.removeAllListeners?.();
+          this.client.end(undefined);
+        } catch { /* best-effort */ }
+        this.client = undefined;
+      }
+
+      // Mark connecting synchronously so a concurrent /instance/connect call
+      // sees 'connecting' (not the initial 'close') and won't spawn a 2nd socket.
+      this.stateConnection.state = 'connecting';
+
       this.instanceQr.count = 0;
       await this.loadWebhook();
       this.client = await this.setSocket();
@@ -665,6 +704,8 @@ export class WAStartupService {
 
       return this.client;
     } catch (error) {
+      // Reset state so a stuck 'connecting' doesn't block future reconnects.
+      this.stateConnection.state = 'close';
       this.logger.error(error);
       throw new InternalServerErrorException(error?.toString());
     }
