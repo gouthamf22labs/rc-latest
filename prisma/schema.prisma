@@ -107,6 +107,7 @@ model Message {
   Media             Media?
 
   @@index([keyId], name: "keyId")
+  @@index([instanceId, keyId])
 }
 
 model Media {
@@ -125,6 +126,8 @@ model MessageUpdate {
   status    String   @db.VarChar(30)
   Message   Message  @relation(fields: [messageId], references: [id], onDelete: Cascade)
   messageId Int
+
+  @@index([messageId])
 }
 
 model Chat {
@@ -135,6 +138,8 @@ model Chat {
   updatedAt  DateTime? @updatedAt
   Instance   Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
   instanceId Int
+
+  @@index([instanceId, remoteJid])
 }
 
 model Contact {
@@ -146,6 +151,8 @@ model Contact {
   updatedAt     DateTime? @updatedAt
   Instance      Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
   instanceId    Int
+
+  @@index([instanceId, remoteJid])
 }
 
 model Webhook {

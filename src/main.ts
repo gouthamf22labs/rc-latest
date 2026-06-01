@@ -37,6 +37,10 @@ import { onUnexpectedError } from './config/error.config';
 import { Logger } from './config/logger.config';
 import { AppModule } from './app.module';
 
+// Baileys registers one process.on('exit') listener per socket connection.
+// With many concurrent instances this exceeds the default limit of 10.
+process.setMaxListeners(0);
+
 const context = new Map<string, any>();
 
 export async function bootstrap() {

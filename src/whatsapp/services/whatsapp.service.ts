@@ -629,7 +629,7 @@ export class WAStartupService {
       maxMsgRetryCount: 1000,
       getMessage: this.getMessage as any,
       generateHighQualityLinkPreview: true,
-      syncFullHistory: true,
+      syncFullHistory: false,
       userDevicesCache: this.userDevicesCache,
       transactionOpts: { maxCommitRetries: 5, delayBetweenTriesMs: 50 },
     };
@@ -863,22 +863,17 @@ export class WAStartupService {
   };
 
   private async syncMessage(messages: PrismType.Message[]) {
-    const messagesRepository = await this.repository.message.findMany({
-      where: { instanceId: this.instance.id },
+    if (messages.length === 0) return;
+
+    const keyIds = messages.map((m) => m.keyId);
+    const existing = await this.repository.message.findMany({
+      where: { instanceId: this.instance.id, keyId: { in: keyIds } },
+      select: { keyId: true },
     });
-
-    for await (const message of messages) {
-      try {
-        if (messagesRepository.find((mr) => mr.keyId === message.keyId)) {
-          continue;
-        }
-
-        await this.repository.message.create({
-          data: message,
-        });
-      } catch {
-        //
-      }
+    const existingSet = new Set(existing.map((m) => m.keyId));
+    const toCreate = messages.filter((m) => !existingSet.has(m.keyId));
+    if (toCreate.length > 0) {
+      await this.repository.message.createMany({ data: toCreate });
     }
   }
 
