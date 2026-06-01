@@ -225,6 +225,7 @@ export class WAStartupService {
   private authStateProvider: AuthStateProvider;
   private phoneNumber: string;
   private reconnecting = false;
+  private prewarmActive = false;
 
   public async setPhoneNumber(v: string) {
     this.phoneNumber = v;
@@ -929,31 +930,34 @@ export class WAStartupService {
     }
   }
 
+  private async enrichOneNewsletter(jid: string) {
+    const meta = await this.client.newsletterMetadata('jid', jid);
+    if (!meta) return;
+    const existing = await this.repository.chat.findFirst({
+      where: { instanceId: this.instance.id, remoteJid: jid },
+    });
+    if (existing) {
+      await this.repository.chat.update({
+        where: { id: existing.id },
+        data: { content: meta as any },
+      });
+      const channelPayload = { remoteJid: jid, metadata: meta };
+      this.ws.send(this.instance.name, 'channel.update', channelPayload);
+      await this.sendDataWebhook('channelUpdated', channelPayload);
+    } else {
+      await this.repository.chat.create({
+        data: { remoteJid: jid, instanceId: this.instance.id, content: meta as any },
+      });
+      const channelPayload = { remoteJid: jid, metadata: meta };
+      this.ws.send(this.instance.name, 'channel.upsert', channelPayload);
+      await this.sendDataWebhook('channelUpsert', channelPayload);
+    }
+  }
+
   private async enrichNewsletterChats(jids: string[]) {
     for (const jid of jids) {
       try {
-        const meta = await this.client.newsletterMetadata('jid', jid);
-        if (meta) {
-          const existing = await this.repository.chat.findFirst({
-            where: { instanceId: this.instance.id, remoteJid: jid },
-          });
-          if (existing) {
-            await this.repository.chat.update({
-              where: { id: existing.id },
-              data: { content: meta as any },
-            });
-            const channelPayload = { remoteJid: jid, metadata: meta };
-            this.ws.send(this.instance.name, 'channel.update', channelPayload);
-            await this.sendDataWebhook('channelUpdated', channelPayload);
-          } else {
-            await this.repository.chat.create({
-              data: { remoteJid: jid, instanceId: this.instance.id, content: meta as any },
-            });
-            const channelPayload = { remoteJid: jid, metadata: meta };
-            this.ws.send(this.instance.name, 'channel.upsert', channelPayload);
-            await this.sendDataWebhook('channelUpsert', channelPayload);
-          }
-        }
+        await this.enrichOneNewsletter(jid);
       } catch { /* best-effort */ }
     }
   }
@@ -2921,6 +2925,10 @@ export class WAStartupService {
   }
 
   public async prewarmChannels() {
+    if (this.prewarmActive) {
+      return { started: false, reason: 'already running' };
+    }
+
     const chats = await this.repository.chat.findMany({
       where: { instanceId: this.instance.id, remoteJid: { contains: '@newsletter' } },
       select: { remoteJid: true },
@@ -2928,10 +2936,40 @@ export class WAStartupService {
     });
     const jids = chats.map((c) => c.remoteJid);
     if (jids.length === 0) {
-      return { prewarmed: 0 };
+      return { started: false, total: 0 };
     }
-    await this.enrichNewsletterChats(jids);
-    return { prewarmed: jids.length };
+
+    // Run in the background so the HTTP request returns immediately.
+    // Throttled: small gap between each channel + a pause every batch, so a
+    // large account (thousands of channels) won't spike CPU/network or trip
+    // WhatsApp rate limits.
+    this.prewarmActive = true;
+    const BATCH = 50;
+    const PER_CALL_DELAY_MS = 150;
+    const PER_BATCH_PAUSE_MS = 2000;
+
+    (async () => {
+      let done = 0;
+      try {
+        for (let i = 0; i < jids.length; i++) {
+          if (this.stateConnection.state !== 'open') break; // stop if disconnected
+          try {
+            await this.enrichOneNewsletter(jids[i]);
+          } catch { /* best-effort */ }
+          done++;
+          await delay(PER_CALL_DELAY_MS);
+          if ((i + 1) % BATCH === 0) {
+            this.logger.info(`prewarmChannels progress: ${done}/${jids.length}`);
+            await delay(PER_BATCH_PAUSE_MS);
+          }
+        }
+        this.logger.info(`prewarmChannels finished: ${done}/${jids.length}`);
+      } finally {
+        this.prewarmActive = false;
+      }
+    })();
+
+    return { started: true, total: jids.length };
   }
 
   public async rejectCall(data: RejectCallDto) {
