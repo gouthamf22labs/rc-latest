@@ -1435,6 +1435,19 @@ export class WAStartupService {
           this.groupHandler['group-participants.update'](payload as any);
         }
 
+        // Channel (newsletter) live updates — analog of groups.update. Baileys
+        // emits these when a followed channel's settings/participants change;
+        // re-enrich the Chat row and fire the channel.update webhook.
+        if (events?.['newsletter-settings.update']) {
+          const { id } = events['newsletter-settings.update'] as any;
+          if (id) this.enrichOneNewsletter(id).catch(() => null);
+        }
+
+        if (events?.['newsletter-participants.update']) {
+          const { id } = events['newsletter-participants.update'] as any;
+          if (id) this.enrichOneNewsletter(id).catch(() => null);
+        }
+
         if (events?.['chats.upsert']) {
           const payload = events['chats.upsert'];
           this.chatHandle['chats.upsert'](payload);
