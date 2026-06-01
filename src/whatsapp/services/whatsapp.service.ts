@@ -224,6 +224,19 @@ export class WAStartupService {
   private authState: Partial<AuthState> = {};
   private authStateProvider: AuthStateProvider;
   private phoneNumber: string;
+  private syncWorkerTimer: NodeJS.Timeout | null = null;
+  private syncWorkerActive = false;
+
+  // SyncQueue delegate — available after prisma generate runs in Docker build
+  private get sq() {
+    return (this.repository as any).syncQueue as {
+      createMany: (args: any) => Promise<any>;
+      findMany: (args: any) => Promise<any[]>;
+      deleteMany: (args: any) => Promise<any>;
+      delete: (args: any) => Promise<any>;
+      count: (args: any) => Promise<number>;
+    };
+  }
 
   public async setPhoneNumber(v: string) {
     this.phoneNumber = v;
@@ -490,6 +503,7 @@ export class WAStartupService {
     }
 
     if (connection === 'close') {
+      this.stopSyncWorker();
       const shouldReconnect = (lastDisconnect.error as Boom)?.output?.statusCode !== 401;
       if (shouldReconnect) {
         await this.connectToWhatsapp();
@@ -549,6 +563,7 @@ export class WAStartupService {
       this.instanceQr.base64 = undefined;
       this.instanceQr.code = undefined;
 
+      this.startSyncWorker();
       this.logger.info('instance started');
     }
   }
@@ -637,7 +652,7 @@ export class WAStartupService {
       maxMsgRetryCount: 1000,
       getMessage: this.getMessage as any,
       generateHighQualityLinkPreview: true,
-      syncFullHistory: false,
+      syncFullHistory: true,
       userDevicesCache: this.userDevicesCache,
       transactionOpts: { maxCommitRetries: 5, delayBetweenTriesMs: 50 },
     };
@@ -926,80 +941,67 @@ export class WAStartupService {
     'messaging-history.set': async ({
       messages,
       chats,
-      isLatest,
+      contacts,
     }: BaileysEventMap['messaging-history.set']) => {
+      // --- SyncQueue: extract newsletter/group JIDs + contacts for background enrichment ---
+      const syncData: { type: string; remoteJid: string; data?: any; instanceId: number }[] = [];
+
       if (chats && chats.length > 0) {
-        const chatsRaw: PrismType.Chat[] = chats.map((chat) => {
-          const { id, ...item } = chat as any;
-          return {
-            remoteJid: id,
-            instanceId: this.instance.id,
-            content: item,
-          } as PrismType.Chat;
-        });
-        await this.sendDataWebhook('chatsSet', chatsRaw);
-        await this.repository.chat.createMany({ data: chatsRaw, skipDuplicates: true });
+        const chatsRaw: PrismType.Chat[] = [];
 
-        // Enrich newsletter chats from this chunk
-        const chunkNewsletterJids = chatsRaw
-          .map((c) => c.remoteJid)
-          .filter((jid) => jid?.includes('@newsletter'));
-        if (chunkNewsletterJids.length) {
-          this.enrichNewsletterChats(chunkNewsletterJids).catch(() => {});
-        }
-      }
+        for (const chat of chats) {
+          const jid = (chat as any).id as string;
+          if (!jid) continue;
 
-      // On final sync chunk, re-enrich ALL newsletter chats in DB to catch any stale content
-      if (isLatest) {
-        const allNewsletterChats = await this.repository.chat.findMany({
-          where: { instanceId: this.instance.id, remoteJid: { contains: '@newsletter' } },
-          select: { remoteJid: true },
-        });
-        const allJids = allNewsletterChats.map((c) => c.remoteJid);
-        if (allJids.length) {
-          this.enrichNewsletterChats(allJids).catch(() => {});
-        }
-      }
-
-      if (messages && messages?.length > 0) {
-        const messagesRaw: PrismType.Message[] = [];
-        for (const [, m] of Object.entries(messages)) {
-          if (
-            m.message?.protocolMessage ||
-            m.message?.senderKeyDistributionMessage ||
-            !m.message
-          ) {
-            continue;
+          if (isJidNewsletter(jid)) {
+            syncData.push({ type: 'newsletter', remoteJid: jid, instanceId: this.instance.id });
+          } else if (isJidGroup(jid)) {
+            syncData.push({ type: 'group', remoteJid: jid, instanceId: this.instance.id });
           }
 
-          let timestamp = m?.messageTimestamp;
+          const { id, ...item } = chat as any;
+          chatsRaw.push({ remoteJid: jid, instanceId: this.instance.id, content: item } as PrismType.Chat);
+        }
 
-          if (
-            timestamp &&
-            typeof timestamp === 'object' &&
-            typeof timestamp.toNumber === 'function'
-          ) {
-            timestamp = timestamp.toNumber();
-          } else if (
-            timestamp &&
-            typeof timestamp === 'object' &&
-            'low' in timestamp &&
-            'high' in timestamp
-          ) {
-            timestamp = Number(timestamp.low) || 0;
+        // Original: save chats to DB + fire webhook
+        if (chatsRaw.length > 0) {
+          await this.sendDataWebhook('chatsSet', chatsRaw);
+          await this.repository.chat.createMany({ data: chatsRaw, skipDuplicates: true });
+        }
+      }
+
+      if (contacts && contacts.length > 0) {
+        for (const contact of contacts) {
+          if (!contact.id) continue;
+          syncData.push({ type: 'contact', remoteJid: contact.id, data: contact, instanceId: this.instance.id });
+        }
+      }
+
+      // Batch upsert into SyncQueue — unique constraint prevents duplicates on re-sync
+      if (syncData.length > 0) {
+        await this.sq.createMany({
+          data: syncData,
+          skipDuplicates: true,
+        }).catch(() => {});
+      }
+
+      // Original: process messages if SYNC_MESSAGES enabled
+      if (messages && messages.length > 0) {
+        const messagesRaw: PrismType.Message[] = [];
+        for (const [, m] of Object.entries(messages)) {
+          if (m.message?.protocolMessage || m.message?.senderKeyDistributionMessage || !m.message) continue;
+          let timestamp = m?.messageTimestamp;
+          if (timestamp && typeof timestamp === 'object' && typeof (timestamp as any).toNumber === 'function') {
+            timestamp = (timestamp as any).toNumber();
+          } else if (timestamp && typeof timestamp === 'object' && 'low' in timestamp) {
+            timestamp = Number((timestamp as any).low) || 0;
           } else if (typeof timestamp !== 'number') {
             timestamp = 0;
           }
-
           const messageType = getContentType(m.message);
-
-          if (!messageType) {
-            continue;
-          }
-
+          if (!messageType) continue;
           const user = getJidUser(m.key);
           const group = getUserGroup(m.key, m?.participant);
-
           messagesRaw.push({
             keyId: m.key.id,
             keyFromMe: m.key.fromMe,
@@ -1015,14 +1017,11 @@ export class WAStartupService {
             device: getDevice(m.key.id),
           } as PrismType.Message);
         }
-
         this.sendDataWebhook('messagesSet', messagesRaw).catch(() => null);
-
         if (this.databaseOptions.DB_OPTIONS.SYNC_MESSAGES) {
           await this.syncMessage(messagesRaw);
         }
-
-        messages = undefined;
+        messages = undefined as any;
         messagesRaw.length = 0;
       }
     },
@@ -2926,6 +2925,100 @@ export class WAStartupService {
       }
     }
     return results;
+  }
+
+  private stopSyncWorker() {
+    this.syncWorkerActive = false;
+    if (this.syncWorkerTimer) {
+      clearTimeout(this.syncWorkerTimer);
+      this.syncWorkerTimer = null;
+    }
+  }
+
+  private startSyncWorker() {
+    this.stopSyncWorker();
+    this.syncWorkerActive = true;
+    const run = async () => {
+      if (!this.syncWorkerActive) return;
+      try {
+        const BATCH = 10;
+
+        // --- newsletters ---
+        const newsletters = await this.sq.findMany({
+          where: { instanceId: this.instance.id, type: 'newsletter' },
+          take: BATCH,
+        });
+        if (newsletters.length > 0) {
+          const jids = newsletters.map((r) => r.remoteJid);
+          try {
+            await this.enrichNewsletterChats(jids);
+            await this.sq.deleteMany({
+              where: { instanceId: this.instance.id, type: 'newsletter', remoteJid: { in: jids } },
+            });
+          } catch { /* leave rows in queue to retry next tick */ }
+        }
+
+        // --- groups ---
+        const groups = await this.sq.findMany({
+          where: { instanceId: this.instance.id, type: 'group' },
+          take: BATCH,
+        });
+        for (const row of groups) {
+          try {
+            const meta = await this.client.groupMetadata(row.remoteJid);
+            if (meta) {
+              this.ws.send(this.instance.name, 'groups.upsert', [meta]);
+              await this.sendDataWebhook('groupsUpsert', [meta]);
+            }
+            await this.sq.delete({ where: { id: row.id } }).catch(() => {});
+          } catch { /* leave row in queue to retry next tick */ }
+        }
+
+        // --- contacts ---
+        const contacts = await this.sq.findMany({
+          where: { instanceId: this.instance.id, type: 'contact' },
+          take: BATCH * 5,
+        });
+        if (contacts.length > 0 && this.databaseOptions.DB_OPTIONS.CONTACTS) {
+          const rows = contacts.map((r) => {
+            const d = r.data as any;
+            return {
+              remoteJid: r.remoteJid,
+              pushName: d?.name || d?.notify || r.remoteJid,
+              profilePicUrl: null,
+              instanceId: this.instance.id,
+            };
+          });
+          await this.repository.contact.createMany({ data: rows, skipDuplicates: true }).catch(() => {});
+        }
+        if (contacts.length > 0) {
+          await this.sq.deleteMany({
+            where: { instanceId: this.instance.id, type: 'contact', id: { in: contacts.map((r) => r.id) } },
+          }).catch(() => {});
+        }
+
+        // --- orphan cleanup: rows older than 1 hour ---
+        await this.sq.deleteMany({
+          where: {
+            instanceId: this.instance.id,
+            createdAt: { lt: new Date(Date.now() - 60 * 60 * 1000) },
+          },
+        }).catch(() => {});
+
+        const remaining = await this.sq.count({
+          where: { instanceId: this.instance.id },
+        });
+        const delay = remaining > 0 ? 5000 : 30000;
+        if (this.syncWorkerActive) {
+          this.syncWorkerTimer = setTimeout(run, delay);
+        }
+      } catch {
+        if (this.syncWorkerActive) {
+          this.syncWorkerTimer = setTimeout(run, 30000);
+        }
+      }
+    };
+    this.syncWorkerTimer = setTimeout(run, 5000);
   }
 
   public async prewarmChannels() {

@@ -79,6 +79,7 @@ export class Repository extends PrismaClient {
     });
   }
 
+
   private readonly logger = new Logger(this.configService, 'repository');
 
   public async onModuleInit() {
