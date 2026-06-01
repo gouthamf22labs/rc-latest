@@ -533,15 +533,10 @@ export class WAStartupService {
           distinct: ['remoteJid'],
         })
         .then(async (chats) => {
-          const jids = chats.map((c) => c.remoteJid);
-          for (const remoteJid of jids) {
+          for (const { remoteJid } of chats) {
             try {
               await this.client.subscribeNewsletterUpdates(remoteJid);
             } catch { /* best-effort */ }
-          }
-          // Prewarm: fetch fresh metadata for all known channels and fire channelUpsert webhooks
-          if (jids.length > 0) {
-            this.enrichNewsletterChats(jids).catch(() => {});
           }
         })
         .catch(() => {});
@@ -940,23 +935,6 @@ export class WAStartupService {
         await this.sendDataWebhook('chatsSet', chatsRaw);
         await this.repository.chat.createMany({ data: chatsRaw, skipDuplicates: true });
 
-        const newsletterJids = chatsRaw
-          .map((c) => c.remoteJid)
-          .filter((jid) => jid?.includes('@newsletter'));
-        if (newsletterJids.length) {
-          this.enrichNewsletterChats(newsletterJids).catch(() => {});
-        }
-      }
-
-      if (isLatest) {
-        const allNewsletterChats = await this.repository.chat.findMany({
-          where: { instanceId: this.instance.id, remoteJid: { contains: '@newsletter' } },
-          select: { remoteJid: true },
-        });
-        const allJids = allNewsletterChats.map((c) => c.remoteJid);
-        if (allJids.length) {
-          this.enrichNewsletterChats(allJids).catch(() => {});
-        }
       }
 
       // Process messages if SYNC_MESSAGES enabled
