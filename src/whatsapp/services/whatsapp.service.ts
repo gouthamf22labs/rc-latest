@@ -674,12 +674,16 @@ export class WAStartupService {
           let item: any = { ...chat };
           delete item.id;
 
-          // For newsletter chats, fetch full metadata (name, description, picture, role)
-          if (isJidNewsletter(chat.id)) {
+          const isNewsletter = isJidNewsletter(chat.id);
+
+          // Always process newsletter chats regardless of CHATS flag
+          if (isNewsletter) {
             try {
               const meta = await this.client.newsletterMetadata('jid', chat.id);
               if (meta) item = meta;
             } catch { /* best-effort */ }
+          } else if (!this.databaseOptions.DB_OPTIONS.CHATS) {
+            continue;
           }
 
           const list: PrismType.Chat[] = [];
@@ -728,6 +732,8 @@ export class WAStartupService {
         }
       >[],
     ) => {
+      if (!this.databaseOptions.DB_OPTIONS.CHATS) return;
+
       const chatsRaw: PrismType.Chat[] = chats.map((chat) => {
         const item = { ...chat };
         delete item.id;
@@ -783,6 +789,7 @@ export class WAStartupService {
         const c = await this.repository.chat.findFirst({
           where: {
             remoteJid: chat,
+            instanceId: this.instance.id,
           },
         });
         if (c) {
@@ -798,21 +805,20 @@ export class WAStartupService {
 
   private readonly contactHandle = {
     'contacts.upsert': async (contacts: Contact[]) => {
+      if (!this.databaseOptions.DB_OPTIONS.CONTACTS) return;
+
       for (const contact of contacts) {
         const list: PrismType.Contact[] = [];
         try {
           const find = await this.repository.contact.findFirst({
-            where: {
-              remoteJid: contact.id,
-              instanceId: this.instance.id,
-            },
+            where: { remoteJid: contact.id, instanceId: this.instance.id },
           });
           if (!find) {
             const create = await this.repository.contact.create({
               data: {
                 remoteJid: contact.id,
                 pushName: contact?.name || contact.id,
-                profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
+                profilePicUrl: null,
                 instanceId: this.instance.id,
               },
             });
@@ -821,7 +827,6 @@ export class WAStartupService {
             list.push(find);
           }
           this.ws.send(this.instance.name, 'contacts.upsert', list);
-
           await this.sendDataWebhook('contactsUpsert', list);
         } catch (error) {
           this.logger.error(error);
@@ -830,21 +835,20 @@ export class WAStartupService {
     },
 
     'contacts.update': async (contacts: Partial<Contact>[]) => {
+      if (!this.databaseOptions.DB_OPTIONS.CONTACTS) return;
+
       for (const contact of contacts) {
         const list: PrismType.Contact[] = [];
         try {
           const find = await this.repository.contact.findFirst({
-            where: {
-              remoteJid: contact.id,
-              instanceId: this.instance.id,
-            },
+            where: { remoteJid: contact.id, instanceId: this.instance.id },
           });
           if (!find) {
             const create = await this.repository.contact.create({
               data: {
                 remoteJid: contact.id,
                 pushName: contact?.name || contact.id,
-                profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
+                profilePicUrl: null,
                 instanceId: this.instance.id,
               },
             });
@@ -853,7 +857,6 @@ export class WAStartupService {
             list.push(find);
           }
           this.ws.send(this.instance.name, 'contacts.upsert', list);
-
           await this.sendDataWebhook('contactsUpsert', list);
         } catch (error) {
           this.logger.error(error);
