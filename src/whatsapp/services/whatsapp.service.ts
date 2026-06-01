@@ -712,6 +712,55 @@ export class WAStartupService {
     }
   }
 
+  /**
+   * Live channel auto-register.
+   *
+   * A followed newsletter's posts arrive on an already-connected socket via
+   * `messages.upsert`, but that path only saves the Message — it never creates
+   * the `@newsletter` Chat row (those rows otherwise come only from
+   * `chats.upsert` / the on-connect history sync). So without a reconnect a
+   * channel never shows up in the Chat table. Here we upsert the Chat row on
+   * the first live post, enriched via `newsletterMetadata`, mirroring the
+   * `chats.upsert` shape and emitting the same channel.upsert events.
+   */
+  private async ensureNewsletterChat(jid: string) {
+    try {
+      const existing = await this.repository.chat.findFirst({
+        where: { remoteJid: jid, instanceId: this.instance.id },
+        select: { id: true },
+      });
+      if (existing) return;
+
+      let content: any = { id: jid };
+      try {
+        const meta = await this.client.newsletterMetadata('jid', jid);
+        if (meta) content = meta;
+      } catch { /* best-effort enrichment */ }
+
+      let create: PrismType.Chat;
+      try {
+        create = await this.repository.chat.create({
+          data: { remoteJid: jid, content, instanceId: this.instance.id },
+        });
+      } catch (err: any) {
+        // Concurrent post created it first (unique instanceId+remoteJid) — done.
+        if (err?.code === 'P2002') return;
+        throw err;
+      }
+
+      this.ws.send(this.instance.name, 'chats.upsert', [create]);
+      await this.sendDataWebhook('chatsUpsert', [create]);
+
+      const channelPayload = { remoteJid: jid, metadata: content };
+      this.ws.send(this.instance.name, 'channel.upsert', channelPayload);
+      await this.sendDataWebhook('channelUpsert', channelPayload);
+
+      this.logger.info(`channel auto-registered from live post: ${jid}`);
+    } catch (error) {
+      this.logger.warn('ensureNewsletterChat failed', error);
+    }
+  }
+
   private readonly chatHandle = {
     'chats.upsert': async (chats: Chat[]) => {
       for (const chat of chats) {
@@ -1036,6 +1085,12 @@ export class WAStartupService {
           continue;
         }
 
+        // Live channel auto-register: a followed newsletter's post lands here
+        // without any reconnect — make sure the channel exists in the Chat table.
+        if (isJidNewsletter(received.key.remoteJid)) {
+          await this.ensureNewsletterChat(received.key.remoteJid);
+        }
+
         await this.client.sendPresenceUpdate('unavailable');
 
         let timestamp = received?.messageTimestamp;
@@ -1059,7 +1114,9 @@ export class WAStartupService {
 
         const messageType = getContentType(received.message);
         if (!messageType) {
-          return;
+          // Skip just this message — `return` here would abandon the rest of
+          // the batch (e.g. a newsletter post queued after a typeless message).
+          continue;
         }
 
         if (typeof received.message[messageType] === 'string') {
