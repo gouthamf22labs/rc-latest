@@ -61,6 +61,8 @@ export class WebhookEvents {
   callUpsert?: boolean;
   labelsAssociation?: boolean;
   labelsEdit?: boolean;
+  channelUpsert?: boolean;
+  channelUpdated?: boolean;
 }
 
 export type EventsType =
@@ -85,7 +87,9 @@ export type EventsType =
   | 'refresh.token'
   | 'call.upsert'
   | 'labels.association'
-  | 'labels.edit';
+  | 'labels.edit'
+  | 'channel.upsert'
+  | 'channel.update';
 
 export type WebhookEventsType = keyof WebhookEvents;
 
@@ -112,6 +116,8 @@ export const WebhookEventsEnum: Record<WebhookEventsType, EventsType> = {
   callUpsert: 'call.upsert',
   labelsAssociation: 'labels.association',
   labelsEdit: 'labels.edit',
+  channelUpsert: 'channel.upsert',
+  channelUpdated: 'channel.update',
 };
 
 export const ListEvents: EventsType[] = Object.values(WebhookEventsEnum);

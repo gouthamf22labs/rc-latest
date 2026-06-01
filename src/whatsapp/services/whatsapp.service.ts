@@ -718,8 +718,13 @@ export class WAStartupService {
             list.push(update);
           }
           this.ws.send(this.instance.name, 'chats.upsert', list);
-
           await this.sendDataWebhook('chatsUpsert', list);
+
+          if (isNewsletter) {
+            const channelPayload = { remoteJid: chat.id, metadata: item };
+            this.ws.send(this.instance.name, 'channel.upsert', channelPayload);
+            await this.sendDataWebhook('channelUpsert', channelPayload);
+          }
         } catch (error) {
           this.logger.error(error);
         }
@@ -896,10 +901,16 @@ export class WAStartupService {
               where: { id: existing.id },
               data: { content: meta as any },
             });
+            const channelPayload = { remoteJid: jid, metadata: meta };
+            this.ws.send(this.instance.name, 'channel.update', channelPayload);
+            await this.sendDataWebhook('channelUpdated', channelPayload);
           } else {
             await this.repository.chat.create({
               data: { remoteJid: jid, instanceId: this.instance.id, content: meta as any },
             });
+            const channelPayload = { remoteJid: jid, metadata: meta };
+            this.ws.send(this.instance.name, 'channel.upsert', channelPayload);
+            await this.sendDataWebhook('channelUpsert', channelPayload);
           }
         }
       } catch { /* best-effort */ }
@@ -1309,6 +1320,9 @@ export class WAStartupService {
             await this.repository.chat.create({
               data: { remoteJid: jid, instanceId: this.instance.id, content: content ?? undefined },
             });
+            const channelPayload = { remoteJid: jid, metadata: content };
+            this.ws.send(this.instance.name, 'channel.upsert', channelPayload);
+            await this.sendDataWebhook('channelUpsert', channelPayload);
             this.logger.info(`newsletter joined/created from phone saved: ${jid}`);
           }
         }
