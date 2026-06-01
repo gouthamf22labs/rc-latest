@@ -224,19 +224,6 @@ export class WAStartupService {
   private authState: Partial<AuthState> = {};
   private authStateProvider: AuthStateProvider;
   private phoneNumber: string;
-  private syncWorkerTimer: NodeJS.Timeout | null = null;
-  private syncWorkerActive = false;
-
-  // SyncQueue delegate — available after prisma generate runs in Docker build
-  private get sq() {
-    return (this.repository as any).syncQueue as {
-      createMany: (args: any) => Promise<any>;
-      findMany: (args: any) => Promise<any[]>;
-      deleteMany: (args: any) => Promise<any>;
-      delete: (args: any) => Promise<any>;
-      count: (args: any) => Promise<number>;
-    };
-  }
 
   public async setPhoneNumber(v: string) {
     this.phoneNumber = v;
@@ -503,7 +490,6 @@ export class WAStartupService {
     }
 
     if (connection === 'close') {
-      this.stopSyncWorker();
       const shouldReconnect = (lastDisconnect.error as Boom)?.output?.statusCode !== 401;
       if (shouldReconnect) {
         await this.connectToWhatsapp();
@@ -563,7 +549,6 @@ export class WAStartupService {
       this.instanceQr.base64 = undefined;
       this.instanceQr.code = undefined;
 
-      this.startSyncWorker();
       this.logger.info('instance started');
     }
   }
@@ -941,54 +926,40 @@ export class WAStartupService {
     'messaging-history.set': async ({
       messages,
       chats,
-      contacts,
+      isLatest,
     }: BaileysEventMap['messaging-history.set']) => {
-      // --- SyncQueue: extract newsletter/group JIDs + contacts for background enrichment ---
-      const syncData: { type: string; remoteJid: string; data?: any; instanceId: number }[] = [];
-
       if (chats && chats.length > 0) {
-        const chatsRaw: PrismType.Chat[] = [];
-
-        for (const chat of chats) {
-          const jid = (chat as any).id as string;
-          if (!jid) continue;
-
-          if (isJidNewsletter(jid)) {
-            syncData.push({ type: 'newsletter', remoteJid: jid, instanceId: this.instance.id });
-          } else if (isJidGroup(jid)) {
-            syncData.push({ type: 'group', remoteJid: jid, instanceId: this.instance.id });
-          }
-
+        const chatsRaw: PrismType.Chat[] = chats.map((chat) => {
           const { id, ...item } = chat as any;
-          chatsRaw.push({ remoteJid: jid, instanceId: this.instance.id, content: item } as PrismType.Chat);
-        }
+          return {
+            remoteJid: id,
+            instanceId: this.instance.id,
+            content: item,
+          } as PrismType.Chat;
+        });
+        await this.sendDataWebhook('chatsSet', chatsRaw);
+        await this.repository.chat.createMany({ data: chatsRaw, skipDuplicates: true });
 
-        // Original: save chats to DB + fire webhook
-        if (chatsRaw.length > 0) {
-          await this.sendDataWebhook('chatsSet', chatsRaw);
-          await this.repository.chat.createMany({ data: chatsRaw, skipDuplicates: true });
-        }
-      }
-
-      if (contacts && contacts.length > 0) {
-        for (const contact of contacts) {
-          if (!contact.id) continue;
-          syncData.push({ type: 'contact', remoteJid: contact.id, data: contact, instanceId: this.instance.id });
-        }
-      }
-
-      // Batch upsert into SyncQueue — unique constraint prevents duplicates on re-sync
-      this.logger.info(`messaging-history.set: chats=${chats?.length ?? 0} contacts=${contacts?.length ?? 0} syncData=${syncData.length}`);
-      if (syncData.length > 0) {
-        try {
-          await this.sq.createMany({ data: syncData, skipDuplicates: true });
-          this.logger.info(`SyncQueue populated: ${syncData.length} rows`);
-        } catch (err) {
-          this.logger.error('SyncQueue.createMany failed', err);
+        const newsletterJids = chatsRaw
+          .map((c) => c.remoteJid)
+          .filter((jid) => jid?.includes('@newsletter'));
+        if (newsletterJids.length) {
+          this.enrichNewsletterChats(newsletterJids).catch(() => {});
         }
       }
 
-      // Original: process messages if SYNC_MESSAGES enabled
+      if (isLatest) {
+        const allNewsletterChats = await this.repository.chat.findMany({
+          where: { instanceId: this.instance.id, remoteJid: { contains: '@newsletter' } },
+          select: { remoteJid: true },
+        });
+        const allJids = allNewsletterChats.map((c) => c.remoteJid);
+        if (allJids.length) {
+          this.enrichNewsletterChats(allJids).catch(() => {});
+        }
+      }
+
+      // Process messages if SYNC_MESSAGES enabled
       if (messages && messages.length > 0) {
         const messagesRaw: PrismType.Message[] = [];
         for (const [, m] of Object.entries(messages)) {
@@ -2928,100 +2899,6 @@ export class WAStartupService {
       }
     }
     return results;
-  }
-
-  private stopSyncWorker() {
-    this.syncWorkerActive = false;
-    if (this.syncWorkerTimer) {
-      clearTimeout(this.syncWorkerTimer);
-      this.syncWorkerTimer = null;
-    }
-  }
-
-  private startSyncWorker() {
-    this.stopSyncWorker();
-    this.syncWorkerActive = true;
-    const run = async () => {
-      if (!this.syncWorkerActive) return;
-      try {
-        const BATCH = 10;
-
-        // --- newsletters ---
-        const newsletters = await this.sq.findMany({
-          where: { instanceId: this.instance.id, type: 'newsletter' },
-          take: BATCH,
-        });
-        if (newsletters.length > 0) {
-          const jids = newsletters.map((r) => r.remoteJid);
-          try {
-            await this.enrichNewsletterChats(jids);
-            await this.sq.deleteMany({
-              where: { instanceId: this.instance.id, type: 'newsletter', remoteJid: { in: jids } },
-            });
-          } catch { /* leave rows in queue to retry next tick */ }
-        }
-
-        // --- groups ---
-        const groups = await this.sq.findMany({
-          where: { instanceId: this.instance.id, type: 'group' },
-          take: BATCH,
-        });
-        for (const row of groups) {
-          try {
-            const meta = await this.client.groupMetadata(row.remoteJid);
-            if (meta) {
-              this.ws.send(this.instance.name, 'groups.upsert', [meta]);
-              await this.sendDataWebhook('groupsUpsert', [meta]);
-            }
-            await this.sq.delete({ where: { id: row.id } }).catch(() => {});
-          } catch { /* leave row in queue to retry next tick */ }
-        }
-
-        // --- contacts ---
-        const contacts = await this.sq.findMany({
-          where: { instanceId: this.instance.id, type: 'contact' },
-          take: BATCH * 5,
-        });
-        if (contacts.length > 0 && this.databaseOptions.DB_OPTIONS.CONTACTS) {
-          const rows = contacts.map((r) => {
-            const d = r.data as any;
-            return {
-              remoteJid: r.remoteJid,
-              pushName: d?.name || d?.notify || r.remoteJid,
-              profilePicUrl: null,
-              instanceId: this.instance.id,
-            };
-          });
-          await this.repository.contact.createMany({ data: rows, skipDuplicates: true }).catch(() => {});
-        }
-        if (contacts.length > 0) {
-          await this.sq.deleteMany({
-            where: { instanceId: this.instance.id, type: 'contact', id: { in: contacts.map((r) => r.id) } },
-          }).catch(() => {});
-        }
-
-        // --- orphan cleanup: rows older than 1 hour ---
-        await this.sq.deleteMany({
-          where: {
-            instanceId: this.instance.id,
-            createdAt: { lt: new Date(Date.now() - 60 * 60 * 1000) },
-          },
-        }).catch(() => {});
-
-        const remaining = await this.sq.count({
-          where: { instanceId: this.instance.id },
-        });
-        const delay = remaining > 0 ? 5000 : 30000;
-        if (this.syncWorkerActive) {
-          this.syncWorkerTimer = setTimeout(run, delay);
-        }
-      } catch {
-        if (this.syncWorkerActive) {
-          this.syncWorkerTimer = setTimeout(run, 30000);
-        }
-      }
-    };
-    this.syncWorkerTimer = setTimeout(run, 5000);
   }
 
   public async prewarmChannels() {

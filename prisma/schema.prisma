@@ -177,18 +177,6 @@ model ActivityLogs {
   instanceId  Int?      @db.Integer
 }
 
-model SyncQueue {
-  id         Int      @id @default(autoincrement())
-  type       String   @db.VarChar(20)
-  remoteJid  String   @db.VarChar(100)
-  data       Json?    @db.JsonB
-  instanceId Int
-  createdAt  DateTime @default(now())
-
-  @@unique([instanceId, type, remoteJid])
-  @@index([instanceId, type])
-}
-
 model Session {
   id         Int      @id @default(autoincrement())
   sessionKey String   @db.VarChar(300)
