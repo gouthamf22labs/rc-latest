@@ -978,11 +978,14 @@ export class WAStartupService {
       }
 
       // Batch upsert into SyncQueue — unique constraint prevents duplicates on re-sync
+      this.logger.info(`messaging-history.set: chats=${chats?.length ?? 0} contacts=${contacts?.length ?? 0} syncData=${syncData.length}`);
       if (syncData.length > 0) {
-        await this.sq.createMany({
-          data: syncData,
-          skipDuplicates: true,
-        }).catch(() => {});
+        try {
+          await this.sq.createMany({ data: syncData, skipDuplicates: true });
+          this.logger.info(`SyncQueue populated: ${syncData.length} rows`);
+        } catch (err) {
+          this.logger.error('SyncQueue.createMany failed', err);
+        }
       }
 
       // Original: process messages if SYNC_MESSAGES enabled
