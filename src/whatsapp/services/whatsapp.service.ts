@@ -478,28 +478,57 @@ export class WAStartupService {
       }
     }
 
+    const closeStatusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+    // "Never paired" = no ownerJid AND Baileys creds not registered. Requiring
+    // both avoids false-positives: a real session whose ownerJid is momentarily
+    // null (loaded from DB, not yet 'open') still has registered creds, so it
+    // is NOT treated as unpaired and will still reconnect.
+    const neverPaired =
+      !this.instance.ownerJid && !this.client?.authState?.creds?.registered;
+    const isRestartRequired = closeStatusCode === DisconnectReason.restartRequired;
+    // A never-authenticated socket closing (QR timeout etc.) is NOT a real
+    // disconnect — suppress its webhook to kill the storm from connect-polling
+    // unpaired instances. The post-scan restartRequired (515) is exempt: it's
+    // part of normal pairing and must still flow.
+    const suppressNoise =
+      connection === 'close' && neverPaired && !isRestartRequired;
+
     if (connection) {
       this.stateConnection.state = connection;
-      this.stateConnection.statusReason =
-        (lastDisconnect?.error as Boom)?.output?.statusCode ?? 200;
+      this.stateConnection.statusReason = closeStatusCode ?? 200;
 
-      const data = {
-        instance: this.instance.name,
-        ...this.stateConnection,
-      };
-      this.ws.send(this.instance.name, 'connection.update', data);
-      this.sendDataWebhook('connectionUpdated', data);
+      if (!suppressNoise) {
+        const data = {
+          instance: this.instance.name,
+          ...this.stateConnection,
+        };
+        this.ws.send(this.instance.name, 'connection.update', data);
+        this.sendDataWebhook('connectionUpdated', data);
+      }
     }
 
     if (connection === 'close') {
-      const statusCode = (lastDisconnect.error as Boom)?.output?.statusCode;
       // Canonical Baileys pattern: reconnect on everything except loggedOut (401).
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      if (shouldReconnect) {
-        // Backoff + in-flight guard. Prevents the tight reconnect storm seen when
-        // two sockets share one session (e.g. 440 connectionReplaced during a
-        // rolling deploy): instead of hundreds of attempts/sec, one every few
-        // seconds. Self-heals once the duplicate socket dies.
+      const isLoggedOut = closeStatusCode === DisconnectReason.loggedOut;
+
+      if (isLoggedOut) {
+        // 401 — session is dead. Remove instance + delete session.
+        this.sendDataWebhook('statusInstance', {
+          instance: this.instance.name,
+          status: 'removed',
+        });
+        this.eventEmitter.emit('remove.instance', this.instance, 'inner');
+        this.client?.ws?.close();
+        this.client.end(new Error('Close connection'));
+      } else if (neverPaired && !isRestartRequired) {
+        // Never-paired socket closed without a scan (QR timeout / transient).
+        // Do NOT auto-reconnect — that's the loop the backend's connect-polling
+        // would otherwise spin forever. The socket already closed (that's why
+        // we're here), so we simply stop. A fresh /instance/connect starts a
+        // new QR session on demand. restartRequired is handled by the else.
+        this.logger.info('unpaired instance closed - not reconnecting');
+      } else {
+        // Paired instance OR post-scan restartRequired → reconnect with backoff.
         if (!this.reconnecting) {
           this.reconnecting = true;
           setTimeout(async () => {
@@ -512,15 +541,6 @@ export class WAStartupService {
             }
           }, 3000);
         }
-      } else {
-        // 401 loggedOut — session is dead. Remove instance + delete session.
-        this.sendDataWebhook('statusInstance', {
-          instance: this.instance.name,
-          status: 'removed',
-        });
-        this.eventEmitter.emit('remove.instance', this.instance, 'inner');
-        this.client?.ws?.close();
-        this.client.end(new Error('Close connection'));
       }
     }
 
