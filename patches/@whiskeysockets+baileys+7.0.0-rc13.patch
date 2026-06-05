@@ -41,10 +41,10 @@ index df19870..992e0fd 100644
      return {
          ...sock,
 diff --git a/node_modules/@whiskeysockets/baileys/lib/Socket/messages-send.js b/node_modules/@whiskeysockets/baileys/lib/Socket/messages-send.js
-index d61e064..420c988 100644
+index d61e064..c823c6a 100644
 --- a/node_modules/@whiskeysockets/baileys/lib/Socket/messages-send.js
 +++ b/node_modules/@whiskeysockets/baileys/lib/Socket/messages-send.js
-@@ -478,12 +478,19 @@ export const makeMessagesSocket = (config) => {
+@@ -478,12 +478,27 @@ export const makeMessagesSocket = (config) => {
                      attrs: {},
                      content: bytes
                  });
@@ -55,13 +55,21 @@ index d61e064..420c988 100644
 +                if (additionalNodes && additionalNodes.length > 0) {
 +                    binaryNodeContent.push(...additionalNodes);
 +                }
++                // Poll/event stanzas must be typed 'poll'/'event' so the server sets
++                // them up for voting/responses. Media and text stay 'text' (newsletter
++                // media is sent via the plaintext path and relies on type 'text').
++                const newsletterMsgType = getMessageType(message);
++                const newsletterStanzaType =
++                    newsletterMsgType === 'poll' || newsletterMsgType === 'event'
++                        ? newsletterMsgType
++                        : 'text';
                  const stanza = {
                      tag: 'message',
                      attrs: {
                          to: jid,
                          id: msgId,
 -                        type: getMessageType(message),
-+                        type: 'text',
++                        type: newsletterStanzaType,
                          ...(additionalAttributes || {})
                      },
                      content: binaryNodeContent
