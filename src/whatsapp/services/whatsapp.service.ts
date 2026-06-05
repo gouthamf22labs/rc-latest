@@ -1693,7 +1693,17 @@ export class WAStartupService {
 
         const messageId = options?.messageId || ulid(Date.now());
 
-        if (message?.['react'] || message?.['edit'] || message?.['text'] || message?.['poll'] || isJidNewsletter(recipient)) {
+        // Pre-built poll/quiz protos (pollCreationMessage*) must NOT go through
+        // client.sendMessage: that path expects high-level `{ poll }` content and
+        // treats a raw proto as media (prepareWAMessageMedia -> 'Invalid media type').
+        // Route them through generateWAMessageFromContent + relayMessage below, which
+        // accepts the raw proto and, for newsletters, encodes the plaintext stanza.
+        const isPollProto =
+          message?.['pollCreationMessage'] ||
+          message?.['pollCreationMessageV2'] ||
+          message?.['pollCreationMessageV3'];
+
+        if (!isPollProto && (message?.['react'] || message?.['edit'] || message?.['text'] || message?.['poll'] || isJidNewsletter(recipient))) {
           // Newsletters: client.sendMessage internally calls prepareWAMessageMedia with the
           // newsletter JID, which uses the correct unencrypted upload path for newsletters.
           // relayMessage() skips this and sends the pre-built proto which WhatsApp rejects for media.
@@ -1716,11 +1726,6 @@ export class WAStartupService {
           // Polls and events need a meta node in the wire stanza.
           // client.sendMessage adds these automatically; we must inject them manually
           // when building proto directly and calling relayMessage.
-          const isPollProto =
-            message?.['pollCreationMessage'] ||
-            message?.['pollCreationMessageV2'] ||
-            message?.['pollCreationMessageV3'];
-
           const additionalNodes = isPollProto
             ? [{ tag: 'meta' as const, attrs: { polltype: 'creation' }, content: undefined }]
             : message?.['eventMessage']
