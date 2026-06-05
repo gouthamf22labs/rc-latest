@@ -41,10 +41,22 @@ index df19870..992e0fd 100644
      return {
          ...sock,
 diff --git a/node_modules/@whiskeysockets/baileys/lib/Socket/messages-send.js b/node_modules/@whiskeysockets/baileys/lib/Socket/messages-send.js
-index d61e064..6692c11 100644
+index d61e064..420c988 100644
 --- a/node_modules/@whiskeysockets/baileys/lib/Socket/messages-send.js
 +++ b/node_modules/@whiskeysockets/baileys/lib/Socket/messages-send.js
-@@ -483,7 +483,7 @@ export const makeMessagesSocket = (config) => {
+@@ -478,12 +478,19 @@ export const makeMessagesSocket = (config) => {
+                     attrs: {},
+                     content: bytes
+                 });
++                // Forward additionalNodes (e.g. <meta polltype="creation"> for poll
++                // creation, <meta event_type="creation"> for events) so newsletter
++                // polls register server-side for voting. Without this, channel poll
++                // votes are rejected with "your vote couldn't be saved".
++                if (additionalNodes && additionalNodes.length > 0) {
++                    binaryNodeContent.push(...additionalNodes);
++                }
+                 const stanza = {
+                     tag: 'message',
                      attrs: {
                          to: jid,
                          id: msgId,
