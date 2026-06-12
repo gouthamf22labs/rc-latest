@@ -79,6 +79,8 @@
 
     const instanceName = "{{instanceName}}";
     const token = "{{auth.token}}";
+    const qrcodeDark = "{{qrcodeDark}}";
+    const qrcodeLight = "{{qrcodeLight}}";
 
     const $ = window.$; // jQuery global
 
@@ -141,7 +143,7 @@
                         errorCorrectionLevel: "L",
                         width: size,
                         margin: 2,
-                        color: { dark: "#198754", light: "#ffffff" },
+                        color: { dark: qrcodeDark, light: qrcodeLight },
                     },
                     (err) => {
                         if (err) {

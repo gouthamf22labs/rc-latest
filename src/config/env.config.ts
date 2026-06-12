@@ -222,7 +222,7 @@ export class ConfigService {
           : '#ffffff',
         DARK_COLOR: process.env?.QRCODE_DARK_COLOR
           ? process.env?.QRCODE_DARK_COLOR
-          : '#198754',
+          : '#314158',
       },
       CONNECTION_TIMEOUT: Number.parseInt(process.env?.CONNECTION_TIMEOUT || '300'),
       AUTHENTICATION: {

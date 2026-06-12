@@ -77,6 +77,8 @@ export class ViewsController {
         isDocker: process.env?.DOCKER_ENV || 'false',
         env: process.env?.NODE_ENV || 'dev',
         version: pkg.version,
+        qrcodeDark: process.env?.QRCODE_DARK_COLOR || '#314158',
+        qrcodeLight: process.env?.QRCODE_LIGHT_COLOR || '#ffffff',
       });
     } catch (error) {
       console.log('ERROR: ', error);
