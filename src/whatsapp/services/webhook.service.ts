@@ -90,7 +90,16 @@ export class WebhookService {
       throw new BadRequestException(error.message);
     }
 
-    return await this.waMonitor.waInstances.get(instanceName).setWebhook(data as any);
+    // The instance can vanish from waInstances between the get() above and here
+    // (e.g. the unregister-then-delete cron tears it down concurrently). Calling
+    // .setWebhook() on undefined threw a TypeError outside the try → HTTP 500.
+    // If there's no live instance, the DB path above already persisted the change,
+    // so return gracefully instead of crashing.
+    const live = this.waMonitor.waInstances.get(instanceName);
+    if (!live) {
+      return { enabled: data.enabled, url: data.url } as any;
+    }
+    return await live.setWebhook(data as any);
   }
 
   public async find({ instanceName }: InstanceDto) {
