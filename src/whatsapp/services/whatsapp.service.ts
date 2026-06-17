@@ -166,6 +166,7 @@ import { fetchLatestBaileysVersionV2 } from '../../utils/wa-version';
 import { getJidUser, getUserGroup } from '../../utils/extract-id';
 import { getObjectUrl } from '../../integrations/minio/minio.utils';
 import { encodeProps } from '../../utils/encode.props';
+import { backoffDelay } from '../../utils/reconnect-backoff';
 
 export const MessageSubtype = () => [
   'ephemeralMessage',
@@ -225,6 +226,7 @@ export class WAStartupService {
   private authStateProvider: AuthStateProvider;
   private phoneNumber: string;
   private reconnecting = false;
+  private reconnectAttempts = 0;
   private prewarmActive = false;
 
   public async setPhoneNumber(v: string) {
@@ -531,6 +533,14 @@ export class WAStartupService {
         // Paired instance OR post-scan restartRequired → reconnect with backoff.
         if (!this.reconnecting) {
           this.reconnecting = true;
+          // Jittered exponential backoff de-synchronizes instances that all
+          // dropped together, so retries don't hammer WhatsApp in lockstep
+          // waves (the lockstep is what earns repeated 428 connectionClosed).
+          const delay = backoffDelay(this.reconnectAttempts);
+          this.reconnectAttempts++;
+          this.logger.info(
+            `reconnect scheduled in ${delay}ms (attempt ${this.reconnectAttempts})`,
+          );
           setTimeout(async () => {
             try {
               await this.connectToWhatsapp();
@@ -539,12 +549,15 @@ export class WAStartupService {
             } finally {
               this.reconnecting = false;
             }
-          }, 3000);
+          }, delay);
         }
       }
     }
 
     if (connection === 'open') {
+      // Successful connection — clear the backoff so the next unrelated drop
+      // starts again from the base delay instead of an inflated one.
+      this.reconnectAttempts = 0;
       this.instance.ownerJid = this.client.user.id.replace(/:\d+/, '');
       this.instance.profilePicUrl = (
         await this.profilePicture(this.instance.ownerJid)
