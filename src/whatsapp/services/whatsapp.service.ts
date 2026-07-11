@@ -194,6 +194,48 @@ type InstanceQrCode = {
 type InstanceStateConnection = {
   state: 'refused' | WAConnectionState;
   statusReason?: number;
+  // Raw attributes of the WhatsApp <failure> / <stream:error> node that closed the
+  // socket, e.g. { reason: '401', location: 'frc' }. Baileys stashes these in Boom.data
+  // but statusReason alone throws them away — and the numeric code cannot distinguish a
+  // user unlinking the device from WhatsApp revoking a restricted account: both are 401.
+  failureNode?: { tag?: string; attrs?: Record<string, string> };
+  failureMessage?: string;
+};
+
+/**
+ * Pulls the WhatsApp failure node out of the Boom that Baileys ended the socket with.
+ * Exactly three Baileys paths attach `data` to the Boom (baileys 7.0.0-rc13, Socket/socket.js):
+ *   - `CB:failure`      (:797) → data is the node's attrs, e.g. { reason: '401', location: 'frc' }
+ *   - `CB:stream:error` (:792) → data is the whole BinaryNode, { tag, attrs, content }
+ *   - `mapWebSocketError` (:964) → data is a raw Node Error (ECONNRESET etc.) — NOT a WhatsApp
+ *     verdict, just a dropped socket. Its enumerable code/errno/syscall would otherwise be
+ *     reported as failure attrs, which is the exact confusion this field exists to remove.
+ *     It is rejected here; `failureMessage` still carries "WebSocket Error (...)".
+ * Normalise the first two to { tag, attrs }, keeping only primitive attr values so the result
+ * is safe to JSON-serialise onto the webhook (BinaryNodes carry Buffer content).
+ */
+const extractFailureNode = (
+  error?: Error,
+): InstanceStateConnection['failureNode'] => {
+  const data = (error as Boom)?.data;
+  if (!data || typeof data !== 'object' || data instanceof Error) {
+    return undefined;
+  }
+
+  const node = 'attrs' in data ? (data as Record<string, any>) : { attrs: data };
+  const attrs: Record<string, string> = {};
+  for (const [key, value] of Object.entries(node.attrs ?? {})) {
+    if (typeof value === 'string' || typeof value === 'number') {
+      attrs[key] = String(value);
+    }
+  }
+
+  const tag = typeof node.tag === 'string' ? node.tag : undefined;
+  if (!tag && Object.keys(attrs).length === 0) {
+    return undefined;
+  }
+
+  return { tag, attrs };
 };
 
 export class WAStartupService {
@@ -413,6 +455,9 @@ export class WAStartupService {
 
         this.stateConnection.state = 'refused';
         this.stateConnection.statusReason = DisconnectReason.connectionClosed;
+        // QR timeout is not a WhatsApp failure — don't let a previous close's node ride along.
+        this.stateConnection.failureNode = undefined;
+        this.stateConnection.failureMessage = undefined;
 
         this.sendDataWebhook('connectionUpdated', {
           instance: this.instance.name,
@@ -480,7 +525,22 @@ export class WAStartupService {
       }
     }
 
-    const closeStatusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+    const closeError = lastDisconnect?.error as Boom;
+    const closeStatusCode = closeError?.output?.statusCode;
+    const failureNode = extractFailureNode(closeError);
+    const failureMessage = closeError?.message;
+
+    if (connection === 'close') {
+      // The status code alone is ambiguous (401 = "user unlinked the device" AND
+      // "WhatsApp revoked a restricted account"). The failure node's attrs are the
+      // only thing that tells them apart, so always log them at close.
+      this.logger.error(`connection closed[${this.instanceName}]`, {
+        statusCode: closeStatusCode ?? 'none',
+        failureNode: failureNode ?? 'none',
+        message: failureMessage ?? 'none',
+      });
+    }
+
     // "Never paired" = no ownerJid AND Baileys creds not registered. Requiring
     // both avoids false-positives: a real session whose ownerJid is momentarily
     // null (loaded from DB, not yet 'open') still has registered creds, so it
@@ -498,6 +558,12 @@ export class WAStartupService {
     if (connection) {
       this.stateConnection.state = connection;
       this.stateConnection.statusReason = closeStatusCode ?? 200;
+      // stateConnection is long-lived and spread into every webhook — clear the failure
+      // detail on any non-close update, or a stale node rides along on the next 'open'.
+      this.stateConnection.failureNode =
+        connection === 'close' ? failureNode : undefined;
+      this.stateConnection.failureMessage =
+        connection === 'close' ? failureMessage : undefined;
 
       if (!suppressNoise) {
         const data = {
