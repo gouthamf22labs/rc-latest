@@ -547,6 +547,23 @@ export class WAStartupService {
     // is NOT treated as unpaired and will still reconnect.
     const neverPaired =
       !this.instance.ownerJid && !this.client?.authState?.creds?.registered;
+    // Paired once (ownerJid survives) but the creds are gone — cleaningUp()
+    // wipes Session rows on 401 without clearing ownerJid, so on the next boot
+    // useDatabaseAuthState falls back to initAuthCreds() and the instance looks
+    // paired while holding blank creds. Reconnecting can never authenticate;
+    // only a fresh QR scan can. Without this the neverPaired guard misses it
+    // (ownerJid is set) and it retries at the 60s cap forever.
+    //
+    // Identity is `creds.me`, NOT `creds.registered`: in Baileys 7.0.0-rc13
+    // `registered` is only ever set true by the pairing-CODE flow
+    // (messages-recv.js:940). QR pairing goes through
+    // configureSuccessfulPairing, which sets `me`/`account` and leaves
+    // `registered` false forever — so gating on `registered` would treat every
+    // healthy QR-paired instance as dead and stop it reconnecting.
+    const credsLost =
+      !!this.instance.ownerJid &&
+      !this.client?.authState?.creds?.me?.id &&
+      !this.client?.authState?.creds?.registered;
     const isRestartRequired = closeStatusCode === DisconnectReason.restartRequired;
     // A never-authenticated socket closing (QR timeout etc.) is NOT a real
     // disconnect — suppress its webhook to kill the storm from connect-polling
@@ -588,6 +605,17 @@ export class WAStartupService {
         this.eventEmitter.emit('remove.instance', this.instance, 'inner');
         this.client?.ws?.close();
         this.client.end(new Error('Close connection'));
+      } else if (credsLost && !isRestartRequired) {
+        // Unrecoverable without a human scanning a QR. Stop retrying and tell
+        // the product so it can prompt a re-scan, instead of burning ~1
+        // connection/minute per instance forever and earning 428s.
+        this.logger.warn(
+          `creds lost for paired instance - not reconnecting, re-scan required`,
+        );
+        this.sendDataWebhook('statusInstance', {
+          instance: this.instance.name,
+          status: 'requiresRescan',
+        });
       } else if (neverPaired && !isRestartRequired) {
         // Never-paired socket closed without a scan (QR timeout / transient).
         // Do NOT auto-reconnect — that's the loop the backend's connect-polling
