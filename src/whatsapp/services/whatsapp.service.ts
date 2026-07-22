@@ -184,6 +184,16 @@ const parsedRescanMax = Number.parseInt(process.env.RESCAN_MAX_ATTEMPTS ?? '', 1
 const RESCAN_MAX_ATTEMPTS =
   Number.isFinite(parsedRescanMax) && parsedRescanMax > 0 ? parsedRescanMax : 5;
 
+// A paired instance WITH creds.me but whose device was removed on the phone keeps
+// attempting a login WhatsApp rejects with 428 (credsLost never fires because me is
+// present) — it flaps and fires a "connectionUpdated" webhook every ~60s. We keep
+// reconnecting (a real network outage self-heals the same way), but after this many
+// consecutive failed reconnects we stop firing the close webhook so it goes quiet in
+// the drain instead of storming it. Recovery ('open') still fires and resets the count.
+const parsedQuiet = Number.parseInt(process.env.MAX_RECONNECT_BEFORE_QUIET ?? '', 10);
+const MAX_RECONNECT_BEFORE_QUIET =
+  Number.isFinite(parsedQuiet) && parsedQuiet > 0 ? parsedQuiet : 3;
+
 export const MessageSubtype = () => [
   'ephemeralMessage',
   'documentWithCaptionMessage',
@@ -654,9 +664,32 @@ export class WAStartupService {
     // A never-authenticated socket closing (QR timeout etc.) is NOT a real
     // disconnect — suppress its webhook to kill the storm from connect-polling
     // unpaired instances. The post-scan restartRequired (515) is exempt: it's
-    // part of normal pairing and must still flow.
+    // part of normal pairing and must flow.
+    //
+    // NOTE: creds-lost closes are deliberately NOT suppressed. The backend
+    // (wa-send-later-be) marks an instance OFFLINE + logs the user out ONLY from
+    // this connectionUpdated(close) webhook — its status.instance handler ignores
+    // `requiresRescan`. Suppressing it would leave the backend thinking a dead
+    // instance is still ONLINE. The recurring storm is instead killed by flipping
+    // the instance OFFLINE in Postgres below: the poller only pokes ONLINE
+    // instances, so after this first close it stops → no more rebuilds → silence.
+    //
+    // A paired instance that has been flapping (>= MAX_RECONNECT_BEFORE_QUIET
+    // consecutive failed reconnects, never reaching 'open') does go quiet: the
+    // backend already learned it's offline from the first few closes, it keeps
+    // trying (so a network blip still self-heals and re-fires 'open'), and we stop
+    // spamming a close webhook every cycle.
+    const flappingQuiet =
+      connection === 'close' &&
+      !neverPaired &&
+      !credsLost &&
+      !isRestartRequired &&
+      closeStatusCode !== DisconnectReason.loggedOut &&
+      this.reconnectAttempts >= MAX_RECONNECT_BEFORE_QUIET;
     const suppressNoise =
-      connection === 'close' && neverPaired && !isRestartRequired;
+      connection === 'close' &&
+      (neverPaired || flappingQuiet) &&
+      !isRestartRequired;
 
     if (connection) {
       this.stateConnection.state = connection;
@@ -703,6 +736,9 @@ export class WAStartupService {
         ) {
           this.rescanAttempts = 0;
         }
+        // requiresRescan stays true across attempts until an 'open' recovers it,
+        // so a false->true transition here is the *first* detection of an episode.
+        const firstDetection = !this.stateConnection.requiresRescan;
         this.rescanAttempts++;
         this.stateConnection.requiresRescan = true;
         this.rescanFlaggedAt = Date.now();
@@ -711,10 +747,28 @@ export class WAStartupService {
             `(attempt ${this.rescanAttempts}/${RESCAN_MAX_ATTEMPTS}` +
             `${this.rescanAttempts >= RESCAN_MAX_ATTEMPTS ? ', cooldown active' : ''})`,
         );
-        this.sendDataWebhook('statusInstance', {
-          instance: this.instance.name,
-          status: 'requiresRescan',
-        });
+        // Only act on the first detection of an episode — otherwise a zombie
+        // instance spams the DB + webhook on every poke.
+        if (firstDetection) {
+          // Flip the instance OFFLINE in Postgres. The backend connect-poller only
+          // pokes ONLINE instances, so this stops it rebuilding a doomed socket for
+          // this instance — killing the "428 Reconnecting" storm at its source. A
+          // later user-driven re-scan sets it back ONLINE on the 'open' handler.
+          this.instance.connectionStatus = 'OFFLINE';
+          this.repository.instance
+            .update({
+              where: { id: this.instance.id },
+              data: { connectionStatus: 'OFFLINE' },
+            })
+            .catch((err) =>
+              this.logger.error('failed to mark creds-lost instance OFFLINE', err),
+            );
+          // One accurate alert per episode (the drain can prompt a re-scan).
+          this.sendDataWebhook('statusInstance', {
+            instance: this.instance.name,
+            status: 'requiresRescan',
+          });
+        }
       } else if (neverPaired && !isRestartRequired) {
         // Never-paired socket closed without a scan (QR timeout / transient).
         // Do NOT auto-reconnect — that's the loop the backend's connect-polling

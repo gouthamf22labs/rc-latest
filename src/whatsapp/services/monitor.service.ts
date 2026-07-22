@@ -114,11 +114,12 @@ export class WAMonitoringService {
     let kicked = 0;
     for (const [name, instance] of this.waInstances) {
       try {
-        const state = instance.getInstance()?.status?.state;
-        // Healthy or mid-connect → leave it. Creds-lost → only a QR re-scan fixes
-        // it, and isAwaitingRescan throttles those, so don't rebuild here.
-        if (state === 'open' || state === 'connecting') continue;
-        if (instance.isAwaitingRescan?.()) continue;
+        const status = instance.getInstance()?.status;
+        // Healthy or mid-connect → leave it. requiresRescan (creds-lost, or a
+        // gave-up flapper) → only a human QR re-scan fixes it, so never auto-poke
+        // it here (that's what marks it OFFLINE + fires the storm).
+        if (status?.state === 'open' || status?.state === 'connecting') continue;
+        if (status?.requiresRescan) continue;
         await instance.connectToWhatsapp();
         kicked++;
       } catch (err) {
