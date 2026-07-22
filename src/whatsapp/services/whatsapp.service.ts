@@ -167,6 +167,22 @@ import { getJidUser, getUserGroup } from '../../utils/extract-id';
 import { getObjectUrl } from '../../integrations/minio/minio.utils';
 import { encodeProps } from '../../utils/encode.props';
 import { backoffDelay } from '../../utils/reconnect-backoff';
+import { connectLimiter } from '../../utils/connect-limiter';
+
+// After creds are lost, a paired instance can only recover by a human scanning a
+// fresh QR. Building a socket per backend connect-poll just churns WASM signal
+// repos (the RAM leak). We allow a short burst of RESCAN_MAX_ATTEMPTS rebuilds so
+// a user who fumbles the scan can retry immediately, then throttle with a cooldown
+// (after which a fresh burst is allowed) so background polling stops churning.
+const parsedRescanCooldown = Number.parseInt(process.env.RESCAN_COOLDOWN_MS ?? '', 10);
+const RESCAN_COOLDOWN_MS =
+  Number.isFinite(parsedRescanCooldown) && parsedRescanCooldown > 0
+    ? parsedRescanCooldown
+    : 5 * 60 * 1000;
+
+const parsedRescanMax = Number.parseInt(process.env.RESCAN_MAX_ATTEMPTS ?? '', 10);
+const RESCAN_MAX_ATTEMPTS =
+  Number.isFinite(parsedRescanMax) && parsedRescanMax > 0 ? parsedRescanMax : 5;
 
 export const MessageSubtype = () => [
   'ephemeralMessage',
@@ -200,6 +216,10 @@ type InstanceStateConnection = {
   // user unlinking the device from WhatsApp revoking a restricted account: both are 401.
   failureNode?: { tag?: string; attrs?: Record<string, string> };
   failureMessage?: string;
+  // Paired instance whose creds are gone — only a fresh QR scan can recover it.
+  // Surfaced on the status response/webhook so the product can prompt a re-scan,
+  // and used to gate doomed socket rebuilds (see isAwaitingRescan).
+  requiresRescan?: boolean;
 };
 
 /**
@@ -269,7 +289,73 @@ export class WAStartupService {
   private phoneNumber: string;
   private reconnecting = false;
   private reconnectAttempts = 0;
+  private reconnectTimer?: ReturnType<typeof setTimeout>;
   private prewarmActive = false;
+  private rescanFlaggedAt = 0;
+  private rescanAttempts = 0;
+
+  /**
+   * Continuous, self-healing reconnect — the primary keep-alive (event-driven,
+   * no fixed interval). On a recoverable close we schedule one attempt with
+   * jittered backoff; if that attempt *throws* before a live socket can take
+   * over the retry loop (e.g. a transient DB/network error inside setSocket),
+   * we reschedule ourselves, so a paired instance is never left permanently
+   * closed with no pending retry. The timer handle is stored so a removed
+   * instance can cancel it (stopReconnect) instead of resurrecting itself.
+   */
+  private scheduleReconnect() {
+    if (this.reconnecting) return;
+    this.reconnecting = true;
+    // Jittered exponential backoff de-synchronizes instances that all dropped
+    // together, so retries don't hammer WhatsApp in lockstep waves (the lockstep
+    // is what earns repeated 428 connectionClosed).
+    const delay = backoffDelay(this.reconnectAttempts);
+    this.reconnectAttempts++;
+    this.logger.info(
+      `reconnect scheduled in ${delay}ms (attempt ${this.reconnectAttempts})`,
+    );
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = undefined;
+      try {
+        await this.connectToWhatsapp();
+        // Success: a live socket now owns the loop — its connection.update
+        // drives the next step ('open' resets attempts, 'close' calls us again).
+        this.reconnecting = false;
+      } catch (err) {
+        // connectToWhatsapp threw before a socket could take over, so nothing
+        // else will reschedule — keep the loop alive here.
+        this.reconnecting = false;
+        this.logger.error('reconnect attempt failed - will retry', err);
+        this.scheduleReconnect();
+      }
+    }, delay);
+  }
+
+  /** Cancel any pending reconnect (instance removed / recovered / shutdown). */
+  public stopReconnect() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+    }
+    this.reconnecting = false;
+  }
+
+  /**
+   * True when a creds-lost instance has used up its burst of RESCAN_MAX_ATTEMPTS
+   * rebuilds and is still inside the cooldown. The connect controller checks this
+   * to skip building another doomed socket (each build leaks a WASM signal repo)
+   * on every backend connect-poll. The first RESCAN_MAX_ATTEMPTS attempts are let
+   * through (so a user who fumbles the scan can retry); once the cooldown elapses,
+   * a fresh burst is allowed again.
+   */
+  public isAwaitingRescan(): boolean {
+    return (
+      !!this.stateConnection.requiresRescan &&
+      this.rescanAttempts >= RESCAN_MAX_ATTEMPTS &&
+      Date.now() - this.rescanFlaggedAt < RESCAN_COOLDOWN_MS
+    );
+  }
 
   public async setPhoneNumber(v: string) {
     this.phoneNumber = v;
@@ -609,8 +695,21 @@ export class WAStartupService {
         // Unrecoverable without a human scanning a QR. Stop retrying and tell
         // the product so it can prompt a re-scan, instead of burning ~1
         // connection/minute per instance forever and earning 428s.
+        // Count this failed re-link. A fully-elapsed cooldown starts a fresh burst
+        // so the user gets RESCAN_MAX_ATTEMPTS quick tries again after the wait.
+        if (
+          this.rescanAttempts >= RESCAN_MAX_ATTEMPTS &&
+          Date.now() - this.rescanFlaggedAt >= RESCAN_COOLDOWN_MS
+        ) {
+          this.rescanAttempts = 0;
+        }
+        this.rescanAttempts++;
+        this.stateConnection.requiresRescan = true;
+        this.rescanFlaggedAt = Date.now();
         this.logger.warn(
-          `creds lost for paired instance - not reconnecting, re-scan required`,
+          `creds lost for paired instance - re-scan required ` +
+            `(attempt ${this.rescanAttempts}/${RESCAN_MAX_ATTEMPTS}` +
+            `${this.rescanAttempts >= RESCAN_MAX_ATTEMPTS ? ', cooldown active' : ''})`,
         );
         this.sendDataWebhook('statusInstance', {
           instance: this.instance.name,
@@ -624,34 +723,22 @@ export class WAStartupService {
         // new QR session on demand. restartRequired is handled by the else.
         this.logger.info('unpaired instance closed - not reconnecting');
       } else {
-        // Paired instance OR post-scan restartRequired → reconnect with backoff.
-        if (!this.reconnecting) {
-          this.reconnecting = true;
-          // Jittered exponential backoff de-synchronizes instances that all
-          // dropped together, so retries don't hammer WhatsApp in lockstep
-          // waves (the lockstep is what earns repeated 428 connectionClosed).
-          const delay = backoffDelay(this.reconnectAttempts);
-          this.reconnectAttempts++;
-          this.logger.info(
-            `reconnect scheduled in ${delay}ms (attempt ${this.reconnectAttempts})`,
-          );
-          setTimeout(async () => {
-            try {
-              await this.connectToWhatsapp();
-            } catch (err) {
-              this.logger.error('reconnect failed', err);
-            } finally {
-              this.reconnecting = false;
-            }
-          }, delay);
-        }
+        // Paired instance OR post-scan restartRequired → continuous self-healing
+        // reconnect (jittered backoff, reschedules itself if an attempt throws).
+        this.scheduleReconnect();
       }
     }
 
     if (connection === 'open') {
       // Successful connection — clear the backoff so the next unrelated drop
-      // starts again from the base delay instead of an inflated one.
+      // starts again from the base delay instead of an inflated one, and cancel
+      // any pending reconnect timer (the live socket owns the loop now).
       this.reconnectAttempts = 0;
+      this.stopReconnect();
+      // Recovered — drop the re-scan gate so future drops reconnect normally.
+      this.stateConnection.requiresRescan = false;
+      this.rescanFlaggedAt = 0;
+      this.rescanAttempts = 0;
       this.instance.ownerJid = this.client.user.id.replace(/:\d+/, '');
       this.instance.profilePicUrl = (
         await this.profilePicture(this.instance.ownerJid)
@@ -838,8 +925,18 @@ export class WAStartupService {
 
       this.instanceQr.count = 0;
       await this.loadWebhook();
-      this.client = await this.setSocket();
-      this.eventHandler();
+
+      // Cap concurrent socket construction process-wide. Each setSocket() builds
+      // a WASM signal repo whose memory the arena never returns to the OS, so RSS
+      // tracks the peak number built at once. Throttling bursts (boot, poll waves)
+      // keeps that peak bounded while GC reclaims churned sockets in between.
+      await connectLimiter.acquire();
+      try {
+        this.client = await this.setSocket();
+        this.eventHandler();
+      } finally {
+        connectLimiter.release();
+      }
 
       return this.client;
     } catch (error) {

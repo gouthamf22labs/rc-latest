@@ -24,6 +24,12 @@ RUN npm run build
 
 RUN npm prune --production
 
+# sharp ships per-platform native binaries as optionalDependencies; a lockfile
+# generated on macOS plus `npm install --force` can leave the linux binary out,
+# so the app crashes at boot with "Could not load the sharp module". Reinstall it
+# for the image's own architecture (works for both arm64 and amd64 builds).
+RUN npm install --include=optional --no-save sharp
+
 FROM node:22-bullseye-slim AS production
 
 RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*

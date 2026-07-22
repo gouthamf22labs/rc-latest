@@ -119,6 +119,13 @@ export class InstanceController {
         throw new Error('Instance already connected');
       }
 
+      // Creds-lost instance inside its re-scan cooldown: return status instead of
+      // rebuilding a doomed socket (each build leaks a WASM signal repo) on every
+      // backend connect-poll. The cooldown lets one recovery attempt through later.
+      if (instance?.isAwaitingRescan()) {
+        return res.status(HttpStatus.OK).json(instance.getInstance().status);
+      }
+
       const state = info?.status.state || 'close';
 
       if (!instance || !info?.status || info?.status?.state === 'refused') {
@@ -174,6 +181,13 @@ export class InstanceController {
       const info = instance?.getInstance();
       if (info?.status.state === 'open') {
         throw new Error('Instance already connected');
+      }
+
+      // Creds-lost instance inside its re-scan cooldown: return status instead of
+      // rebuilding a doomed socket (each build leaks a WASM signal repo) on every
+      // backend connect-poll. The cooldown lets one recovery attempt through later.
+      if (instance?.isAwaitingRescan()) {
+        return res.status(HttpStatus.OK).json(instance.getInstance().status);
       }
 
       const state = info?.status.state || 'close';

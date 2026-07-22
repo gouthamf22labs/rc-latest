@@ -69,6 +69,75 @@ export class WAMonitoringService {
     Object.assign(this.db, configService.get<Database>('DATABASE'));
 
     this.logger = logger.setCtx('wa-monitoring-service');
+
+    this.startReconnectSweep();
+  }
+
+  private reconnectSweepTimer?: ReturnType<typeof setInterval>;
+
+  /**
+   * Periodic reconciliation backstop for reconnection. The primary reconnect is
+   * event-driven and continuous (WAStartupService.scheduleReconnect self-heals on
+   * every drop), so this sweep normally finds nothing — it exists to catch
+   * instances that somehow fell out of that loop (stuck 'close' with no pending
+   * attempt). It replaces the external cron that used to poke /instance/connect,
+   * so there are no HTTP round-trips or cross-service state. Skips healthy /
+   * connecting instances and creds-lost ones (isAwaitingRescan); socket builds are
+   * concurrency-capped inside connectToWhatsapp and staggered here so the sweep is
+   * not a synchronized wave. Toggle with RECONNECT_SWEEP_ENABLED / RECONNECT_SWEEP_MS.
+   */
+  private startReconnectSweep() {
+    if ((process.env.RECONNECT_SWEEP_ENABLED ?? 'true') === 'false') {
+      this.logger.info('reconnect sweep disabled');
+      return;
+    }
+    const parsedInterval = Number.parseInt(process.env.RECONNECT_SWEEP_MS ?? '', 10);
+    const intervalMs =
+      Number.isFinite(parsedInterval) && parsedInterval > 0
+        ? parsedInterval
+        : 45 * 60 * 1000;
+    const parsedStagger = Number.parseInt(process.env.STARTUP_STAGGER_MS ?? '', 10);
+    const staggerMs =
+      Number.isFinite(parsedStagger) && parsedStagger >= 0 ? parsedStagger : 800;
+
+    this.reconnectSweepTimer = setInterval(() => {
+      this.reconnectSweep(staggerMs).catch((err) =>
+        this.logger.error('reconnect sweep failed', err),
+      );
+    }, intervalMs);
+    this.logger.info(
+      `reconnect sweep every ${intervalMs}ms (stagger ${staggerMs}ms)`,
+    );
+  }
+
+  private async reconnectSweep(staggerMs: number) {
+    let kicked = 0;
+    for (const [name, instance] of this.waInstances) {
+      try {
+        const state = instance.getInstance()?.status?.state;
+        // Healthy or mid-connect → leave it. Creds-lost → only a QR re-scan fixes
+        // it, and isAwaitingRescan throttles those, so don't rebuild here.
+        if (state === 'open' || state === 'connecting') continue;
+        if (instance.isAwaitingRescan?.()) continue;
+        await instance.connectToWhatsapp();
+        kicked++;
+      } catch (err) {
+        this.logger.warn(`reconnect sweep: failed to reconnect ${name}`, err);
+      }
+      if (staggerMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, staggerMs));
+      }
+    }
+    if (kicked > 0) {
+      this.logger.info(`reconnect sweep: kicked ${kicked} closed instance(s)`);
+    }
+  }
+
+  public stopReconnectSweep() {
+    if (this.reconnectSweepTimer) {
+      clearInterval(this.reconnectSweepTimer);
+      this.reconnectSweepTimer = undefined;
+    }
   }
 
   private readonly db: Partial<Database> = {};
@@ -136,6 +205,9 @@ export class WAMonitoringService {
 
   private clearListeners(instanceName: string) {
     try {
+      // Cancel any pending reconnect timer first, or a removed instance can
+      // resurrect itself by firing connectToWhatsapp after teardown.
+      this.waInstances.get(instanceName)?.stopReconnect?.();
       const client = this.waInstances.get(instanceName)?.client;
       if (client?.ev) {
         client.ev.removeAllListeners('connection.update');
@@ -234,6 +306,9 @@ export class WAMonitoringService {
         if (!instance?.name) {
           return;
         }
+        // Cancel any pending reconnect so the removed instance can't resurrect
+        // itself by firing connectToWhatsapp after it's gone from the map.
+        this.waInstances.get(instance.name)?.stopReconnect?.();
         this.waInstances
           .get(instance.name)
           ?.client?.ev.removeAllListeners('connection.update');
