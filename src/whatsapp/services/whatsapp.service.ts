@@ -666,13 +666,16 @@ export class WAStartupService {
     // unpaired instances. The post-scan restartRequired (515) is exempt: it's
     // part of normal pairing and must flow.
     //
-    // NOTE: creds-lost closes are deliberately NOT suppressed. The backend
+    // Creds-lost: the FIRST close of an episode must flow — the backend
     // (wa-send-later-be) marks an instance OFFLINE + logs the user out ONLY from
-    // this connectionUpdated(close) webhook — its status.instance handler ignores
-    // `requiresRescan`. Suppressing it would leave the backend thinking a dead
-    // instance is still ONLINE. The recurring storm is instead killed by flipping
-    // the instance OFFLINE in Postgres below: the poller only pokes ONLINE
-    // instances, so after this first close it stops → no more rebuilds → silence.
+    // this connectionUpdated(close) webhook (its status.instance handler ignores
+    // `requiresRescan`), so suppressing it would leave the backend thinking a dead
+    // instance is still ONLINE. Every *subsequent* close in the same episode is
+    // pure noise: the backend already knows, and callers keep poking
+    // /instance/connect regardless of connectionStatus, so each poke builds
+    // another doomed socket and fires another identical webhook — that is the
+    // "428 Reconnecting" storm. `requiresRescan` is only cleared by a successful
+    // 'open', so this stays suppressed until the user actually re-scans.
     //
     // A paired instance that has been flapping (>= MAX_RECONNECT_BEFORE_QUIET
     // consecutive failed reconnects, never reaching 'open') does go quiet: the
@@ -686,9 +689,19 @@ export class WAStartupService {
       !isRestartRequired &&
       closeStatusCode !== DisconnectReason.loggedOut &&
       this.reconnectAttempts >= MAX_RECONNECT_BEFORE_QUIET;
+    // "Already announced" MUST be derived from durable state, not memory.
+    // INSTANCE_EXPIRATION_TIME defaults to 5 minutes, so delInstanceTime() drops
+    // every non-open instance out of waInstances every 5 min; the next poke builds
+    // a fresh WAStartupService whose in-memory requiresRescan/rescanAttempts are
+    // back to zero. An in-memory marker therefore resets itself every 5 minutes and
+    // the storm survives it. connectionStatus is persisted and setInstanceName()
+    // reloads it, so it survives both eviction and a process restart: a creds-lost
+    // instance already OFFLINE in the DB has had its one close webhook, and every
+    // later close is storm noise.
+    const credsLostRepeat = credsLost && this.instance.connectionStatus === 'OFFLINE';
     const suppressNoise =
       connection === 'close' &&
-      (neverPaired || flappingQuiet) &&
+      (neverPaired || flappingQuiet || credsLostRepeat) &&
       !isRestartRequired;
 
     if (connection) {
@@ -736,9 +749,11 @@ export class WAStartupService {
         ) {
           this.rescanAttempts = 0;
         }
-        // requiresRescan stays true across attempts until an 'open' recovers it,
-        // so a false->true transition here is the *first* detection of an episode.
-        const firstDetection = !this.stateConnection.requiresRescan;
+        // Same durable test as credsLostRepeat above: announce (and flip the DB)
+        // only for an instance the DB still believes is ONLINE. Using the
+        // in-memory requiresRescan here would re-announce after every 5-minute
+        // eviction and after every restart.
+        const firstDetection = !credsLostRepeat;
         this.rescanAttempts++;
         this.stateConnection.requiresRescan = true;
         this.rescanFlaggedAt = Date.now();

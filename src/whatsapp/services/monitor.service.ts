@@ -232,33 +232,102 @@ export class WAMonitoringService {
     }
   }
 
-  public async loadInstance() {
-    const set = async (name: string) => {
-      const instance = await this.repository.instance.findUnique({
-        where: { name },
-      });
-      if (!instance) {
-        return this.eventEmitter.emit('remove.instance', instance);
-      }
-      const init = new WAStartupService(
-        this.configService,
-        this.eventEmitter,
-        this.repository,
-        this.providerFiles,
-        this.ws,
-      );
-      await init.setInstanceName(name);
-      this.addInstance(init.instanceName, init);
+  /**
+   * Construct an instance and put it in `waInstances`, WITHOUT connecting.
+   *
+   * Registration is deliberately separate from (and always precedes) the connect:
+   * reconnectSweep() can only heal instances that are in the map, so an instance
+   * that fails to connect must still end up registered — otherwise it is dead
+   * until something pokes /instance/connect from outside the process.
+   */
+  private async registerInstance(name: string): Promise<WAStartupService | undefined> {
+    const instance = await this.repository.instance.findUnique({ where: { name } });
+    if (!instance) {
+      this.eventEmitter.emit('remove.instance', instance);
+      return undefined;
+    }
+    const init = new WAStartupService(
+      this.configService,
+      this.eventEmitter,
+      this.repository,
+      this.providerFiles,
+      this.ws,
+    );
+    await init.setInstanceName(name);
+    this.addInstance(init.instanceName, init);
+    return init;
+  }
+
+  /**
+   * Restore a single instance end-to-end. NEVER throws.
+   *
+   * connectToWhatsapp() throws on any failure, and the boot loop used to await it
+   * with no per-instance catch — so the first instance that failed aborted the
+   * whole restore and every instance after it was never registered nor connected
+   * (and, not being in `waInstances`, was invisible to reconnectSweep too).
+   */
+  private async restoreInstance(name: string): Promise<boolean> {
+    let init: WAStartupService | undefined;
+    try {
+      init = await this.registerInstance(name);
+    } catch (err) {
+      this.logger.warn(`boot: failed to register instance ${name}`, err);
+      return false;
+    }
+    if (!init) {
+      return false;
+    }
+    try {
       await init.connectToWhatsapp();
+      return true;
+    } catch (err) {
+      // Registered but not connected — reconnectSweep() will pick it up.
+      this.logger.warn(`boot: failed to connect instance ${name}`, err);
+      return false;
+    }
+  }
+
+  /**
+   * Restore many instances with bounded parallelism. connectLimiter already caps
+   * concurrent socket construction process-wide, but the old loop awaited each
+   * instance in turn, so effective concurrency was 1 and restoring a large
+   * population took an extremely long time. Workers pull from a shared cursor so
+   * a slow instance doesn't stall the others. Tune with STARTUP_CONCURRENCY.
+   */
+  private async restoreAll(names: string[]): Promise<void> {
+    if (names.length === 0) {
+      return;
+    }
+    const parsed = Number.parseInt(process.env.STARTUP_CONCURRENCY ?? '', 10);
+    const workers = Number.isFinite(parsed) && parsed > 0 ? parsed : 10;
+
+    let cursor = 0;
+    let connected = 0;
+    const worker = async () => {
+      while (cursor < names.length) {
+        const name = names[cursor++];
+        if (await this.restoreInstance(name)) {
+          connected++;
+        }
+      }
     };
 
+    await Promise.all(
+      Array.from({ length: Math.min(workers, names.length) }, () => worker()),
+    );
+
+    const failed = names.length - connected;
+    this.logger.info(
+      `boot: restored ${connected}/${names.length} instance(s)` +
+        `${failed > 0 ? ` (${failed} not connected - sweep will retry)` : ''}`,
+    );
+  }
+
+  public async loadInstance() {
     try {
       if (this.providerSession.ENABLED) {
         const [instances] = await this.providerFiles.allInstances();
-        instances.data.forEach(async (name: string) => {
-          await set(name);
-        });
-
+        await this.restoreAll((instances.data as string[]) ?? []);
         return;
       }
 
@@ -270,13 +339,13 @@ export class WAMonitoringService {
           where: { Session: { some: {} } },
           select: { name: true },
         })
-        .catch(() => []);
+        .catch((err) => {
+          this.logger.error('boot: failed to list instances from DB', err);
+          return [] as { name: string }[];
+        });
 
       const dbNames = new Set(dbInstances.filter((i) => i?.name).map((i) => i.name));
-
-      for (const name of dbNames) {
-        await set(name);
-      }
+      const names = [...dbNames];
 
       // Also scan filesystem for any remaining file-based sessions not in DB
       try {
@@ -290,14 +359,16 @@ export class WAMonitoringService {
               rmSync(join(INSTANCE_DIR, dirent.name), { recursive: true, force: true });
               continue;
             }
-            await set(dirent.name);
+            names.push(dirent.name);
           }
         }
       } catch {
         // INSTANCE_DIR may not exist on a fresh container — that's fine
       }
+
+      await this.restoreAll(names);
     } catch (error) {
-      this.logger.error(error);
+      this.logger.error('boot: instance restore aborted', error);
     }
   }
 
