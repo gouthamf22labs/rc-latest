@@ -41,10 +41,29 @@ index df19870..992e0fd 100644
      return {
          ...sock,
 diff --git a/node_modules/@whiskeysockets/baileys/lib/Socket/messages-send.js b/node_modules/@whiskeysockets/baileys/lib/Socket/messages-send.js
-index d61e064..c823c6a 100644
+index d61e064..f52106f 100644
 --- a/node_modules/@whiskeysockets/baileys/lib/Socket/messages-send.js
 +++ b/node_modules/@whiskeysockets/baileys/lib/Socket/messages-send.js
-@@ -478,12 +478,27 @@ export const makeMessagesSocket = (config) => {
+@@ -49,6 +49,18 @@ export const makeMessagesSocket = (config) => {
+                     content: [{ tag: 'media_conn', attrs: {} }]
+                 });
+                 const mediaConnNode = getBinaryNodeChild(result, 'media_conn');
++                // query() returns undefined when the iq times out (socket.js swallows the
++                // timeout Boom and returns undefined), and its assertNodeErrorFree guard is
++                // skipped for a falsy result. Without this check we'd deref undefined and
++                // throw an opaque "Cannot read properties of undefined (reading 'attrs')"
++                // instead of reporting the real cause: the socket is dead/unresponsive.
++                if (!mediaConnNode) {
++                    // Drop the rejected promise from the cache. It is only cleared on socket
++                    // end otherwise, so one timeout would fail every later media send on this
++                    // socket with the same error.
++                    mediaConn = undefined;
++                    throw new Boom('Failed to fetch media upload connection: WhatsApp did not return a media_conn node (socket disconnected or query timed out)', { statusCode: 503, data: result });
++                }
+                 // TODO: explore full length of data that whatsapp provides
+                 const node = {
+                     hosts: getBinaryNodeChildren(mediaConnNode, 'host').map(({ attrs }) => ({
+@@ -478,12 +490,27 @@ export const makeMessagesSocket = (config) => {
                      attrs: {},
                      content: bytes
                  });
