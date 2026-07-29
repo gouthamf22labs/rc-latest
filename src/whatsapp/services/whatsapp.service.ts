@@ -2335,9 +2335,39 @@ export class WAStartupService {
     } catch (error) {
       const axiosError = error as AxiosError;
       if (axiosError?.isAxiosError) {
-        this.logger.error(axiosError?.message);
-        const err = Buffer.from(axiosError?.response?.data as any).toString('utf-8');
-        throw new BadRequestException(axiosError?.message, err);
+        this.logger.error('prepareMediaMessage: media download failed', {
+          url: mediaMessage?.media,
+          code: axiosError?.code,
+          status: axiosError?.response?.status,
+          error: axiosError?.message,
+        });
+
+        // Network-level failures (ECONNRESET/ENOTFOUND/ETIMEDOUT...) have no `response`.
+        // Buffer.from(undefined) used to throw TypeError [ERR_INVALID_ARG_TYPE] from inside
+        // this catch, which escaped every handler and surfaced to callers as an opaque
+        // 500 {"code":"ERR_INVALID_ARG_TYPE"} instead of the real download failure.
+        if (!axiosError?.response) {
+          throw new InternalServerErrorException(
+            `Failed to download media from "${mediaMessage?.media}"`,
+            `${axiosError?.code || 'NETWORK_ERROR'}: ${axiosError?.message}`,
+          );
+        }
+
+        const body = axiosError.response.data as any;
+        let err: string;
+        if (Buffer.isBuffer(body) || body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
+          err = Buffer.from(body as any).toString('utf-8');
+        } else if (typeof body === 'string') {
+          err = body;
+        } else {
+          err = body ? JSON.stringify(body) : 'no response body';
+        }
+
+        throw new BadRequestException(
+          `Failed to download media from "${mediaMessage?.media}" (HTTP ${axiosError.response.status})`,
+          axiosError?.message,
+          err.slice(0, 500),
+        );
       }
 
       this.logger.error(error);
