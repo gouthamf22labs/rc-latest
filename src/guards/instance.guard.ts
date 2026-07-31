@@ -114,11 +114,14 @@ export class InstanceGuard {
     if (!param?.instanceName) {
       throw new BadRequestException('"instanceName" not provided.');
     }
-    const fetch = await fetchInstanceFromCache(
-      param.instanceName,
-      this.waMonitor,
-      this.providerFiles,
-    );
+    // NOT fetchInstanceFromCache: that only sees the in-memory map (plus a
+    // filesystem fallback that never matches DB-backed sessions), so an instance
+    // absent from memory — during the post-restart restore window, or after a
+    // remove.instance — was rejected as non-existent while its session sat intact
+    // in the DB. ensureInstance restores it on demand instead.
+    const fetch = await this.waMonitor
+      .ensureInstance(param.instanceName)
+      .catch(() => false);
 
     if (!fetch) {
       throw new BadRequestException(

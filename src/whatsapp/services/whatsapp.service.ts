@@ -89,6 +89,8 @@ import { Logger } from '../../config/logger.config';
 import { INSTANCE_DIR, ROOT_DIR } from '../../config/path.config';
 import { join, normalize } from 'path';
 import axios, { AxiosError } from 'axios';
+import { Agent as HttpAgent } from 'http';
+import { Agent as HttpsAgent } from 'https';
 import qrcode, { QRCodeToDataURLOptions } from 'qrcode';
 import qrcodeTerminal from 'qrcode-terminal';
 import { Boom } from '@hapi/boom';
@@ -193,6 +195,31 @@ const RESCAN_MAX_ATTEMPTS =
 const parsedQuiet = Number.parseInt(process.env.MAX_RECONNECT_BEFORE_QUIET ?? '', 10);
 const MAX_RECONNECT_BEFORE_QUIET =
   Number.isFinite(parsedQuiet) && parsedQuiet > 0 ? parsedQuiet : 3;
+
+// Media downloads used to be a single axios.get with no timeout and no retry, so
+// one dropped socket permanently failed the message (and refunded the user's
+// credit). Node >= 19 defaults http(s).globalAgent to keepAlive:true: a socket
+// the object store or its proxy reaped while it sat idle in the pool gets picked
+// for the next download and dies with ECONNRESET before any response arrives —
+// intermittently, per-message, with no HTTP status to explain it. Dedicated
+// non-pooling agents remove the stale-socket race entirely; the retry covers the
+// rest (transient resets, 5xx, rate limits). Worst case with the defaults below
+// (3 attempts + backoff) stays well under the 120s the backend waits.
+const mediaHttpAgent = new HttpAgent({ keepAlive: false });
+const mediaHttpsAgent = new HttpsAgent({ keepAlive: false });
+
+const parsedMediaTimeout = Number.parseInt(
+  process.env.MEDIA_DOWNLOAD_TIMEOUT_MS ?? '',
+  10,
+);
+const MEDIA_DOWNLOAD_TIMEOUT_MS =
+  Number.isFinite(parsedMediaTimeout) && parsedMediaTimeout > 0
+    ? parsedMediaTimeout
+    : 25 * 1000;
+
+const parsedMediaRetries = Number.parseInt(process.env.MEDIA_DOWNLOAD_RETRIES ?? '', 10);
+const MEDIA_DOWNLOAD_RETRIES =
+  Number.isFinite(parsedMediaRetries) && parsedMediaRetries > 0 ? parsedMediaRetries : 3;
 
 export const MessageSubtype = () => [
   'ephemeralMessage',
@@ -2225,6 +2252,54 @@ export class WAStartupService {
     });
   }
 
+  /**
+   * GET media with a bounded timeout and retries on transient transport failures.
+   *
+   * Retries only what a second attempt can actually fix: connection-level errors
+   * (no HTTP response at all — ECONNRESET / socket hang up / ETIMEDOUT /
+   * ECONNREFUSED), 429, and 5xx. A 404 or 403 is a real, final answer about the
+   * object, so it is thrown immediately instead of burning the caller's budget
+   * three times over.
+   */
+  private async downloadMedia(url: string) {
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= MEDIA_DOWNLOAD_RETRIES; attempt++) {
+      try {
+        return await axios.get(url, {
+          responseType: 'arraybuffer',
+          timeout: MEDIA_DOWNLOAD_TIMEOUT_MS,
+          httpAgent: mediaHttpAgent,
+          httpsAgent: mediaHttpsAgent,
+        });
+      } catch (error) {
+        lastError = error;
+
+        const axiosError = error as AxiosError;
+        const status = axiosError?.response?.status;
+        const retriable =
+          !axiosError?.response || status === 429 || (status >= 500 && status < 600);
+
+        if (!retriable || attempt === MEDIA_DOWNLOAD_RETRIES) {
+          throw error;
+        }
+
+        this.logger.warn('media download failed, retrying', {
+          url,
+          attempt,
+          of: MEDIA_DOWNLOAD_RETRIES,
+          code: axiosError?.code,
+          status: status ?? 'none',
+          error: axiosError?.message,
+        });
+
+        await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** (attempt - 1)));
+      }
+    }
+
+    throw lastError;
+  }
+
   private async prepareMediaMessage(
     mediaMessage: MediaMessage & { mimetype?: string; convert?: boolean },
   ) {
@@ -2241,9 +2316,7 @@ export class WAStartupService {
       const isURL = /http(s?):\/\//.test(mediaMessage.media as string);
 
       if (isURL) {
-        const response = await axios.get(mediaMessage.media as string, {
-          responseType: 'arraybuffer',
-        });
+        const response = await this.downloadMedia(mediaMessage.media as string);
 
         mimetype = response.headers['content-type'] as string;
         if (!ext) {
@@ -2351,9 +2424,9 @@ export class WAStartupService {
         // no indication of whether it was DNS, a reset, or a timeout.
         if (!axiosError?.response) {
           throw new InternalServerErrorException(
-            `Failed to download media [${axiosError?.code || 'NETWORK_ERROR'}: ${
-              axiosError?.message
-            }] from "${mediaMessage?.media}"`,
+            `Failed to download media after ${MEDIA_DOWNLOAD_RETRIES} attempt(s) [${
+              axiosError?.code || 'NETWORK_ERROR'
+            }: ${axiosError?.message}] from "${mediaMessage?.media}"`,
           );
         }
 

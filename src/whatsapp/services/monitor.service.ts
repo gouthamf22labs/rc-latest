@@ -37,7 +37,7 @@
  * └──────────────────────────────────────────────────────────────────────────────┘
  */
 
-import { opendirSync, readdirSync, rmSync } from 'fs';
+import { existsSync, opendirSync, readdirSync, rmSync } from 'fs';
 import { WAStartupService } from './whatsapp.service';
 import { INSTANCE_DIR } from '../../config/path.config';
 import EventEmitter2 from 'eventemitter2';
@@ -294,6 +294,102 @@ export class WAMonitoringService {
    * population took an extremely long time. Workers pull from a shared cursor so
    * a slow instance doesn't stall the others. Tune with STARTUP_CONCURRENCY.
    */
+  private readonly pendingRestore = new Map<string, Promise<boolean>>();
+
+  /**
+   * Resolve an instance for an inbound request, restoring it on demand.
+   *
+   * InstanceGuard used to answer "does this instance exist?" from `waInstances`
+   * alone, with a filesystem fallback that is dead for DB-backed sessions (those
+   * never create an INSTANCE_DIR folder — only useMultiFileAuthState does). So an
+   * instance absent from memory was reported as "does not exist or is not
+   * connected" even though its session was intact in the DB. That happens on every
+   * restart: main.ts starts listening immediately while loadInstance() restores in
+   * the background, so sends landing in that window got a hard 400. It is also
+   * terminal after a `remove.instance`, since reconnectSweep only walks the map.
+   *
+   * Here a DB session is authoritative: register + connect the instance and let
+   * the request through, rather than failing a message whose session is fine.
+   */
+  public async ensureInstance(name: string): Promise<boolean> {
+    if (this.waInstances.get(name)) {
+      return true;
+    }
+
+    // Provider-files and legacy file-based sessions keep their original discovery.
+    if (this.providerSession?.ENABLED) {
+      const [keyExists] = await this.providerFiles.allInstances();
+      return !!keyExists?.data?.includes(name);
+    }
+
+    // Collapse concurrent requests for the same instance onto one restore, or a
+    // burst of scheduled sends would each build a socket on the same creds →
+    // WhatsApp 'conflict: replaced' → reconnect storm.
+    const inFlight = this.pendingRestore.get(name);
+    if (inFlight) {
+      return inFlight;
+    }
+
+    const restore = this.restoreOnDemand(name).finally(() =>
+      this.pendingRestore.delete(name),
+    );
+    this.pendingRestore.set(name, restore);
+    return restore;
+  }
+
+  private async restoreOnDemand(name: string): Promise<boolean> {
+    let hasSession: boolean;
+    try {
+      hasSession = !!(await this.repository.instance.findFirst({
+        where: { name, Session: { some: {} } },
+        select: { name: true },
+      }));
+    } catch (err) {
+      this.logger.error(`on-demand restore: DB lookup failed for ${name}`, err);
+      return existsSync(join(INSTANCE_DIR, name));
+    }
+
+    if (!hasSession) {
+      // No session rows — genuinely unpaired or deleted. Fall back to the legacy
+      // filesystem check before declaring it gone.
+      return existsSync(join(INSTANCE_DIR, name));
+    }
+
+    this.logger.warn(`on-demand restore: ${name} missing from memory, restoring`);
+    await this.restoreInstance(name);
+
+    // Registered is enough to let the request through: the guard never checked
+    // connection state for instances already in the map either, and the send path
+    // reports the real socket state far more accurately than this guard can.
+    const restored = !!this.waInstances.get(name);
+    if (restored) {
+      await this.waitForOpen(name);
+    }
+    return restored;
+  }
+
+  /**
+   * Best-effort grace period so the caller's send lands on a live socket instead
+   * of one still handshaking. Never fails the request — if the instance does not
+   * reach 'open' in time, the send path surfaces the real reason.
+   */
+  private async waitForOpen(name: string): Promise<void> {
+    const parsed = Number.parseInt(process.env.ONDEMAND_OPEN_TIMEOUT_MS ?? '', 10);
+    const timeoutMs = Number.isFinite(parsed) && parsed >= 0 ? parsed : 20 * 1000;
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      const state = this.waInstances.get(name)?.getInstance()?.status?.state;
+      if (state === 'open') {
+        return;
+      }
+      if (state !== 'connecting') {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
+
   private async restoreAll(names: string[]): Promise<void> {
     if (names.length === 0) {
       return;
