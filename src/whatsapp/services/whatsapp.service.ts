@@ -2346,10 +2346,14 @@ export class WAStartupService {
         // Buffer.from(undefined) used to throw TypeError [ERR_INVALID_ARG_TYPE] from inside
         // this catch, which escaped every handler and surfaced to callers as an opaque
         // 500 {"code":"ERR_INVALID_ARG_TYPE"} instead of the real download failure.
+        // The caller (BE scheduler) only surfaces the first element of `message`, so the
+        // axios code has to live in it — otherwise the alert says "download failed" with
+        // no indication of whether it was DNS, a reset, or a timeout.
         if (!axiosError?.response) {
           throw new InternalServerErrorException(
-            `Failed to download media from "${mediaMessage?.media}"`,
-            `${axiosError?.code || 'NETWORK_ERROR'}: ${axiosError?.message}`,
+            `Failed to download media [${axiosError?.code || 'NETWORK_ERROR'}: ${
+              axiosError?.message
+            }] from "${mediaMessage?.media}"`,
           );
         }
 
@@ -2364,9 +2368,9 @@ export class WAStartupService {
         }
 
         throw new BadRequestException(
-          `Failed to download media from "${mediaMessage?.media}" (HTTP ${axiosError.response.status})`,
-          axiosError?.message,
-          err.slice(0, 500),
+          `Failed to download media [HTTP ${axiosError.response.status}] from "${
+            mediaMessage?.media
+          }": ${err.slice(0, 300)}`,
         );
       }
 
