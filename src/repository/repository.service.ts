@@ -66,7 +66,12 @@ export class Repository extends PrismaClient {
       adapter: new PrismaPg(
         new pg.Pool({
           connectionString: process.env.DATABASE_URL,
-          max: 100,
+          // 20, not 100. At 100 a single process could claim the server's entire
+          // max_connections budget and starve every other client. PgBouncer now
+          // sits in front and absorbs bursts (hundreds of cheap client
+          // connections multiplexed onto ~5-9 real ones), so a large client-side
+          // pool buys nothing: it only churns connect/disconnect traffic.
+          max: 20,
           // 30s here was the lockout window: a burst grew the pool to `max` and
           // held every connection idle for 30s afterwards, so a momentary spike
           // locked out every other client (other replicas, wa-send-later-be, the
