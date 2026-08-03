@@ -45,9 +45,16 @@ import { NextFunction, Request, Response } from 'express';
 import { existsSync } from 'fs';
 import { join } from 'path';
 import { INSTANCE_DIR } from '../config/path.config';
-import { BadRequestException, ForbiddenException } from '../exceptions';
+import {
+  BadRequestException,
+  ForbiddenException,
+  ServiceUnavailableException,
+} from '../exceptions';
 import { InstanceDto } from '../whatsapp/dto/instance.dto';
-import { WAMonitoringService } from '../whatsapp/services/monitor.service';
+import {
+  InstanceLookupError,
+  WAMonitoringService,
+} from '../whatsapp/services/monitor.service';
 import { ProviderFiles } from '../provider/sessions';
 
 async function fetchInstanceFromCache(
@@ -119,9 +126,24 @@ export class InstanceGuard {
     // absent from memory — during the post-restart restore window, or after a
     // remove.instance — was rejected as non-existent while its session sat intact
     // in the DB. ensureInstance restores it on demand instead.
-    const fetch = await this.waMonitor
-      .ensureInstance(param.instanceName)
-      .catch(() => false);
+    let fetch: boolean;
+    try {
+      fetch = await this.waMonitor.ensureInstance(param.instanceName);
+    } catch (error) {
+      // Never collapse a lookup failure into `false`: that reports a live
+      // instance as non-existent and callers treat the 400 as terminal. Anything
+      // we could not determine gets a 503 carrying the real reason.
+      if (error instanceof InstanceLookupError) {
+        throw new ServiceUnavailableException(
+          `Could not verify instance "${param.instanceName}" (${error.reason}) - session may be intact, retry`,
+          error.message,
+        );
+      }
+      throw new ServiceUnavailableException(
+        `Could not verify instance "${param.instanceName}"`,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
 
     if (!fetch) {
       throw new BadRequestException(

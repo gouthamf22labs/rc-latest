@@ -314,6 +314,13 @@ export class WAStartupService {
   private readonly webhook: Partial<Webhook> & { events?: WebhookEvents } = {};
   private readonly msgRetryCounterCache: CacheStore = new NodeCache({ stdTTL: 3600, maxKeys: 10000 });
   private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 1800, maxKeys: 50000 });
+  /**
+   * Recipient existence lookups are USync round-trips, and nothing cached them:
+   * every send to the same recipient paid for one again. Only positive results
+   * are cached — a number absent from WhatsApp today may join tomorrow, and that
+   * is the answer that rejects sends, so it must not be held.
+   */
+  private readonly numberLookupCache = new NodeCache({ stdTTL: 6 * 3600, maxKeys: 50000 });
   private readonly instanceQr: InstanceQrCode = { count: 0 };
   private readonly stateConnection: InstanceStateConnection = { state: 'close' };
   private readonly databaseOptions: Database =
@@ -1941,12 +1948,10 @@ export class WAStartupService {
     }
 
     const jid = this.createJid(number);
-    const isWA = (await this.whatsappNumber({ numbers: [jid] }))[0];
-    if (!isWA.exists && !isJidGroup(isWA.jid) && !isJidNewsletter(isWA.jid)) {
-      throw new BadRequestException(isWA);
-    }
-
-    const recipient = isJidGroup(jid) ? jid : isLidUser(jid) ? jid : isJidNewsletter(jid) ? jid : isWA.jid;
+    // Was whatsappNumber(), which also ran a getLid() USync whose result this
+    // path never read — a second 60s-bounded round-trip for nothing. resolveRecipient
+    // does the existence leg only, bounded and cached.
+    const recipient = await this.resolveRecipient(jid);
 
     if (isJidGroup(recipient)) {
       try {
@@ -2874,12 +2879,102 @@ export class WAStartupService {
   }
 
   // Chat Controller
+  /**
+   * Bound a WhatsApp query that would otherwise inherit Baileys'
+   * defaultQueryTimeoutMs (60s). Two of those back to back exceed the HTTP
+   * budget of most callers, so the caller aborts and can no longer tell whether
+   * its message was sent. The losing promise is left to settle on its own —
+   * Baileys offers no cancellation — so its rejection is swallowed here rather
+   * than surfacing as an unhandled rejection.
+   */
+  private async withLookupDeadline<T>(work: Promise<T>, label: string): Promise<T> {
+    const parsed = Number.parseInt(process.env.NUMBER_LOOKUP_TIMEOUT_MS ?? '', 10);
+    const timeoutMs = Number.isFinite(parsed) && parsed > 0 ? parsed : 15 * 1000;
+
+    let timer: NodeJS.Timeout;
+    work.catch(() => undefined);
+
+    try {
+      return await Promise.race([
+        work,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`${label} timed out after ${timeoutMs}ms`)),
+            timeoutMs,
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Resolve the jid a message is actually delivered to.
+   *
+   * The existence lookup is an optimisation, not a requirement — WhatsApp accepts
+   * a plain <number>@s.whatsapp.net. It used to run unbounded and uncached before
+   * every send, and *any* failure, timeout included, was reported as "number not
+   * on WhatsApp", so a slow USync killed sends to perfectly valid numbers.
+   *
+   * The distinction that matters: onWhatsApp filters out users it did not resolve
+   * (Socket/socket.js -> `.filter(a => !!a.contact)`), so a completed query with
+   * no entry IS the not-registered answer and still rejects. Only a query that
+   * never completed — timeout, or a falsy USync result — falls through to the raw
+   * jid and lets the send itself be the judge.
+   */
+  private async resolveRecipient(jid: string): Promise<string> {
+    if (isJidGroup(jid) || isJidNewsletter(jid) || isLidUser(jid)) {
+      return jid;
+    }
+
+    const cached = this.numberLookupCache.get<OnWhatsAppDto>(jid);
+    if (cached) {
+      return cached.jid || jid;
+    }
+
+    let list: { jid: string; exists: boolean }[] | undefined;
+    try {
+      list = await this.withLookupDeadline(
+        this.client.onWhatsApp(jid),
+        `onWhatsApp(${jid})`,
+      );
+    } catch (error) {
+      this.logger.warn(
+        `recipient lookup unavailable for ${jid}, sending to the raw jid: ${
+          error?.message ?? error
+        }`,
+      );
+      return jid;
+    }
+
+    if (!list) {
+      // Baileys returns undefined when the USync itself yielded nothing. That is
+      // "we could not ask", not "the number is absent" — do not reject on it.
+      this.logger.warn(
+        `recipient lookup returned no USync result for ${jid}, sending to the raw jid`,
+      );
+      return jid;
+    }
+
+    const result = list[0];
+    if (!result?.exists) {
+      throw new BadRequestException(new OnWhatsAppDto(false, jid));
+    }
+
+    this.numberLookupCache.set(jid, new OnWhatsAppDto(true, result.jid));
+    return result.jid || jid;
+  }
+
   public async whatsappNumber(data: WhatsAppNumberDto) {
     const onWhatsapp: OnWhatsAppDto[] = [];
     for await (const number of data.numbers) {
       const jid = this.createJid(number);
       if (isLidUser(jid)) {
+        // `continue`: onWhatsApp explicitly rejects LIDs, so falling through to
+        // the branch below only produced a bogus second entry for this number.
         onWhatsapp.push(new OnWhatsAppDto(true, '', jid));
+        continue;
       }
       if (isJidGroup(jid)) {
         const group = await this.findGroup({ groupJid: jid }, 'inner');

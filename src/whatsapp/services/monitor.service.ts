@@ -54,6 +54,26 @@ import { Instance } from '@prisma/client';
 import { ProviderFiles } from '../../provider/sessions';
 import { Websocket } from '../../websocket/server';
 
+export type InstanceLookupFailure = 'DB_UNAVAILABLE' | 'RESTORE_FAILED';
+
+/**
+ * Thrown by ensureInstance when we could not determine whether an instance is
+ * usable — as opposed to determining that it is gone. The distinction has to
+ * survive all the way to the HTTP status: "gone" is a 400 the caller should stop
+ * retrying, "could not tell" is a 503 it should retry.
+ */
+export class InstanceLookupError extends Error {
+  constructor(
+    public readonly instanceName: string,
+    public readonly reason: InstanceLookupFailure,
+    public readonly cause?: unknown,
+  ) {
+    const detail = cause instanceof Error ? cause.message : String(cause ?? '');
+    super(`${reason} for instance "${instanceName}"${detail ? `: ${detail}` : ''}`);
+    this.name = 'InstanceLookupError';
+  }
+}
+
 export class WAMonitoringService {
   constructor(
     private readonly eventEmitter: EventEmitter2,
@@ -346,17 +366,30 @@ export class WAMonitoringService {
       }));
     } catch (err) {
       this.logger.error(`on-demand restore: DB lookup failed for ${name}`, err);
-      return existsSync(join(INSTANCE_DIR, name));
+      // Deliberately NOT falling back to the filesystem check here. That fallback
+      // is always false for DB-backed sessions, so a Postgres blip resolved to
+      // "instance does not exist" — the same terminal 400 a genuinely deleted
+      // instance gets. Callers then gave up on a session that was perfectly fine.
+      // Surface it as its own retryable failure instead.
+      throw new InstanceLookupError(name, 'DB_UNAVAILABLE', err);
     }
 
     if (!hasSession) {
-      // No session rows — genuinely unpaired or deleted. Fall back to the legacy
-      // filesystem check before declaring it gone.
+      // No session rows — genuinely unpaired or deleted. This filesystem check is
+      // real discovery, not error masking: legacy useMultiFileAuthState instances
+      // live only on disk and have no session rows by design.
       return existsSync(join(INSTANCE_DIR, name));
     }
 
     this.logger.warn(`on-demand restore: ${name} missing from memory, restoring`);
-    await this.restoreInstance(name);
+    try {
+      await this.restoreInstance(name);
+    } catch (err) {
+      this.logger.error(`on-demand restore: restore failed for ${name}`, err);
+      // Same reasoning: the session exists, we just could not stand it up right
+      // now. Reporting that as "does not exist" hides a live instance.
+      throw new InstanceLookupError(name, 'RESTORE_FAILED', err);
+    }
 
     // Registered is enough to let the request through: the guard never checked
     // connection state for instances already in the map either, and the send path

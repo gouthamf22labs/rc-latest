@@ -39,12 +39,12 @@ import { InstanceDto } from '../whatsapp/dto/instance.dto';
 import { JSONSchema7 } from 'json-schema';
 import { Request } from 'express';
 import { validate } from 'jsonschema';
-import { BadRequestException } from '../exceptions';
+import { BadRequestException, GatewayTimeoutException } from '../exceptions';
 import { Logger } from '../config/logger.config';
 import { GroupJid } from '../whatsapp/dto/group.dto';
 import { ConfigService } from '../config/env.config';
 
-class DataValidate<T> {
+export class DataValidate<T> {
   request: Request;
   schema: JSONSchema7;
   execute: (instance: InstanceDto, data: T, file?: Express.Multer.File) => Promise<any>;
@@ -103,6 +103,62 @@ export async function dataValidate<T>(args: DataValidate<T>) {
   }
 
   return await execute(instance, body, request?.file);
+}
+
+/**
+ * dataValidate with a server-side deadline.
+ *
+ * Without one, a handler that stalls — a socket reporting 'open' while WhatsApp
+ * answers nothing — simply never responds, and the caller's own HTTP timeout
+ * fires instead. That is the worst outcome available: the caller aborts with no
+ * status code, cannot distinguish "never sent" from "sent and we lost the
+ * receipt", and typically records a failure for a message that was delivered.
+ *
+ * So the API answers first, with a 504 that says so. The deadline must stay
+ * below the caller's timeout to be worth anything (wa-send-later-be posts sends
+ * with a 120s axios timeout, hence the 90s default). Tune with SEND_DEADLINE_MS.
+ *
+ * The handler is NOT cancelled — Node offers no way to unwind it — so the send
+ * may still land. That is precisely what `inFlight` on the response body says,
+ * and why a 504 must never be treated as proof of failure.
+ */
+export async function dataValidateWithDeadline<T>(args: DataValidate<T>) {
+  const parsed = Number.parseInt(process.env.SEND_DEADLINE_MS ?? '', 10);
+  const timeoutMs = Number.isFinite(parsed) && parsed > 0 ? parsed : 90 * 1000;
+
+  const work = dataValidate<T>(args);
+  // The race stops observing `work` once the deadline wins; without this a later
+  // rejection would surface as an unhandled rejection and take the process down.
+  work.catch(() => undefined);
+
+  const timedOut = Symbol('deadline');
+  let timer: NodeJS.Timeout;
+  try {
+    const outcome = await Promise.race([
+      work,
+      new Promise<typeof timedOut>((resolve) => {
+        timer = setTimeout(() => resolve(timedOut), timeoutMs);
+      }),
+    ]);
+
+    if (outcome !== timedOut) {
+      return outcome;
+    }
+
+    logger.error(
+      `deadline exceeded after ${timeoutMs}ms: ${args.request.method} ${args.request.originalUrl}`,
+    );
+    // Constructs and throws — see the exception classes in src/exceptions.
+    new GatewayTimeoutException(
+      `Request exceeded the server deadline of ${timeoutMs}ms`,
+      'The operation was still running and may still complete - do not treat this as a confirmed failure',
+    );
+    // Unreachable: the constructor above always throws. TypeScript cannot see
+    // that, so give its control-flow analysis something to terminate on.
+    throw new Error(`deadline exceeded after ${timeoutMs}ms`);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function groupValidate<T>(args: DataValidate<T>) {

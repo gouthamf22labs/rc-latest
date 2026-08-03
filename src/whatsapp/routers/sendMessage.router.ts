@@ -70,7 +70,7 @@ import { BadRequestException } from '../../exceptions';
 import { isEmpty } from 'class-validator';
 import { HttpStatus } from '../../app.module';
 import { SendMessageController } from '../controllers/sendMessage.controller';
-import { routerPath, dataValidate } from '../../validate/router.validate';
+import { routerPath, dataValidateWithDeadline } from '../../validate/router.validate';
 import { existsSync, mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { ROOT_DIR } from '../../config/path.config';
@@ -100,7 +100,7 @@ export function MessageRouter(
 
   const router = Router()
     .post(routerPath('sendText'), ...guards, async (req, res) => {
-      const response = await dataValidate<SendTextDto>({
+      const response = await dataValidateWithDeadline<SendTextDto>({
         request: req,
         schema: textMessageSchema,
         execute: (instance, data) => sendMessageController.sendText(instance, data),
@@ -109,7 +109,7 @@ export function MessageRouter(
       res.status(HttpStatus.CREATED).json(response);
     })
     .post(routerPath('sendMedia'), ...guards, async (req, res) => {
-      const response = await dataValidate<SendMediaDto>({
+      const response = await dataValidateWithDeadline<SendMediaDto>({
         request: req,
         schema: mediaMessageSchema,
         execute: (instance, data) => sendMessageController.sendMedia(instance, data),
@@ -123,7 +123,7 @@ export function MessageRouter(
       uploadFile.single('attachment'),
       validateMedia,
       async (req, res) => {
-        const response = await dataValidate<MediaFileDto>({
+        const response = await dataValidateWithDeadline<MediaFileDto>({
           request: req,
           schema: mediaFileMessageSchema,
           execute: (instance, data, file) => {
@@ -135,7 +135,7 @@ export function MessageRouter(
       },
     )
     .post(routerPath('sendWhatsAppAudio'), ...guards, async (req, res) => {
-      const response = await dataValidate<SendAudioDto>({
+      const response = await dataValidateWithDeadline<SendAudioDto>({
         request: req,
         schema: audioMessageSchema,
         execute: (instance, data) =>
@@ -150,7 +150,7 @@ export function MessageRouter(
       uploadFile.single('attachment'),
       validateMedia,
       async (req, res) => {
-        const response = await dataValidate<AudioMessageFileDto>({
+        const response = await dataValidateWithDeadline<AudioMessageFileDto>({
           request: req,
           schema: audioFileMessageSchema,
           execute: (instance, data, file) => {
@@ -166,7 +166,7 @@ export function MessageRouter(
       },
     )
     .post(routerPath('sendLocation'), ...guards, async (req, res) => {
-      const response = await dataValidate<SendLocationDto>({
+      const response = await dataValidateWithDeadline<SendLocationDto>({
         request: req,
         schema: locationMessageSchema,
         execute: (instance, data) => sendMessageController.sendLocation(instance, data),
@@ -175,7 +175,7 @@ export function MessageRouter(
       res.status(HttpStatus.CREATED).json(response);
     })
     .post(routerPath('sendContact'), ...guards, async (req, res) => {
-      const response = await dataValidate<SendContactDto>({
+      const response = await dataValidateWithDeadline<SendContactDto>({
         request: req,
         schema: contactMessageSchema,
         execute: (instance, data) => sendMessageController.sendContact(instance, data),
@@ -184,7 +184,7 @@ export function MessageRouter(
       res.status(HttpStatus.CREATED).json(response);
     })
     .post(routerPath('sendReaction'), ...guards, async (req, res) => {
-      const response = await dataValidate<SendReactionDto>({
+      const response = await dataValidateWithDeadline<SendReactionDto>({
         request: req,
         schema: reactionMessageSchema,
         execute: (instance, data) => sendMessageController.sendReaction(instance, data),
@@ -193,7 +193,7 @@ export function MessageRouter(
       res.status(HttpStatus.CREATED).json(response);
     })
     // .post(routerPath('sendButtons'), ...guards, async (req, res) => {
-    //   const response = await dataValidate<SendButtonsDto>({
+    //   const response = await dataValidateWithDeadline<SendButtonsDto>({
     //     request: req,
     //     schema: buttonsMessageSchema,
     //     execute: (instance, data) => {
@@ -215,7 +215,7 @@ export function MessageRouter(
     //   res.status(HttpStatus.CREATED).json(response);
     // })
     // .post(routerPath('sendList'), ...guards, async (req, res) => {
-    //   const response = await dataValidate<SendListDto>({
+    //   const response = await dataValidateWithDeadline<SendListDto>({
     //     request: req,
     //     schema: listMessageSchema,
     //     execute: (instance, data) => {
@@ -230,7 +230,7 @@ export function MessageRouter(
     //   res.status(HttpStatus.CREATED).json(response);
     // })
     // .post(routerPath('sendList/legacy'), ...guards, async (req, res) => {
-    //   const response = await dataValidate<SendListLegacyDto>({
+    //   const response = await dataValidateWithDeadline<SendListLegacyDto>({
     //     request: req,
     //     schema: listMessageLegacySchema,
     //     execute: (instance, data) => {
@@ -248,7 +248,7 @@ export function MessageRouter(
     //   res.status(HttpStatus.CREATED).json(response);
     // })
     .post(routerPath('sendLink'), ...guards, async (req, res) => {
-      const response = await dataValidate<SendLinkDto>({
+      const response = await dataValidateWithDeadline<SendLinkDto>({
         request: req,
         schema: sendLinkSchema,
         execute: (instance, data) =>
@@ -258,7 +258,7 @@ export function MessageRouter(
       res.status(HttpStatus.CREATED).json(response);
     })
     .post(routerPath('sendPoll'), ...guards, async (req, res) => {
-      const response = await dataValidate<SendPollDto>({
+      const response = await dataValidateWithDeadline<SendPollDto>({
         request: req,
         schema: pollMessageSchema,
         execute: (instance, data) => sendMessageController.sendPoll(instance, data),
@@ -267,7 +267,7 @@ export function MessageRouter(
       res.status(HttpStatus.CREATED).json(response);
     })
     .post(routerPath('sendQuiz'), ...guards, async (req, res) => {
-      const response = await dataValidate<SendQuizDto>({
+      const response = await dataValidateWithDeadline<SendQuizDto>({
         request: req,
         schema: quizMessageSchema,
         execute: (instance, data) => sendMessageController.sendQuiz(instance, data),
@@ -276,7 +276,7 @@ export function MessageRouter(
       res.status(HttpStatus.CREATED).json(response);
     })
     .post(routerPath('sendSticker'), ...guards, async (req, res) => {
-      const response = await dataValidate<SendStickerDto>({
+      const response = await dataValidateWithDeadline<SendStickerDto>({
         request: req,
         schema: stickerMessageSchema,
         execute: (instance, data) => sendMessageController.sendSticker(instance, data),
@@ -285,7 +285,7 @@ export function MessageRouter(
       res.status(HttpStatus.CREATED).json(response);
     })
     .post(routerPath('sendEvent'), ...guards, async (req, res) => {
-      const response = await dataValidate<SendEventDto>({
+      const response = await dataValidateWithDeadline<SendEventDto>({
         request: req,
         schema: eventMessageSchema,
         execute: (instance, data) => sendMessageController.sendEvent(instance, data),

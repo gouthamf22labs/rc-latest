@@ -67,7 +67,13 @@ export class Repository extends PrismaClient {
         new pg.Pool({
           connectionString: process.env.DATABASE_URL,
           max: 100,
-          idleTimeoutMillis: 30000,
+          // 30s here was the lockout window: a burst grew the pool to `max` and
+          // held every connection idle for 30s afterwards, so a momentary spike
+          // locked out every other client (other replicas, wa-send-later-be, the
+          // reconnect poller, `prisma migrate deploy`) long after the work was
+          // done. Draining in 5s keeps the same burst ceiling at a fraction of
+          // the exposure; the cost is more reconnect churn on a quiet pool.
+          idleTimeoutMillis: 5000,
           connectionTimeoutMillis: 5000,
         }),
         {
