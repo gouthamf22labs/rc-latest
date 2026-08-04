@@ -641,7 +641,12 @@ export class WAStartupService {
           qrcode: { instance: this.instance.name, ...this.instanceQr },
         });
 
-        this.eventEmitter.emit('qrcode.updated', { ...this.instanceQr });
+        // Name included so a listener can tell whose QR this is: the emitter is global and
+        // process-wide, so an unfiltered listener resolves on whichever instance emits first.
+        this.eventEmitter.emit('qrcode.updated', {
+          instance: this.instance.name,
+          ...this.instanceQr,
+        });
       });
 
       if (process.env.NODE_ENV === 'development') {
@@ -1633,13 +1638,15 @@ export class WAStartupService {
 
   private readonly groupHandler = {
     'groups.upsert': (groupMetadata: GroupMetadata[]) => {
-      this.ws.send(this.instance.name, 'groups.upsert', groupMetadata);
-      this.sendDataWebhook('groupsUpsert', groupMetadata);
+      const payload = this.annotateGroupRights(groupMetadata);
+      this.ws.send(this.instance.name, 'groups.upsert', payload);
+      this.sendDataWebhook('groupsUpsert', payload);
     },
 
     'groups.update': (groupMetadataUpdate: Partial<GroupMetadata>[]) => {
-      this.ws.send(this.instance.name, 'groups.update', groupMetadataUpdate);
-      this.sendDataWebhook('groupsUpdated', groupMetadataUpdate);
+      const payload = this.annotateGroupRights(groupMetadataUpdate);
+      this.ws.send(this.instance.name, 'groups.update', payload);
+      this.sendDataWebhook('groupsUpdated', payload);
     },
 
     'group-participants.update': (participantsUpdate: {
@@ -1649,8 +1656,18 @@ export class WAStartupService {
       participants: GroupParticipant[];
       action: ParticipantAction;
     }) => {
-      this.ws.send(this.instance.name, 'group-participants.update', participantsUpdate);
-      this.sendDataWebhook('groupsParticipantsUpdated', participantsUpdate);
+      // affectsMe tells consumers whether this promote/demote/add/remove changed OUR standing in
+      // the group, as opposed to some other member's. Resolved here because identifying ourselves
+      // needs both of our identities (see selfIds) — a consumer holding only the phone number
+      // cannot do it for lid-addressed groups.
+      const payload = {
+        ...participantsUpdate,
+        affectsMe: (participantsUpdate.participants ?? []).some((p) =>
+          this.isSelfParticipant(p),
+        ),
+      };
+      this.ws.send(this.instance.name, 'group-participants.update', payload);
+      this.sendDataWebhook('groupsParticipantsUpdated', payload);
     },
   };
 
@@ -2658,6 +2675,48 @@ export class WAStartupService {
     return await this.sendMessageWithTyping(data.number, { ...message }, data?.options);
   }
 
+  /**
+   * Our own identities, as bare ids with the ":deviceId" suffix and "@server" stripped.
+   *
+   * Both forms are needed: a group addressed by phone number lists us by our PN, one addressed
+   * by LID lists us by our LID, and WhatsApp does not always send the `phone_number` attribute
+   * alongside a LID (see Baileys' group metadata parsing). Matching on either identity is what
+   * makes self-resolution work for every group regardless of its addressingMode.
+   */
+  private get selfIds(): Set<string> {
+    const bare = (jid?: string | null) => (jid ?? '').split('@')[0].split(':')[0];
+    return new Set(
+      [this.client?.user?.id, (this.client?.user as any)?.lid].map(bare).filter(Boolean),
+    );
+  }
+
+  /**
+   * Tags group payloads with this instance's posting rights, matching fetchAllGroups' output.
+   *
+   * Only groups that actually carry a participant list are annotated. groups.update is partial —
+   * a rename or an announce toggle arrives with no participants — and annotating those would
+   * emit isMember:false purely because the event omitted the data, which reads identically to a
+   * genuine removal. Such payloads pass through untouched and keep whatever the consumer stored.
+   */
+  private annotateGroupRights<T extends Partial<GroupMetadata>>(groups: T[]): T[] {
+    if (!Array.isArray(groups)) return groups;
+    return groups.map((g) => {
+      if (!Array.isArray(g?.participants) || g.participants.length === 0) return g;
+      const self = g.participants.find((p) => this.isSelfParticipant(p));
+      return { ...g, isMember: !!self, isAdmin: !!self?.admin };
+    });
+  }
+
+  /** True when a group participant entry refers to this instance. */
+  private isSelfParticipant(participant: any): boolean {
+    const ids = this.selfIds;
+    if (!ids.size) return false;
+    const bare = (jid?: string | null) => (jid ?? '').split('@')[0].split(':')[0];
+    return [participant?.phoneNumber, participant?.id, participant?.lid, participant?.jid]
+      .filter((v) => typeof v === 'string')
+      .some((v) => ids.has(bare(v)));
+  }
+
   public async fetchAllGroups() {
     try {
       const groups = await this.client.groupFetchAllParticipating();
@@ -2669,17 +2728,30 @@ export class WAStartupService {
       });
       const nameMap = new Map(contacts.map((c) => [c.remoteJid, c.pushName]));
 
-      return groupList.map((g) => ({
-        ...g,
-        participants: g.participants.map((p) => {
+      return groupList.map((g) => {
+        const participants = g.participants.map((p) => {
           const jid = (p as any).phoneNumber ?? p.id;
           const inMemory = (this.client as any).contacts?.[jid];
           return {
             ...p,
             name: nameMap.get(jid) ?? inMemory?.name ?? inMemory?.notify ?? null,
           };
-        }),
-      }));
+        });
+
+        // Resolve our own entry here rather than leaving it to the caller: only this process
+        // holds both of our identities, so only it can match a group whichever addressing mode
+        // the group uses. See isSelfParticipant.
+        const self = participants.find((p) => this.isSelfParticipant(p));
+
+        return {
+          ...g,
+          participants,
+          // Posting rights, for consumers to combine: canSend = isMember && (!announce || isAdmin).
+          // admin is 'admin' | 'superadmin' | null — both admin kinds may post to announce groups.
+          isMember: !!self,
+          isAdmin: !!self?.admin,
+        };
+      });
     } catch (error) {
       // groupFetchAllParticipating can fail when a deleted group remains in the Baileys
       // socket's in-memory state. Return empty list instead of 500 so the caller is not

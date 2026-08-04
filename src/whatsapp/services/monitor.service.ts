@@ -96,6 +96,41 @@ export class WAMonitoringService {
   private reconnectSweepTimer?: ReturnType<typeof setInterval>;
 
   /**
+   * In-flight teardowns, keyed by instance name.
+   *
+   * Logout is asynchronous end to end: the HTTP handler returns as soon as
+   * client.logout() resolves, but the resulting close event -> 'remove.instance' ->
+   * cleaningUp() chain keeps running afterwards. A /instance/connect issued in that
+   * window used to interleave badly in both directions — the new socket could read the
+   * OLD session rows before cleaningUp deleted them (authenticating with dead creds), and
+   * cleaningUp could then delete the NEW rows the fresh pairing had just written, killing
+   * a scan that was already in progress. Either way the instance ends up credential-less
+   * and starts burning re-scan attempts.
+   *
+   * Callers await teardown for a name before touching its instance, so a reconnect always
+   * starts from a settled state.
+   */
+  private readonly teardowns = new Map<string, Promise<void>>();
+
+  /**
+   * Resolves once any in-flight teardown for this instance has finished.
+   *
+   * @param waitForStartMs how long to wait for a teardown that is expected but has not
+   * begun. Callers reacting to a teardown already under way (a reconnect) pass 0. The
+   * logout path passes a budget because client.logout() resolves before the close event
+   * that triggers teardown has even fired — without it there would be nothing to await
+   * and the wait would return instantly, reopening the race it exists to close.
+   */
+  public async awaitTeardown(instanceName: string, waitForStartMs = 0): Promise<void> {
+    const deadline = Date.now() + waitForStartMs;
+    while (!this.teardowns.has(instanceName) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    // Failures are the teardown's own to log; a caller only needs to know it settled.
+    await this.teardowns.get(instanceName)?.catch(() => undefined);
+  }
+
+  /**
    * Periodic reconciliation backstop for reconnection. The primary reconnect is
    * event-driven and continuous (WAStartupService.scheduleReconnect self-heals on
    * every drop), so this sweep normally finds nothing — it exists to catch
@@ -204,7 +239,21 @@ export class WAMonitoringService {
     }
   }
 
-  private async cleaningUp({ name }: Instance) {
+  /**
+   * @param doomed the service being torn down, when the caller has it. If a *different*
+   * service is registered for this name by the time we run, a reconnect has already taken
+   * over: its session rows are the live ones, so wiping them here would destroy a pairing
+   * in progress. Defence in depth behind awaitTeardown — that ordering should prevent the
+   * overlap, this makes the overlap harmless if it happens anyway.
+   */
+  private async cleaningUp({ name }: Instance, doomed?: WAStartupService) {
+    const current = this.waInstances.get(name);
+    if (doomed && current && current !== doomed) {
+      this.logger.warn(
+        `cleaningUp skipped for "${name}": a newer instance is already connecting`,
+      );
+      return;
+    }
     this.clearListeners(name);
     if (this.providerSession?.ENABLED) {
       await this.providerFiles.removeSession(name);
@@ -503,26 +552,42 @@ export class WAMonitoringService {
 
   private removeInstance() {
     this.eventEmitter.on('remove.instance', async (instance: Instance) => {
-      try {
-        if (!instance?.name) {
-          return;
-        }
-        // Cancel any pending reconnect so the removed instance can't resurrect
-        // itself by firing connectToWhatsapp after it's gone from the map.
-        this.waInstances.get(instance.name)?.stopReconnect?.();
-        this.waInstances
-          .get(instance.name)
-          ?.client?.ev.removeAllListeners('connection.update');
-        this.waInstances.get(instance.name)?.client?.ev.flush();
-        this.waInstances.delete(instance.name);
-      } catch (error) {
-        this.logger.error('remove-instance', { error });
+      if (!instance?.name) {
+        return;
       }
+      const name = instance.name;
+      // Captured before the map entry goes, so cleaningUp can tell whether the service
+      // it is tearing down is still the current one for this name.
+      const doomed = this.waInstances.get(name);
 
+      const teardown = (async () => {
+        try {
+          // Cancel any pending reconnect so the removed instance can't resurrect
+          // itself by firing connectToWhatsapp after it's gone from the map.
+          doomed?.stopReconnect?.();
+          doomed?.client?.ev.removeAllListeners('connection.update');
+          doomed?.client?.ev.flush();
+          this.waInstances.delete(name);
+        } catch (error) {
+          this.logger.error('remove-instance', { error });
+        }
+
+        try {
+          await this.cleaningUp(instance, doomed);
+        } finally {
+          this.logger.warn(`Instance "${name}" - REMOVED`);
+        }
+      })();
+
+      // Published before the first await inside teardown completes, so a connect racing
+      // this event always finds it. Cleared in the same tick it settles.
+      this.teardowns.set(name, teardown);
       try {
-        await this.cleaningUp(instance);
+        await teardown;
       } finally {
-        this.logger.warn(`Instance "${instance?.name}" - REMOVED`);
+        // Only clear our own entry — a later teardown for the same name may have
+        // replaced it while this one was running.
+        if (this.teardowns.get(name) === teardown) this.teardowns.delete(name);
       }
     });
   }

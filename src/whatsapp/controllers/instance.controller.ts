@@ -112,6 +112,13 @@ export class InstanceController {
     }
 
     try {
+      // A logout's teardown (session wipe + instance dir removal) runs asynchronously
+      // after the logout response is sent. Starting a socket mid-teardown means either
+      // reading creds that are about to be deleted, or having this pairing's fresh creds
+      // deleted underneath it — both leave the instance credential-less and unable to
+      // re-link for minutes. Wait for a settled state first.
+      await this.waMonitor.awaitTeardown(instanceName);
+
       let instance: WAStartupService;
       instance = this.waMonitor.waInstances.get(instanceName);
       const info = instance?.getInstance();
@@ -141,12 +148,31 @@ export class InstanceController {
       }
 
       switch (state) {
-        case 'close':
-          await instance.connectToWhatsapp();
-          this.eventEmitter.once('qrcode.updated', (data: any) => {
+        case 'close': {
+          // Registered BEFORE the connect: setSocket() can emit the QR while
+          // connectToWhatsapp is still awaited, and a listener attached afterwards would
+          // miss it and leave this request hanging with no response.
+          //
+          // The emitter is process-global, so filter by name — otherwise a concurrent
+          // instance's QR resolves this request with someone else's code. Removed on
+          // failure too: a leaked one-shot listener would later fire on an unrelated QR
+          // and try to respond to a request that already errored.
+          const onQrcode = (data: any) => {
+            if (data?.instance && data.instance !== instanceName) {
+              this.eventEmitter.once('qrcode.updated', onQrcode);
+              return;
+            }
             res.status(HttpStatus.OK).json(data);
-          });
+          };
+          this.eventEmitter.once('qrcode.updated', onQrcode);
+          try {
+            await instance.connectToWhatsapp();
+          } catch (error) {
+            this.eventEmitter.removeListener('qrcode.updated', onQrcode);
+            throw error;
+          }
           break;
+        }
         case 'connecting':
           res.status(HttpStatus.OK).json(instance.qrCode);
           break;
@@ -293,6 +319,12 @@ export class InstanceController {
       await this.waMonitor.waInstances
         .get(instanceName)
         ?.client?.logout('Log out instance: ' + instanceName);
+      // client.logout() resolves once the logout is sent; the session wipe happens later,
+      // driven by the resulting close event. Wait for it so a 200 here means the instance
+      // is genuinely torn down and the caller can immediately re-connect and scan. The
+      // budget covers the gap before that close event arrives; if it never does, we return
+      // anyway rather than hanging the request — connect's own wait still covers us.
+      await this.waMonitor.awaitTeardown(instanceName, 3000);
       return { error: false, message: 'Instance logged out' };
     } catch (error) {
       throw new InternalServerErrorException(error?.message);
