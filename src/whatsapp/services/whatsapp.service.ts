@@ -2017,16 +2017,42 @@ export class WAStartupService {
   }
 
   /**
-   * Resolves a number to the jid presence updates will actually arrive under.
-   * Groups pass through; users go through the existence check so a `@c.us`/raw
-   * number lands on the same jid the send path uses.
+   * Every jid a contact's presence can arrive under, primary first.
+   *
+   * WhatsApp addresses a contact by phone-number jid *or* by LID, and a
+   * `<presence>` node carries whichever it pleases — observed in the wild:
+   * subscribe by phone-number jid, updates arrive from the LID. Watching a
+   * single jid therefore misses them silently, so both are always resolved and
+   * indexed together.
    */
-  private async presenceJid(number: string): Promise<string> {
+  private async presenceJids(number: string): Promise<string[]> {
     const jid = this.createJid(number);
-    if (isJidGroup(jid)) {
-      return jid;
+    if (isJidGroup(jid) || isJidNewsletter(jid)) {
+      return [jid];
     }
-    return await this.resolveRecipient(jid);
+    if (isLidUser(jid)) {
+      return [jid];
+    }
+
+    const resolved = await this.resolveRecipient(jid);
+    const jids = new Set<string>([resolved, jid]);
+
+    try {
+      // Bounded: this is a USync round-trip, and both callers (a lookup and the
+      // backend's watch registration) are request-path.
+      const lid = (
+        await this.withLookupDeadline(this.getLid(resolved), `getLid(${resolved})`)
+      )[0]?.lid;
+      if (lid) {
+        jids.add(lid);
+      }
+    } catch (error) {
+      // Presence still works on whichever jid WhatsApp happens to use; a missing
+      // LID only narrows coverage, so this must not fail the request.
+      this.logger.warn(`lid lookup failed for ${resolved}: ${error?.message ?? error}`);
+    }
+
+    return [...jids];
   }
 
   private presenceResponse(jid: string, number: string, snapshot?: PresenceSnapshot) {
@@ -2067,16 +2093,16 @@ export class WAStartupService {
    */
   public async fetchPresence(data: { number: string; waitMs?: number }) {
     this.assertConnected();
-    const jid = await this.presenceJid(data.number);
+    const jids = await this.presenceJids(data.number);
     const waitMs = Math.min(Math.max(data.waitMs ?? 3000, 0), 15000);
 
-    const cached = this.presenceWatcher.getSnapshot(jid);
+    const cached = this.presenceWatcher.getSnapshot(...jids);
     if (cached) {
-      return this.presenceResponse(jid, data.number, cached);
+      return this.presenceResponse(jids[0], data.number, cached);
     }
 
-    const fresh = await this.presenceWatcher.requestSnapshot(jid, waitMs);
-    return this.presenceResponse(jid, data.number, fresh ?? undefined);
+    const fresh = await this.presenceWatcher.requestSnapshot(jids, waitMs);
+    return this.presenceResponse(jids[0], data.number, fresh ?? undefined);
   }
 
   /**
@@ -2092,7 +2118,8 @@ export class WAStartupService {
     fireIfAlreadyOnline?: boolean;
   }) {
     this.assertConnected();
-    const jid = await this.presenceJid(data.number);
+    const jids = await this.presenceJids(data.number);
+    const jid = jids[0];
     if (isJidGroup(jid) || isJidNewsletter(jid)) {
       // Groups report an online *count*, never a per-member transition, and
       // channels have no presence at all — there is nothing to trigger on.
@@ -2104,6 +2131,7 @@ export class WAStartupService {
     const { watch, firedImmediately } = this.presenceWatcher.watch({
       watchId: data.watchId,
       jid,
+      jids,
       number: data.number,
       ttlSeconds,
       fireIfAlreadyOnline: data.fireIfAlreadyOnline,
@@ -2117,7 +2145,8 @@ export class WAStartupService {
       // The watch already fired (contact was online): the webhook has been sent
       // and no watch remains registered.
       firedImmediately,
-      presence: this.presenceResponse(jid, data.number, this.presenceWatcher.getSnapshot(jid)),
+      jids: watch.jids,
+      presence: this.presenceResponse(jid, data.number, this.presenceWatcher.getSnapshot(...jids)),
     };
   }
 
@@ -2128,8 +2157,8 @@ export class WAStartupService {
     if (!data.number) {
       throw new BadRequestException('Provide watchId or number');
     }
-    const jid = await this.presenceJid(data.number);
-    return { removed: this.presenceWatcher.unwatchJid(jid) };
+    const jids = await this.presenceJids(data.number);
+    return { removed: this.presenceWatcher.unwatchJid(...jids) };
   }
 
   public findPresenceWatches() {
@@ -2139,8 +2168,13 @@ export class WAStartupService {
       jid: watch.jid,
       createdAt: new Date(watch.createdAt).toISOString(),
       expiresAt: new Date(watch.expiresAt).toISOString(),
+      jids: watch.jids,
       fireIfAlreadyOnline: watch.fireIfAlreadyOnline,
-      presence: this.presenceResponse(watch.jid, watch.number, this.presenceWatcher.getSnapshot(watch.jid)),
+      presence: this.presenceResponse(
+        watch.jid,
+        watch.number,
+        this.presenceWatcher.getSnapshot(...watch.jids),
+      ),
     }));
   }
 

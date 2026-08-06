@@ -36,7 +36,15 @@ export type PresenceSnapshot = {
 
 export type PresenceWatch = {
   watchId: string;
+  /** Primary jid, used for display and for the subscribe. */
   jid: string;
+  /**
+   * Every jid this contact's presence can arrive under. WhatsApp addresses a
+   * contact by phone-number jid *or* by LID, and which one a `<presence>` node
+   * carries is not ours to choose — a watch registered under only one of them
+   * silently never fires.
+   */
+  jids: string[];
   number: string;
   createdAt: number;
   expiresAt: number;
@@ -52,6 +60,8 @@ export type PresenceWatch = {
 export type PresenceWatchInput = {
   watchId: string;
   jid: string;
+  /** Aliases of `jid` (typically its LID). `jid` itself is added automatically. */
+  jids?: string[];
   number: string;
   ttlSeconds: number;
   fireIfAlreadyOnline?: boolean;
@@ -132,40 +142,63 @@ export class PresenceWatcher {
 
   // ─── reads ──────────────────────────────────────────────────────────────────
 
-  public getSnapshot(jid: string): PresenceSnapshot | undefined {
-    return this.snapshots.get(jid);
+  /** Freshest snapshot across a contact's jids (phone-number jid and LID). */
+  public getSnapshot(...jids: string[]): PresenceSnapshot | undefined {
+    let best: PresenceSnapshot | undefined;
+    for (const jid of jids) {
+      const found = this.snapshots.get(jid);
+      if (found && (!best || found.updatedAt > best.updatedAt)) {
+        best = found;
+      }
+    }
+    return best;
   }
 
   /**
-   * Subscribes and resolves on the first `presence.update` for `jid`, or null on
-   * timeout. A timeout is a normal outcome: WhatsApp stays silent when the
-   * contact hides both last-seen and online status.
+   * Subscribes and resolves on the first `presence.update` for any of the
+   * contact's jids, or null on timeout. A timeout is a normal outcome: WhatsApp
+   * stays silent when the contact hides both last-seen and online status.
    */
-  public async requestSnapshot(jid: string, timeoutMs: number): Promise<PresenceSnapshot | null> {
-    const waiter = this.waitForUpdate(jid, timeoutMs);
-    try {
-      await this.deps.subscribe(jid);
-    } catch (error) {
-      this.deps.logger.warn(`presence subscribe failed for ${jid}: ${error?.message ?? error}`);
+  public async requestSnapshot(jids: string[], timeoutMs: number): Promise<PresenceSnapshot | null> {
+    const waiter = this.waitForUpdate(jids, timeoutMs);
+    for (const jid of jids) {
+      try {
+        await this.deps.subscribe(jid);
+      } catch (error) {
+        this.deps.logger.warn(`presence subscribe failed for ${jid}: ${error?.message ?? error}`);
+      }
     }
     return waiter;
   }
 
-  private waitForUpdate(jid: string, timeoutMs: number): Promise<PresenceSnapshot | null> {
+  private waitForUpdate(jids: string[], timeoutMs: number): Promise<PresenceSnapshot | null> {
     return new Promise((resolve) => {
-      const list = this.waiters.get(jid) ?? [];
+      let settled = false;
+
       const timer = setTimeout(() => {
-        this.removeWaiter(jid, onUpdate);
+        settled = true;
+        for (const jid of jids) {
+          this.removeWaiter(jid, onUpdate);
+        }
         resolve(null);
       }, timeoutMs);
 
       const onUpdate = (snapshot: PresenceSnapshot) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
         clearTimeout(timer);
+        // The other aliases' waiters are left to be cleared by their own
+        // resolution or by notifyWaiters; `settled` makes them harmless.
         resolve(snapshot);
       };
 
-      list.push(onUpdate);
-      this.waiters.set(jid, list);
+      for (const jid of jids) {
+        const list = this.waiters.get(jid) ?? [];
+        list.push(onUpdate);
+        this.waiters.set(jid, list);
+      }
     });
   }
 
@@ -210,31 +243,36 @@ export class PresenceWatcher {
     const watch: PresenceWatch = {
       watchId: input.watchId,
       jid: input.jid,
+      jids: [...new Set([input.jid, ...(input.jids ?? [])])].filter(Boolean),
       number: input.number,
       createdAt: existing?.createdAt ?? Date.now(),
       expiresAt: Date.now() + input.ttlSeconds * 1000,
       fireIfAlreadyOnline: input.fireIfAlreadyOnline ?? true,
     };
 
-    // A re-registration may move the jid; clear the old index entry first.
-    if (existing && existing.jid !== watch.jid) {
+    // A re-registration may move the jids; clear the old index entries first.
+    if (existing) {
       this.unindex(existing);
     }
 
     this.watches.set(watch.watchId, watch);
-    const set = this.watchesByJid.get(watch.jid) ?? new Set<string>();
-    set.add(watch.watchId);
-    this.watchesByJid.set(watch.jid, set);
+    for (const jid of watch.jids) {
+      const set = this.watchesByJid.get(jid) ?? new Set<string>();
+      set.add(watch.watchId);
+      this.watchesByJid.set(jid, set);
+    }
 
     this.ensureTimers();
 
-    const known = this.snapshots.get(watch.jid);
+    const known = this.getSnapshot(...watch.jids);
     if (watch.fireIfAlreadyOnline && known?.online && this.isFresh(known)) {
       this.fire([watch], known);
       return { watch, firedImmediately: true };
     }
 
-    this.subscribeQueue.add(watch.jid);
+    for (const jid of watch.jids) {
+      this.subscribeQueue.add(jid);
+    }
     void this.drain();
     return { watch, firedImmediately: false };
   }
@@ -250,25 +288,36 @@ export class PresenceWatcher {
     return true;
   }
 
-  /** Drops every watch aimed at a jid. Returns the ids removed. */
-  public unwatchJid(jid: string): string[] {
-    const ids = [...(this.watchesByJid.get(jid) ?? [])];
-    for (const id of ids) {
-      this.watches.delete(id);
+  /** Drops every watch aimed at any of these jids. Returns the ids removed. */
+  public unwatchJid(...jids: string[]): string[] {
+    const ids = new Set<string>();
+    for (const jid of jids) {
+      for (const id of this.watchesByJid.get(jid) ?? []) {
+        ids.add(id);
+      }
     }
-    this.watchesByJid.delete(jid);
+    for (const id of ids) {
+      const watch = this.watches.get(id);
+      this.watches.delete(id);
+      // Unindex by the watch's own aliases, not just the jids passed in.
+      if (watch) {
+        this.unindex(watch);
+      }
+    }
     this.stopTimersIfIdle();
-    return ids;
+    return [...ids];
   }
 
   private unindex(watch: PresenceWatch) {
-    const set = this.watchesByJid.get(watch.jid);
-    if (!set) {
-      return;
-    }
-    set.delete(watch.watchId);
-    if (set.size === 0) {
-      this.watchesByJid.delete(watch.jid);
+    for (const jid of watch.jids) {
+      const set = this.watchesByJid.get(jid);
+      if (!set) {
+        continue;
+      }
+      set.delete(watch.watchId);
+      if (set.size === 0) {
+        this.watchesByJid.delete(jid);
+      }
     }
   }
 
