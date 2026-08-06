@@ -161,7 +161,10 @@ export function ChatRouter(chatController: ChatController, ...guards: RequestHan
       const response = await dataValidate<InstanceDto>({
         request: req,
         schema: null,
-        execute: (instance) => chatController.findPresenceWatches(instance),
+        // ?trust=1 also reports whether each contact will accept our presence
+        // subscribe — the first thing to check when a trigger never fires.
+        execute: (instance) =>
+          chatController.findPresenceWatches(instance, req.query?.trust === '1'),
       });
 
       res.status(HttpStatus.OK).json(response);

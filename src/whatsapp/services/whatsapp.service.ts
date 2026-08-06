@@ -171,6 +171,15 @@ import { encodeProps } from '../../utils/encode.props';
 import { backoffDelay } from '../../utils/reconnect-backoff';
 import { connectLimiter } from '../../utils/connect-limiter';
 import { PresenceWatcher, PresenceSnapshot } from './presence.service';
+// Not re-exported from the package root, but the package publishes no `exports`
+// map so the subpath is importable. Using Baileys' own helpers keeps the stored
+// token in exactly the shape presenceSubscribe later reads back.
+import {
+  isTcTokenExpired,
+  resolveIssuanceJid,
+  resolveTcTokenJid,
+  storeTcTokensFromIqResult,
+} from '@whiskeysockets/baileys/lib/Utils/tc-token-utils.js';
 
 // After creds are lost, a paired instance can only recover by a human scanning a
 // fresh QR. Building a socket per backend connect-poll just churns WASM signal
@@ -332,10 +341,13 @@ export class WAStartupService {
    * and re-subscribes on every `open` (subscriptions are socket-scoped).
    */
   private readonly presenceWatcher = new PresenceWatcher({
-    subscribe: (jid) => {
+    subscribe: async (jid) => {
       if (!this.client) {
-        return Promise.reject(new Error('socket not connected'));
+        throw new Error('socket not connected');
       }
+      // A subscribe without a trusted-contact token is accepted and silently
+      // ignored, so make sure we hold one first. No-op once issued.
+      await this.ensureTrustToken(jid);
       return this.client.presenceSubscribe(jid);
     },
     announceAvailable: () => {
@@ -2014,6 +2026,94 @@ export class WAStartupService {
     this.presenceWatcher.dispose();
   }
 
+  /**
+   * True when a live trusted-contact token exists for `jid`.
+   *
+   * Without one WhatsApp ignores our presence subscribe, so this is the single
+   * best predictor of whether an online trigger will actually fire for a
+   * contact — worth surfacing rather than letting the message quietly fall
+   * through to its backstop.
+   */
+  private async hasTrustToken(jid: string): Promise<boolean> {
+    if (!this.client || isJidGroup(jid) || isJidNewsletter(jid)) {
+      return false;
+    }
+    try {
+      const getLIDForPN = (pn: string) =>
+        this.client.signalRepository.lidMapping.getLIDForPN(pn);
+      const storageJid = await resolveTcTokenJid(jid, getLIDForPN);
+      const stored = await this.client.authState.keys.get('tctoken', [storageJid]);
+      const entry = stored?.[storageJid] as
+        | { token?: Uint8Array; timestamp?: string }
+        | undefined;
+      return !!entry?.token?.length && !isTcTokenExpired(entry?.timestamp);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Makes sure we hold a trusted-contact token for `jid` before subscribing to
+   * their presence.
+   *
+   * `presenceSubscribe` attaches a `tctoken` only when one is stored, and
+   * WhatsApp quietly ignores a bare subscribe — which is why presence appears to
+   * "only work after you message them": sending a 1:1 message is what issues the
+   * token (see messages-send.js, `issuePrivacyTokens` after `sendNode`). The IQ
+   * that does it is exposed on the socket, so we can issue one directly and get
+   * the same effect without sending anything.
+   *
+   * Best-effort and self-throttling: a live token short-circuits, so the IQ goes
+   * out roughly once per contact per token lifetime (~28 days), not per refresh.
+   */
+  private async ensureTrustToken(jid: string): Promise<void> {
+    if (!this.client || isJidGroup(jid) || isJidNewsletter(jid)) {
+      return;
+    }
+
+    try {
+      const getLIDForPN = (pn: string) =>
+        this.client.signalRepository.lidMapping.getLIDForPN(pn);
+      const storageJid = await resolveTcTokenJid(jid, getLIDForPN);
+
+      const existing = await this.client.authState.keys.get('tctoken', [storageJid]);
+      // Baileys stores the issue time as a string; isTcTokenExpired coerces it.
+      const entry = existing?.[storageJid] as
+        | { token?: Uint8Array; timestamp?: string }
+        | undefined;
+      if (entry?.token?.length && !isTcTokenExpired(entry?.timestamp)) {
+        return;
+      }
+
+      const getPNForLID = (lid: string) =>
+        this.client.signalRepository.lidMapping.getPNForLID(lid);
+      const issueJid = await resolveIssuanceJid(
+        jid,
+        (this.client as any).serverProps?.lidTrustedTokenIssueToLid,
+        getLIDForPN,
+        getPNForLID,
+      );
+
+      const result = await this.withLookupDeadline(
+        this.client.issuePrivacyTokens([issueJid]),
+        `issuePrivacyTokens(${issueJid})`,
+      );
+      await storeTcTokensFromIqResult({
+        result,
+        fallbackJid: storageJid,
+        keys: this.client.authState.keys,
+        getLIDForPN,
+      });
+      this.logger.info(`issued trusted-contact token for ${storageJid}`);
+    } catch (error) {
+      // Presence still works for contacts that already trust us; a failure here
+      // only leaves this one contact on the pre-existing behaviour.
+      this.logger.warn(
+        `trusted-contact token issuance failed for ${jid}: ${error?.message ?? error}`,
+      );
+    }
+  }
+
   private assertConnected() {
     if (!this.client || this.stateConnection.state !== 'open') {
       throw new BadRequestException(
@@ -2155,6 +2255,11 @@ export class WAStartupService {
     // 24h default, 7d ceiling — a watch is a live subscription, not storage.
     const ttlSeconds = Math.min(Math.max(data.ttlSeconds ?? 86400, 60), 7 * 86400);
 
+    // Issue the trusted-contact token now rather than waiting for the throttled
+    // subscribe queue, so the answer below reflects this watch's real chances.
+    await this.ensureTrustToken(jid);
+    const trusted = await this.hasTrustToken(jid);
+
     const { watch, firedImmediately } = this.presenceWatcher.watch({
       watchId: data.watchId,
       jid,
@@ -2173,6 +2278,13 @@ export class WAStartupService {
       // and no watch remains registered.
       firedImmediately,
       jids: watch.jids,
+      /**
+       * False means WhatsApp is unlikely to push presence for this contact, so
+       * the trigger probably will not fire and the message will go out at its
+       * backstop instead. Surfaced so the product can say so up front rather
+       * than leaving it a silent surprise.
+       */
+      trustedContact: trusted,
       presence: this.presenceResponse(jid, data.number, this.presenceWatcher.getSnapshot(...jids)),
     };
   }
@@ -2210,8 +2322,20 @@ export class WAStartupService {
     };
   }
 
-  public findPresenceWatches() {
-    return this.presenceWatcher.listWatches().map((watch) => ({
+  /**
+   * @param withTrust resolve each watch's trusted-contact state. Off by default
+   * because it reads the key store per watch; the diagnostic value is worth the
+   * cost only when you are asking why a trigger has not fired.
+   */
+  public async findPresenceWatches(withTrust = false) {
+    const watches = this.presenceWatcher.listWatches();
+    const trust = new Map<string, boolean>();
+    if (withTrust) {
+      for (const watch of watches) {
+        trust.set(watch.watchId, await this.hasTrustToken(watch.jid));
+      }
+    }
+    return watches.map((watch) => ({
       watchId: watch.watchId,
       number: watch.number,
       jid: watch.jid,
@@ -2219,6 +2343,7 @@ export class WAStartupService {
       expiresAt: new Date(watch.expiresAt).toISOString(),
       jids: watch.jids,
       fireIfAlreadyOnline: watch.fireIfAlreadyOnline,
+      ...(withTrust ? { trustedContact: trust.get(watch.watchId) === true } : {}),
       presence: (() => {
         // Same staleness rule the lookup applies, so the two never disagree
         // about whether a contact is currently online.
