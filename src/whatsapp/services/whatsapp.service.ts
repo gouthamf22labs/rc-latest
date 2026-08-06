@@ -338,6 +338,12 @@ export class WAStartupService {
       }
       return this.client.presenceSubscribe(jid);
     },
+    announceAvailable: () => {
+      if (!this.client) {
+        return Promise.reject(new Error('socket not connected'));
+      }
+      return this.client.sendPresenceUpdate('available');
+    },
     onOnline: (watches, snapshot) => {
       for (const watch of watches) {
         const payload = {

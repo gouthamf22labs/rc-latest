@@ -76,6 +76,14 @@ type WatcherLogger = {
 export type PresenceWatcherDeps = {
   /** Sends `presenceSubscribe` on the live socket. May reject; the watcher swallows. */
   subscribe: (jid: string) => Promise<unknown>;
+  /**
+   * Announces the socket as `available`. WhatsApp only pushes presence to a
+   * socket it considers online: without this, subscribes are accepted and
+   * nothing is ever pushed back. Baileys' own markOnlineOnConnect announce is
+   * not sufficient — it is skipped when the creds carry no pushName, and the
+   * server stops honouring it well before a long-lived watch expires.
+   */
+  announceAvailable: () => Promise<unknown>;
   /** A watch matched: the contact is online. One-shot — the watch is already removed. */
   onOnline: (watches: PresenceWatch[], snapshot: PresenceSnapshot) => void;
   /** TTL elapsed without the contact ever coming online. */
@@ -85,6 +93,11 @@ export type PresenceWatcherDeps = {
 
 /** Gap between subscribe nodes so a reconnect doesn't burst the socket. */
 const SUBSCRIBE_GAP_MS = 150;
+/**
+ * How long an `available` announce is assumed to hold. Re-announced before a
+ * batch of subscribes once this has elapsed, which also covers the refresh tick.
+ */
+const AVAILABLE_TTL_MS = 60 * 1000;
 /** WhatsApp lets subscriptions lapse; re-assert them on this cadence. */
 const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 /** How often expired watches are swept. */
@@ -107,6 +120,7 @@ export class PresenceWatcher {
   private readonly subscribeQueue = new Set<string>();
   private draining = false;
   private connected = false;
+  private lastAnnouncedAt = 0;
   private refreshTimer?: NodeJS.Timeout;
   private sweepTimer?: NodeJS.Timeout;
 
@@ -114,6 +128,8 @@ export class PresenceWatcher {
 
   public onConnectionOpen() {
     this.connected = true;
+    // The previous socket's announce died with it.
+    this.lastAnnouncedAt = 0;
     // Subscriptions die with the old socket — re-assert every watch, throttled.
     for (const watch of this.watches.values()) {
       this.subscribeQueue.add(watch.jid);
@@ -161,6 +177,10 @@ export class PresenceWatcher {
    */
   public async requestSnapshot(jids: string[], timeoutMs: number): Promise<PresenceSnapshot | null> {
     const waiter = this.waitForUpdate(jids, timeoutMs);
+    // This path subscribes directly rather than through the queue, so it has to
+    // do its own announce — otherwise the lookup waits out its timeout against a
+    // socket WhatsApp will not push to.
+    await this.ensureAvailable();
     for (const jid of jids) {
       try {
         await this.deps.subscribe(jid);
@@ -430,12 +450,32 @@ export class PresenceWatcher {
 
   // ─── subscribe throttling ───────────────────────────────────────────────────
 
+  /**
+   * WhatsApp pushes presence only to a socket it considers online, so every
+   * batch of subscribes is preceded by an announce. Cheap and idempotent —
+   * rate-limited to one per AVAILABLE_TTL_MS.
+   */
+  private async ensureAvailable() {
+    if (!this.connected || Date.now() - this.lastAnnouncedAt < AVAILABLE_TTL_MS) {
+      return;
+    }
+    try {
+      await this.deps.announceAvailable();
+      this.lastAnnouncedAt = Date.now();
+    } catch (error) {
+      this.deps.logger.warn(`presence available announce failed: ${error?.message ?? error}`);
+    }
+  }
+
   private async drain() {
     if (this.draining || !this.connected) {
       return;
     }
     this.draining = true;
     try {
+      if (this.subscribeQueue.size > 0) {
+        await this.ensureAvailable();
+      }
       while (this.connected && this.subscribeQueue.size > 0) {
         const jid = this.subscribeQueue.values().next().value as string;
         this.subscribeQueue.delete(jid);
