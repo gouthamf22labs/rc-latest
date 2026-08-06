@@ -2061,15 +2061,27 @@ export class WAStartupService {
     return [...jids];
   }
 
-  private presenceResponse(jid: string, number: string, snapshot?: PresenceSnapshot) {
+  /**
+   * @param stale the snapshot is older than PRESENCE_FRESH_MS — it still carries
+   * a usable `lastSeen`, but `online` is reported as unknown rather than as the
+   * last value heard, which may be minutes out of date.
+   */
+  private presenceResponse(
+    jid: string,
+    number: string,
+    snapshot?: PresenceSnapshot,
+    stale = false,
+  ) {
     if (!snapshot) {
       return {
         number,
         jid,
         known: false,
+        stale: false,
         online: null,
         lastKnownPresence: null,
         lastSeen: null,
+        lastSeenIso: null,
         lastSeenHidden: null,
         updatedAt: null,
       };
@@ -2079,8 +2091,9 @@ export class WAStartupService {
       number,
       jid,
       known: true,
-      online: snapshot.online,
-      lastKnownPresence: snapshot.lastKnownPresence,
+      stale,
+      online: stale ? null : snapshot.online,
+      lastKnownPresence: stale ? null : snapshot.lastKnownPresence,
       lastSeen: snapshot.lastSeen,
       lastSeenIso: snapshot.lastSeen ? new Date(snapshot.lastSeen * 1000).toISOString() : null,
       // True when WhatsApp answered `last="deny"`: the contact hides last seen,
@@ -2103,12 +2116,20 @@ export class WAStartupService {
     const waitMs = Math.min(Math.max(data.waitMs ?? 3000, 0), 15000);
 
     const cached = this.presenceWatcher.getSnapshot(...jids);
-    if (cached) {
+    if (cached && this.presenceWatcher.isFresh(cached)) {
       return this.presenceResponse(jids[0], data.number, cached);
     }
 
+    // Stale (or absent): WhatsApp stops pushing once the subscription lapses, so
+    // the last thing we heard must not be served as the contact's state now.
     const fresh = await this.presenceWatcher.requestSnapshot(jids, waitMs);
-    return this.presenceResponse(jids[0], data.number, fresh ?? undefined);
+    if (fresh) {
+      return this.presenceResponse(jids[0], data.number, fresh);
+    }
+
+    // Nothing new arrived. Report what we have, explicitly marked stale, rather
+    // than either inventing a state or discarding a usable lastSeen.
+    return this.presenceResponse(jids[0], data.number, cached ?? undefined, !!cached);
   }
 
   /**

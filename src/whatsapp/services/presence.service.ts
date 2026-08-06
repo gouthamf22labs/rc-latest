@@ -104,6 +104,16 @@ const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const SWEEP_INTERVAL_MS = 30 * 1000;
 /** Cap on cached snapshots per instance — presence data is disposable. */
 const MAX_CACHED_SNAPSHOTS = 2000;
+/**
+ * How long a snapshot is treated as describing the contact *now*.
+ *
+ * Presence changes in seconds, and WhatsApp only pushes while we hold a live
+ * subscription — once the last watch on a contact fires, updates stop and the
+ * last thing we heard ("online") sits in the cache indefinitely. Acting on that
+ * sent messages to contacts who had closed WhatsApp minutes earlier, so anything
+ * older than this is reported as stale rather than as current state.
+ */
+export const PRESENCE_FRESH_MS = 45 * 1000;
 /** Hard cap on live watches per instance; mass-subscribing is a ban signal. */
 export const MAX_WATCHES_PER_INSTANCE = 500;
 
@@ -304,6 +314,7 @@ export class PresenceWatcher {
     }
     this.watches.delete(watchId);
     this.unindex(watch);
+    this.forgetIfUnwatched(watch.jids);
     this.stopTimersIfIdle();
     return true;
   }
@@ -322,6 +333,7 @@ export class PresenceWatcher {
       // Unindex by the watch's own aliases, not just the jids passed in.
       if (watch) {
         this.unindex(watch);
+        this.forgetIfUnwatched(watch.jids);
       }
     }
     this.stopTimersIfIdle();
@@ -383,8 +395,11 @@ export class PresenceWatcher {
         continue;
       }
       // Only a transition arms the trigger for watches that asked for one;
-      // presence flaps (typing → available → typing) must not re-fire.
-      const transitioned = !previous?.online;
+      // presence flaps (typing → available → typing) must not re-fire. "We had
+      // no state" is not a transition either — since the cache is dropped once a
+      // contact is unwatched, treating unknown→online as one would fire watches
+      // that explicitly asked to wait for the contact to go offline first.
+      const transitioned = previous ? !previous.online : false;
       const due = [...(this.watchesByJid.get(jid) ?? [])]
         .map((id) => this.watches.get(id))
         .filter((w): w is PresenceWatch => !!w && (transitioned || w.fireIfAlreadyOnline));
@@ -423,11 +438,32 @@ export class PresenceWatcher {
     }
   }
 
+  /**
+   * Drops cached presence for contacts nobody is watching any more.
+   *
+   * WhatsApp only pushes while a subscription is live, and there is no
+   * unsubscribe — once the last watch on a contact goes, updates simply stop and
+   * whatever was last heard would sit in the cache forever. Keeping "online"
+   * around is worse than keeping nothing: the next watch would act on it. A
+   * contact still watched by another message is left alone, since the refresh
+   * loop keeps that entry honest.
+   */
+  private forgetIfUnwatched(jids: string[]) {
+    for (const jid of jids) {
+      if (!this.watchesByJid.has(jid)) {
+        this.snapshots.delete(jid);
+      }
+    }
+  }
+
   /** Watches are one-shot: removed before the callback so a throw can't re-fire them. */
   private fire(watches: PresenceWatch[], snapshot: PresenceSnapshot) {
     for (const watch of watches) {
       this.watches.delete(watch.watchId);
       this.unindex(watch);
+    }
+    for (const watch of watches) {
+      this.forgetIfUnwatched(watch.jids);
     }
     this.stopTimersIfIdle();
 
@@ -441,11 +477,12 @@ export class PresenceWatcher {
   }
 
   /**
-   * A cached "online" older than the refresh cadence is not evidence the contact
-   * is online now — it just means nothing has arrived since.
+   * A cached "online" past PRESENCE_FRESH_MS is not evidence the contact is
+   * online now — it only means nothing has arrived since, which is the normal
+   * state once the subscription lapses.
    */
-  private isFresh(snapshot: PresenceSnapshot) {
-    return Date.now() - snapshot.updatedAt < REFRESH_INTERVAL_MS;
+  public isFresh(snapshot: PresenceSnapshot) {
+    return Date.now() - snapshot.updatedAt < PRESENCE_FRESH_MS;
   }
 
   // ─── subscribe throttling ───────────────────────────────────────────────────
@@ -548,6 +585,10 @@ export class PresenceWatcher {
     for (const watch of expired) {
       this.watches.delete(watch.watchId);
       this.unindex(watch);
+    }
+    // Same reasoning as fire(): an expired watch also leaves the entry unrefreshed.
+    for (const watch of expired) {
+      this.forgetIfUnwatched(watch.jids);
     }
     this.stopTimersIfIdle();
 
