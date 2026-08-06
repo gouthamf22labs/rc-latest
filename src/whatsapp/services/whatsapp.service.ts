@@ -2252,8 +2252,9 @@ export class WAStartupService {
       // channels have no presence at all — there is nothing to trigger on.
       throw new BadRequestException('Presence watches are only supported for individual contacts');
     }
-    // 24h default, 7d ceiling — a watch is a live subscription, not storage.
-    const ttlSeconds = Math.min(Math.max(data.ttlSeconds ?? 86400, 60), 7 * 86400);
+    // 24h default and ceiling — a watch is a live subscription, not storage, and
+    // the backend's send-when-online backstop is 24h, so nothing needs longer.
+    const ttlSeconds = Math.min(Math.max(data.ttlSeconds ?? 86400, 60), 86400);
 
     // Issue the trusted-contact token now rather than waiting for the throttled
     // subscribe queue, so the answer below reflects this watch's real chances.
