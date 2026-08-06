@@ -141,8 +141,12 @@ export class PresenceWatcher {
     // The previous socket's announce died with it.
     this.lastAnnouncedAt = 0;
     // Subscriptions die with the old socket — re-assert every watch, throttled.
+    // Every alias, not just the primary: presence commonly arrives under the
+    // LID, so re-subscribing the phone-number jid alone silently loses it.
     for (const watch of this.watches.values()) {
-      this.subscribeQueue.add(watch.jid);
+      for (const jid of watch.jids) {
+        this.subscribeQueue.add(jid);
+      }
     }
     void this.drain();
     this.ensureTimers();
@@ -569,8 +573,13 @@ export class PresenceWatcher {
     if (!this.connected) {
       return;
     }
+    // All aliases — see onConnectionOpen. Re-asserting only the primary jid lets
+    // a LID-delivered contact's subscription lapse for good after the first
+    // registration, which looks exactly like the contact never coming online.
     for (const watch of this.watches.values()) {
-      this.subscribeQueue.add(watch.jid);
+      for (const jid of watch.jids) {
+        this.subscribeQueue.add(jid);
+      }
     }
     void this.drain();
   }
