@@ -614,6 +614,44 @@ export const updatePresenceSchema: JSONSchema7 = {
   required: ['presence'],
 };
 
+export const fetchPresenceSchema: JSONSchema7 = {
+  $id: ulid(),
+  type: 'object',
+  properties: {
+    number: { ...numberDefinition },
+    // How long to wait for WhatsApp's first push on a cache miss. Silence is a
+    // normal answer (contact hides presence), so this bounds the request.
+    waitMs: { type: 'integer', minimum: 0, maximum: 15000 },
+  },
+  required: ['number'],
+  ...isNotEmpty('number'),
+};
+
+export const watchPresenceSchema: JSONSchema7 = {
+  $id: ulid(),
+  type: 'object',
+  properties: {
+    number: { ...numberDefinition },
+    // Caller-owned id (e.g. the scheduled message id) — re-registering the same
+    // id refreshes the watch instead of creating a second trigger.
+    watchId: { type: 'string', minLength: 1, maxLength: 128 },
+    ttlSeconds: { type: 'integer', minimum: 60, maximum: 604800 },
+    fireIfAlreadyOnline: { type: 'boolean', enum: [true, false] },
+  },
+  required: ['number', 'watchId'],
+  ...isNotEmpty('number', 'watchId'),
+};
+
+export const unwatchPresenceSchema: JSONSchema7 = {
+  $id: ulid(),
+  type: 'object',
+  properties: {
+    watchId: { type: 'string', minLength: 1, maxLength: 128 },
+    number: { ...numberDefinition },
+  },
+  anyOf: [{ required: ['watchId'] }, { required: ['number'] }],
+};
+
 export const archiveChatSchema: JSONSchema7 = {
   $id: ulid(),
   type: 'object',
@@ -831,6 +869,8 @@ export const webhookSchema: JSONSchema7 = {
         chatsUpdated: { type: 'boolean', enum: [true, false] },
         chatsDeleted: { type: 'boolean', enum: [true, false] },
         presenceUpdated: { type: 'boolean', enum: [true, false] },
+        presenceOnline: { type: 'boolean', enum: [true, false] },
+        presenceWatchExpired: { type: 'boolean', enum: [true, false] },
         groupsUpsert: { type: 'boolean', enum: [true, false] },
         groupsUpdated: { type: 'boolean', enum: [true, false] },
         groupsParticipantsUpdated: { type: 'boolean', enum: [true, false] },

@@ -60,6 +60,23 @@ export class UpdatePresenceDto extends NumberDto {
   presence: WAPresence;
 }
 
+export class FetchPresenceDto extends NumberDto {
+  /** Bound on how long to wait for WhatsApp's first push on a cache miss. */
+  waitMs?: number;
+}
+
+export class WatchPresenceDto extends NumberDto {
+  /** Caller-owned id; re-registering the same id refreshes the watch. */
+  watchId: string;
+  ttlSeconds?: number;
+  fireIfAlreadyOnline?: boolean;
+}
+
+export class UnwatchPresenceDto {
+  watchId?: string;
+  number?: string;
+}
+
 class Key {
   id: string;
   fromMe: boolean;

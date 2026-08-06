@@ -52,6 +52,10 @@ export class WebhookEvents {
   chatsUpdated?: boolean;
   chatsDeleted?: boolean;
   presenceUpdated?: boolean;
+  /** One-shot: a watched contact came online. See chat/watchPresence. */
+  presenceOnline?: boolean;
+  /** A presence watch reached its TTL without the contact ever coming online. */
+  presenceWatchExpired?: boolean;
   groupsUpsert?: boolean;
   groupsUpdated?: boolean;
   groupsParticipantsUpdated?: boolean;
@@ -77,6 +81,8 @@ export type EventsType =
   | 'contacts.upsert'
   | 'contacts.update'
   | 'presence.update'
+  | 'presence.online'
+  | 'presence.watch.expired'
   | 'chats.set'
   | 'chats.update'
   | 'chats.upsert'
@@ -107,6 +113,8 @@ export const WebhookEventsEnum: Record<WebhookEventsType, EventsType> = {
   chatsUpdated: 'chats.update',
   chatsDeleted: 'chats.delete',
   presenceUpdated: 'presence.update',
+  presenceOnline: 'presence.online',
+  presenceWatchExpired: 'presence.watch.expired',
   groupsUpsert: 'groups.upsert',
   groupsUpdated: 'groups.update',
   groupsParticipantsUpdated: 'group-participants.update',

@@ -46,6 +46,9 @@ import {
   readMessageSchema,
   rejectCallSchema,
   updatePresenceSchema,
+  fetchPresenceSchema,
+  watchPresenceSchema,
+  unwatchPresenceSchema,
   whatsappNumberSchema,
 } from '../../validate/validate.schema';
 import {
@@ -57,6 +60,9 @@ import {
   ReadMessageIdDto,
   RejectCallDto,
   UpdatePresenceDto,
+  FetchPresenceDto,
+  WatchPresenceDto,
+  UnwatchPresenceDto,
   WhatsAppNumberDto,
 } from '../dto/chat.dto';
 import { InstanceDto } from '../dto/instance.dto';
@@ -107,6 +113,44 @@ export function ChatRouter(chatController: ChatController, ...guards: RequestHan
         request: req,
         schema: updatePresenceSchema,
         execute: (instance, data) => chatController.updatePresence(instance, data),
+      });
+
+      res.status(HttpStatus.OK).json(response);
+    })
+    // Presence read. POST rather than GET: a cache miss subscribes on the live
+    // socket and waits for WhatsApp's first push, so this is not a pure read.
+    .post(routerPath('fetchPresence'), ...guards, async (req, res) => {
+      const response = await dataValidate<FetchPresenceDto>({
+        request: req,
+        schema: fetchPresenceSchema,
+        execute: (instance, data) => chatController.fetchPresence(instance, data),
+      });
+
+      res.status(HttpStatus.OK).json(response);
+    })
+    .post(routerPath('watchPresence'), ...guards, async (req, res) => {
+      const response = await dataValidate<WatchPresenceDto>({
+        request: req,
+        schema: watchPresenceSchema,
+        execute: (instance, data) => chatController.watchPresence(instance, data),
+      });
+
+      res.status(HttpStatus.OK).json(response);
+    })
+    .post(routerPath('unwatchPresence'), ...guards, async (req, res) => {
+      const response = await dataValidate<UnwatchPresenceDto>({
+        request: req,
+        schema: unwatchPresenceSchema,
+        execute: (instance, data) => chatController.unwatchPresence(instance, data),
+      });
+
+      res.status(HttpStatus.OK).json(response);
+    })
+    .get(routerPath('findPresenceWatches'), ...guards, async (req, res) => {
+      const response = await dataValidate<InstanceDto>({
+        request: req,
+        schema: null,
+        execute: (instance) => chatController.findPresenceWatches(instance),
       });
 
       res.status(HttpStatus.OK).json(response);

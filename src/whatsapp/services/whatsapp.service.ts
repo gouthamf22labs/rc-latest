@@ -170,6 +170,7 @@ import { getObjectUrl } from '../../integrations/minio/minio.utils';
 import { encodeProps } from '../../utils/encode.props';
 import { backoffDelay } from '../../utils/reconnect-backoff';
 import { connectLimiter } from '../../utils/connect-limiter';
+import { PresenceWatcher, PresenceSnapshot } from './presence.service';
 
 // After creds are lost, a paired instance can only recover by a human scanning a
 // fresh QR. Building a socket per backend connect-poll just churns WASM signal
@@ -325,6 +326,55 @@ export class WAStartupService {
   private readonly stateConnection: InstanceStateConnection = { state: 'close' };
   private readonly databaseOptions: Database =
     this.configService.get<Database>('DATABASE');
+
+  /**
+   * Presence cache + online-trigger watches. Owns its own subscribe throttling
+   * and re-subscribes on every `open` (subscriptions are socket-scoped).
+   */
+  private readonly presenceWatcher = new PresenceWatcher({
+    subscribe: (jid) => {
+      if (!this.client) {
+        return Promise.reject(new Error('socket not connected'));
+      }
+      return this.client.presenceSubscribe(jid);
+    },
+    onOnline: (watches, snapshot) => {
+      for (const watch of watches) {
+        const payload = {
+          watchId: watch.watchId,
+          number: watch.number,
+          jid: watch.jid,
+          onlineAt: Math.floor(snapshot.updatedAt / 1000),
+          lastKnownPresence: snapshot.lastKnownPresence,
+          lastSeen: snapshot.lastSeen,
+        };
+        this.logger.info(`presence watch fired for ${watch.jid} (${watch.watchId})`);
+        this.ws.send(this.instance.name, 'presence.online', payload);
+        this.sendDataWebhook('presenceOnline', payload);
+      }
+    },
+    onExpire: (watches) => {
+      for (const watch of watches) {
+        const snapshot = this.presenceWatcher.getSnapshot(watch.jid);
+        const payload = {
+          watchId: watch.watchId,
+          number: watch.number,
+          jid: watch.jid,
+          expiredAt: Math.floor(Date.now() / 1000),
+          lastKnownPresence: snapshot?.lastKnownPresence ?? null,
+          lastSeen: snapshot?.lastSeen ?? null,
+        };
+        this.logger.info(`presence watch expired for ${watch.jid} (${watch.watchId})`);
+        this.ws.send(this.instance.name, 'presence.watch.expired', payload);
+        this.sendDataWebhook('presenceWatchExpired', payload);
+      }
+    },
+    logger: {
+      info: (msg) => this.logger.info(msg),
+      warn: (msg) => this.logger.warn(msg),
+      error: (msg) => this.logger.error(msg),
+    },
+  });
 
   private endSession = false;
   public client: WASocket;
@@ -764,6 +814,10 @@ export class WAStartupService {
     }
 
     if (connection === 'close') {
+      // Presence subscriptions live on the socket that just died. Watches are
+      // kept (they are re-asserted on the next 'open'), the pending subscribe
+      // queue is not.
+      this.presenceWatcher.onConnectionClosed();
       // Canonical Baileys pattern: reconnect on everything except loggedOut (401).
       const isLoggedOut = closeStatusCode === DisconnectReason.loggedOut;
 
@@ -882,6 +936,10 @@ export class WAStartupService {
           }
         })
         .catch(() => {});
+
+      // Re-assert presence subscriptions for every live watch — they did not
+      // survive the previous socket. Throttled inside the watcher.
+      this.presenceWatcher.onConnectionOpen();
 
       this.instanceQr.base64 = undefined;
       this.instanceQr.code = undefined;
@@ -1771,6 +1829,9 @@ export class WAStartupService {
 
         if (events?.['presence.update']) {
           const payload = events['presence.update'];
+          // Feed the cache/watches first: an online-trigger send must not wait on
+          // a webhook POST that may be slow or disabled.
+          this.presenceWatcher.handleUpdate(payload as any);
           this.ws.send(this.instance.name, 'presence.update', payload);
           this.sendDataWebhook('presenceUpdated', payload);
         }
@@ -1940,6 +2001,147 @@ export class WAStartupService {
     await this.client.sendPresenceUpdate(data.presence, recipient);
 
     return { message: 'success' };
+  }
+
+  /** Frees the presence watcher's timers. Called on instance teardown. */
+  public disposePresence() {
+    this.presenceWatcher.dispose();
+  }
+
+  private assertConnected() {
+    if (!this.client || this.stateConnection.state !== 'open') {
+      throw new BadRequestException(
+        'Instance is not connected - presence requires a live socket',
+      );
+    }
+  }
+
+  /**
+   * Resolves a number to the jid presence updates will actually arrive under.
+   * Groups pass through; users go through the existence check so a `@c.us`/raw
+   * number lands on the same jid the send path uses.
+   */
+  private async presenceJid(number: string): Promise<string> {
+    const jid = this.createJid(number);
+    if (isJidGroup(jid)) {
+      return jid;
+    }
+    return await this.resolveRecipient(jid);
+  }
+
+  private presenceResponse(jid: string, number: string, snapshot?: PresenceSnapshot) {
+    if (!snapshot) {
+      return {
+        number,
+        jid,
+        known: false,
+        online: null,
+        lastKnownPresence: null,
+        lastSeen: null,
+        lastSeenHidden: null,
+        updatedAt: null,
+      };
+    }
+
+    return {
+      number,
+      jid,
+      known: true,
+      online: snapshot.online,
+      lastKnownPresence: snapshot.lastKnownPresence,
+      lastSeen: snapshot.lastSeen,
+      lastSeenIso: snapshot.lastSeen ? new Date(snapshot.lastSeen * 1000).toISOString() : null,
+      // True when WhatsApp answered `last="deny"`: the contact hides last seen,
+      // or our own privacy setting revokes the right to see it (it is reciprocal).
+      lastSeenHidden: snapshot.lastSeenHidden,
+      groupOnlineCount: snapshot.groupOnlineCount ?? undefined,
+      updatedAt: new Date(snapshot.updatedAt).toISOString(),
+    };
+  }
+
+  /**
+   * Last-seen / online lookup. WhatsApp has no request-response form for this,
+   * so a cache miss becomes "subscribe and wait for the first push"; silence
+   * within `waitMs` yields `known: false` rather than an error, because a
+   * contact who hides both last-seen and online status never answers.
+   */
+  public async fetchPresence(data: { number: string; waitMs?: number }) {
+    this.assertConnected();
+    const jid = await this.presenceJid(data.number);
+    const waitMs = Math.min(Math.max(data.waitMs ?? 3000, 0), 15000);
+
+    const cached = this.presenceWatcher.getSnapshot(jid);
+    if (cached) {
+      return this.presenceResponse(jid, data.number, cached);
+    }
+
+    const fresh = await this.presenceWatcher.requestSnapshot(jid, waitMs);
+    return this.presenceResponse(jid, data.number, fresh ?? undefined);
+  }
+
+  /**
+   * Registers a one-shot watch that emits `presence.online` the moment the
+   * contact is next seen online. Idempotent on `watchId`, so the owner of the
+   * pending action can re-register on a cadence and survive a restart on either
+   * side without duplicating the trigger.
+   */
+  public async watchPresence(data: {
+    number: string;
+    watchId: string;
+    ttlSeconds?: number;
+    fireIfAlreadyOnline?: boolean;
+  }) {
+    this.assertConnected();
+    const jid = await this.presenceJid(data.number);
+    if (isJidGroup(jid) || isJidNewsletter(jid)) {
+      // Groups report an online *count*, never a per-member transition, and
+      // channels have no presence at all — there is nothing to trigger on.
+      throw new BadRequestException('Presence watches are only supported for individual contacts');
+    }
+    // 24h default, 7d ceiling — a watch is a live subscription, not storage.
+    const ttlSeconds = Math.min(Math.max(data.ttlSeconds ?? 86400, 60), 7 * 86400);
+
+    const { watch, firedImmediately } = this.presenceWatcher.watch({
+      watchId: data.watchId,
+      jid,
+      number: data.number,
+      ttlSeconds,
+      fireIfAlreadyOnline: data.fireIfAlreadyOnline,
+    });
+
+    return {
+      watchId: watch.watchId,
+      number: watch.number,
+      jid: watch.jid,
+      expiresAt: new Date(watch.expiresAt).toISOString(),
+      // The watch already fired (contact was online): the webhook has been sent
+      // and no watch remains registered.
+      firedImmediately,
+      presence: this.presenceResponse(jid, data.number, this.presenceWatcher.getSnapshot(jid)),
+    };
+  }
+
+  public async unwatchPresence(data: { watchId?: string; number?: string }) {
+    if (data.watchId) {
+      return { removed: this.presenceWatcher.unwatch(data.watchId) ? [data.watchId] : [] };
+    }
+    if (!data.number) {
+      throw new BadRequestException('Provide watchId or number');
+    }
+    const jid = await this.presenceJid(data.number);
+    return { removed: this.presenceWatcher.unwatchJid(jid) };
+  }
+
+  public findPresenceWatches() {
+    return this.presenceWatcher.listWatches().map((watch) => ({
+      watchId: watch.watchId,
+      number: watch.number,
+      jid: watch.jid,
+      createdAt: new Date(watch.createdAt).toISOString(),
+      expiresAt: new Date(watch.expiresAt).toISOString(),
+      fireIfAlreadyOnline: watch.fireIfAlreadyOnline,
+      presence: this.presenceResponse(watch.jid, watch.number, this.presenceWatcher.getSnapshot(watch.jid)),
+    }));
   }
 
   private async sendMessageWithTyping<T = proto.IMessage>(

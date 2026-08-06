@@ -565,6 +565,8 @@ export class WAMonitoringService {
           // Cancel any pending reconnect so the removed instance can't resurrect
           // itself by firing connectToWhatsapp after it's gone from the map.
           doomed?.stopReconnect?.();
+          // Releases the presence refresh/sweep intervals for this instance.
+          doomed?.disposePresence?.();
           doomed?.client?.ev.removeAllListeners('connection.update');
           doomed?.client?.ev.flush();
           this.waInstances.delete(name);

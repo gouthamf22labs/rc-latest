@@ -44,6 +44,9 @@ import {
   ReadMessageIdDto,
   RejectCallDto,
   EditMessage,
+  FetchPresenceDto,
+  WatchPresenceDto,
+  UnwatchPresenceDto,
 } from '../dto/chat.dto';
 import { InstanceDto } from '../dto/instance.dto';
 import { WAMonitoringService } from '../services/monitor.service';
@@ -95,6 +98,22 @@ export class ChatController {
 
   public async updatePresence({ instanceName }: InstanceDto, data: UpdatePresenceDto) {
     return await this.waMonitor.waInstances.get(instanceName).updatePresence(data);
+  }
+
+  public async fetchPresence({ instanceName }: InstanceDto, data: FetchPresenceDto) {
+    return await this.waMonitor.waInstances.get(instanceName).fetchPresence(data);
+  }
+
+  public async watchPresence({ instanceName }: InstanceDto, data: WatchPresenceDto) {
+    return await this.waMonitor.waInstances.get(instanceName).watchPresence(data);
+  }
+
+  public async unwatchPresence({ instanceName }: InstanceDto, data: UnwatchPresenceDto) {
+    return await this.waMonitor.waInstances.get(instanceName).unwatchPresence(data);
+  }
+
+  public async findPresenceWatches({ instanceName }: InstanceDto) {
+    return this.waMonitor.waInstances.get(instanceName).findPresenceWatches();
   }
 
   public async getBinaryMedia(mediaType: string, query: string) {
