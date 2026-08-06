@@ -2261,6 +2261,20 @@ export class WAStartupService {
     await this.ensureTrustToken(jid);
     const trusted = await this.hasTrustToken(jid);
 
+    // Ask WhatsApp about the contact before answering, so the caller learns up
+    // front whether this trigger can realistically fire.
+    //
+    // Presence is mutual-trust gated: a contact who has never messaged us (and
+    // whose "last seen" is limited to their own contacts) is answered with
+    // `last="deny"`, and their `available` broadcast never reaches us either.
+    // Only a chat-state they aim at us — them typing in our chat — gets through.
+    // Nothing client-side changes that, so the honest move is to say so rather
+    // than let the message sit until its backstop.
+    const known =
+      this.presenceWatcher.getSnapshot(...jids) ??
+      (await this.presenceWatcher.requestSnapshot(jids, 4000));
+    const presenceReadable = known ? !known.lastSeenHidden : null;
+
     const { watch, firedImmediately } = this.presenceWatcher.watch({
       watchId: data.watchId,
       jid,
@@ -2286,6 +2300,17 @@ export class WAStartupService {
        * than leaving it a silent surprise.
        */
       trustedContact: trusted,
+      /**
+       * Whether WhatsApp is willing to tell us about this contact's presence.
+       *
+       * - `true`  — presence is readable; the trigger should fire on app-open.
+       * - `false` — WhatsApp denies it (no mutual history, or their "last seen"
+       *             is limited to their own contacts and we are not one). The
+       *             watch stays armed and still fires if they type to us, but
+       *             expect the backstop instead.
+       * - `null`  — nothing arrived in time; unknown rather than assumed.
+       */
+      presenceReadable,
       presence: this.presenceResponse(jid, data.number, this.presenceWatcher.getSnapshot(...jids)),
     };
   }
