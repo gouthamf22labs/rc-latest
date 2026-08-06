@@ -2188,6 +2188,28 @@ export class WAStartupService {
     return { removed: this.presenceWatcher.unwatchJid(...jids) };
   }
 
+  /**
+   * The instance's own privacy settings, straight from WhatsApp (`force` skips
+   * the local cache).
+   *
+   * Diagnostic for presence: last-seen visibility is **reciprocal** — an account
+   * whose own `last`/`online` is restricted loses the right to read anyone
+   * else's, and every lookup comes back `lastSeenHidden: true` no matter what
+   * the contact allows. Changing it in the app does not always reach a live
+   * socket, so this reads the server's current view rather than assuming.
+   */
+  public async fetchPrivacySettings(force = true) {
+    this.assertConnected();
+    const settings = await this.client.fetchPrivacySettings(force);
+    return {
+      settings,
+      // 'all' | 'contacts' | 'contact_blacklist' | 'none'. Anything but 'all'
+      // narrows whose last seen this instance can read; 'none' blocks it entirely.
+      canReadOthersLastSeen: settings?.last_seen !== 'none',
+      canBeSeenOnline: settings?.online !== 'match_last_seen' || settings?.last_seen !== 'none',
+    };
+  }
+
   public findPresenceWatches() {
     return this.presenceWatcher.listWatches().map((watch) => ({
       watchId: watch.watchId,
@@ -2197,11 +2219,17 @@ export class WAStartupService {
       expiresAt: new Date(watch.expiresAt).toISOString(),
       jids: watch.jids,
       fireIfAlreadyOnline: watch.fireIfAlreadyOnline,
-      presence: this.presenceResponse(
-        watch.jid,
-        watch.number,
-        this.presenceWatcher.getSnapshot(...watch.jids),
-      ),
+      presence: (() => {
+        // Same staleness rule the lookup applies, so the two never disagree
+        // about whether a contact is currently online.
+        const snapshot = this.presenceWatcher.getSnapshot(...watch.jids);
+        return this.presenceResponse(
+          watch.jid,
+          watch.number,
+          snapshot,
+          !!snapshot && !this.presenceWatcher.isFresh(snapshot),
+        );
+      })(),
     }));
   }
 

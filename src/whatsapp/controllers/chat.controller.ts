@@ -112,6 +112,10 @@ export class ChatController {
     return await this.waMonitor.waInstances.get(instanceName).unwatchPresence(data);
   }
 
+  public async fetchPrivacySettings({ instanceName }: InstanceDto) {
+    return await this.waMonitor.waInstances.get(instanceName).fetchPrivacySettings();
+  }
+
   public async findPresenceWatches({ instanceName }: InstanceDto) {
     return this.waMonitor.waInstances.get(instanceName).findPresenceWatches();
   }

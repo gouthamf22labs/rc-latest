@@ -146,6 +146,17 @@ export function ChatRouter(chatController: ChatController, ...guards: RequestHan
 
       res.status(HttpStatus.OK).json(response);
     })
+    // Reciprocity check: an instance whose own last-seen privacy is restricted
+    // cannot read anyone else's, which surfaces as lastSeenHidden everywhere.
+    .get(routerPath('fetchPrivacySettings'), ...guards, async (req, res) => {
+      const response = await dataValidate<InstanceDto>({
+        request: req,
+        schema: null,
+        execute: (instance) => chatController.fetchPrivacySettings(instance),
+      });
+
+      res.status(HttpStatus.OK).json(response);
+    })
     .get(routerPath('findPresenceWatches'), ...guards, async (req, res) => {
       const response = await dataValidate<InstanceDto>({
         request: req,
