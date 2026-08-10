@@ -2292,17 +2292,24 @@ export class WAStartupService {
       this.presenceWatcher.getSnapshot(...jids) ??
       (await this.presenceWatcher.requestSnapshot(jids, 4000));
     // A reply of any kind — including a plain "unavailable" — proves WhatsApp is
-    // willing to talk to us about this contact, which is exactly what the
-    // trigger needs. Silence is the only real evidence against it.
+    // willing to talk to us about this contact. Absent one, fall back to the
+    // trusted-contact token rather than to "no".
+    //
+    // Silence is not evidence: WhatsApp sends nothing at all for a contact who
+    // is simply offline with last-seen withheld, which is most contacts most of
+    // the time. Worse, the snapshot cache is dropped once a contact's last watch
+    // fires, so a watch registered moments after a delivery found nothing and
+    // reported "not readable" about a contact that had *just* fired. In
+    // production one contact produced [false,false,false,true,true,false,true,
+    // false] across eight registrations while its token never changed.
+    //
+    // The token is the stable, structural answer: WhatsApp mints it from mutual
+    // history, and it is what allows a presence subscribe to be honoured at all.
     //
     // This deliberately does NOT key off lastSeenHidden. Last-seen and online
     // are separate privacy settings, and hiding the former while broadcasting
-    // the latter is a common, ordinary configuration: those contacts answer,
-    // and their triggers fire within seconds. Reading a withheld timestamp as
-    // "presence unreadable" marked every contact unreachable, including ones
-    // that had already fired — a warning shown on everything is one nobody
-    // reads.
-    const presenceReadable = known ? true : false;
+    // the latter is an ordinary configuration whose triggers fire in seconds.
+    const presenceReadable = known ? true : trusted;
 
     const { watch, firedImmediately } = this.presenceWatcher.watch({
       watchId: data.watchId,
@@ -2330,16 +2337,19 @@ export class WAStartupService {
        */
       trustedContact: trusted,
       /**
-       * Whether WhatsApp is willing to tell us about this contact's presence.
+       * Whether WhatsApp is likely to tell us about this contact's presence.
        *
-       * - `true`  — it answered. The trigger should fire when they next appear.
-       *             Note this includes contacts who withhold their last-seen
-       *             timestamp: that is a separate privacy setting and does not
-       *             stop online status from reaching us.
-       * - `false` — nothing came back within the wait. Usually a contact with no
-       *             mutual history, whom WhatsApp declines to report on. The
-       *             watch stays armed and still fires if they type to us or in a
-       *             group we share, but expect the backstop instead.
+       * - `true`  — either it answered just now, or we hold a trusted-contact
+       *             token for them (mutual history). Includes contacts who
+       *             withhold last-seen: that is a separate privacy setting and
+       *             does not stop online status reaching us.
+       * - `false` — no answer *and* no token, so WhatsApp is unlikely to report
+       *             on them at all. The watch stays armed and still fires if
+       *             they type to us or in a group we share, but expect the
+       *             backstop instead.
+       *
+       * Stable per contact by design — it is a property of the relationship,
+       * not of whether a snapshot happened to be cached at this instant.
        */
       presenceReadable,
       presence: this.presenceResponse(jid, data.number, this.presenceWatcher.getSnapshot(...jids)),
