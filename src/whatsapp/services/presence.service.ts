@@ -66,6 +66,16 @@ export type PresenceWatch = {
    * transition.
    */
   fireIfAlreadyOnline: boolean;
+  /**
+   * Only fire on a typing signal (`composing` / `recording`), never on a plain
+   * `available`.
+   *
+   * "Send when this member types" has to mean typing. Presence for a person
+   * reaches us from anywhere — them opening WhatsApp in a private chat included
+   * — and a watch armed by a group member firing on that would post to the
+   * group when nobody had said anything, which is not what was asked for.
+   */
+  requireTyping: boolean;
 };
 
 export type PresenceWatchInput = {
@@ -76,6 +86,8 @@ export type PresenceWatchInput = {
   number: string;
   ttlSeconds: number;
   fireIfAlreadyOnline?: boolean;
+  /** See PresenceWatch.requireTyping. */
+  requireTyping?: boolean;
 };
 
 type WatcherLogger = {
@@ -117,6 +129,15 @@ export type PresenceWatcherDeps = {
  * drains steadily instead of saturating the socket.
  */
 const MAX_LID_REPAIRS_PER_CYCLE = 25;
+
+/**
+ * WhatsApp reports typing as `composing`, and a voice note being recorded as
+ * `recording`; Baileys maps `paused` to `available`, so a person who stopped
+ * typing is not still typing.
+ */
+function isTypingPresence(presence?: WAPresence | null): boolean {
+  return presence === 'composing' || presence === 'recording';
+}
 
 /** Gap between subscribe nodes so a reconnect doesn't burst the socket. */
 const SUBSCRIBE_GAP_MS = 150;
@@ -310,6 +331,7 @@ export class PresenceWatcher {
       createdAt: existing?.createdAt ?? Date.now(),
       expiresAt: Date.now() + input.ttlSeconds * 1000,
       fireIfAlreadyOnline: input.fireIfAlreadyOnline ?? true,
+      requireTyping: input.requireTyping ?? false,
     };
 
     // A re-registration may move the jids; clear the old index entries first.
@@ -327,7 +349,12 @@ export class PresenceWatcher {
     this.ensureTimers();
 
     const known = this.getSnapshot(...watch.jids);
-    if (watch.fireIfAlreadyOnline && known?.online && this.isFresh(known)) {
+    if (
+      watch.fireIfAlreadyOnline &&
+      known?.online &&
+      this.isFresh(known) &&
+      (!watch.requireTyping || isTypingPresence(known.lastKnownPresence))
+    ) {
       this.fire([watch], known);
       return { watch, firedImmediately: true };
     }
@@ -440,7 +467,13 @@ export class PresenceWatcher {
       const transitioned = previous ? !previous.online : false;
       const due = [...(this.watchesByJid.get(jid) ?? [])]
         .map((id) => this.watches.get(id))
-        .filter((w): w is PresenceWatch => !!w && (transitioned || w.fireIfAlreadyOnline));
+        .filter((w): w is PresenceWatch => {
+          if (!w) return false;
+          // A typing-only watch ignores a bare "available": the contact opening
+          // WhatsApp is not them saying something.
+          if (w.requireTyping && !isTypingPresence(lastKnownPresence)) return false;
+          return transitioned || w.fireIfAlreadyOnline;
+        });
 
       if (due.length > 0) {
         this.fire(due, snapshot);

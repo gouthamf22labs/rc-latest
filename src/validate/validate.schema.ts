@@ -636,6 +636,7 @@ export const watchPresenceSchema: JSONSchema7 = {
     // id refreshes the watch instead of creating a second trigger.
     watchId: { type: 'string', minLength: 1, maxLength: 128 },
     ttlSeconds: { type: 'integer', minimum: 60, maximum: 604800 },
+    requireTyping: { type: 'boolean' },
     fireIfAlreadyOnline: { type: 'boolean', enum: [true, false] },
   },
   required: ['number', 'watchId'],

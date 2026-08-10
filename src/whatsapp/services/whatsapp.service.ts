@@ -2261,6 +2261,8 @@ export class WAStartupService {
     watchId: string;
     ttlSeconds?: number;
     fireIfAlreadyOnline?: boolean;
+    /** Fire only on a typing signal — see PresenceWatch.requireTyping. */
+    requireTyping?: boolean;
   }) {
     this.assertConnected();
     const jids = await this.presenceJids(data.number);
@@ -2318,6 +2320,7 @@ export class WAStartupService {
       number: data.number,
       ttlSeconds,
       fireIfAlreadyOnline: data.fireIfAlreadyOnline,
+      requireTyping: data.requireTyping,
     });
 
     return {
@@ -2410,6 +2413,7 @@ export class WAStartupService {
       expiresAt: new Date(watch.expiresAt).toISOString(),
       jids: watch.jids,
       fireIfAlreadyOnline: watch.fireIfAlreadyOnline,
+      requireTyping: watch.requireTyping,
       ...(withTrust ? { trustedContact: trust.get(watch.watchId) === true } : {}),
       presence: (() => {
         // Same staleness rule the lookup applies, so the two never disagree
