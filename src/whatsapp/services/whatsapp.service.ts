@@ -4215,10 +4215,38 @@ export class WAStartupService {
   public async findParticipants(id: GroupJid) {
     try {
       const participants = (await this.client.groupMetadata(id.groupJid)).participants;
-      return { participants };
+      // Enriched with the same sources fetchAllGroups uses. Raw group metadata
+      // carries no display names, so returning it unchanged would show bare
+      // numbers — and, worse, a caller that stores this would overwrite names
+      // the full sync had already resolved.
+      return { participants: await this.withParticipantNames(participants) };
     } catch (error) {
       throw new BadRequestException('No participants', error.toString());
     }
+  }
+
+  /**
+   * Attaches a display name to each participant.
+   *
+   * Group metadata identifies members by jid alone. Names come from the synced
+   * contact store, falling back to whatever Baileys holds in memory (`name`,
+   * then the `notify` push-name). Null when no source knows them — the caller
+   * shows the number instead.
+   */
+  private async withParticipantNames<T extends { id: string }>(participants: T[]) {
+    const contacts = await this.repository.contact.findMany({
+      where: { instanceId: this.instance.id },
+      select: { remoteJid: true, pushName: true },
+    });
+    const nameMap = new Map(contacts.map((c) => [c.remoteJid, c.pushName]));
+    return participants.map((p) => {
+      const jid = (p as any).phoneNumber ?? p.id;
+      const inMemory = (this.client as any).contacts?.[jid];
+      return {
+        ...p,
+        name: nameMap.get(jid) ?? inMemory?.name ?? inMemory?.notify ?? null,
+      };
+    });
   }
 
   public async updateGParticipant(update: GroupUpdateParticipantDto) {
