@@ -365,8 +365,16 @@ export class WAStartupService {
           onlineAt: Math.floor(snapshot.updatedAt / 1000),
           lastKnownPresence: snapshot.lastKnownPresence,
           lastSeen: snapshot.lastSeen,
+          // Which channel carried the signal. A fire off group chat-state is a
+          // materially different event from a direct one — it means the contact
+          // typed somewhere shared rather than simply opening WhatsApp — and
+          // without this the distinction is unrecoverable after the fact.
+          source: snapshot.source,
+          viaJid: snapshot.viaJid ?? null,
         };
-        this.logger.info(`presence watch fired for ${watch.jid} (${watch.watchId})`);
+        this.logger.info(
+          `presence watch fired for ${watch.jid} (${watch.watchId}) via ${snapshot.source}`,
+        );
         this.ws.send(this.instance.name, 'presence.online', payload);
         this.sendDataWebhook('presenceOnline', payload);
       }
@@ -387,6 +395,9 @@ export class WAStartupService {
         this.sendDataWebhook('presenceWatchExpired', payload);
       }
     },
+    // Retried on the refresh cycle for watches whose LID lookup failed at
+    // registration — see PresenceWatcherDeps.expandJids.
+    expandJids: (number) => this.presenceJids(number),
     logger: {
       info: (msg) => this.logger.info(msg),
       warn: (msg) => this.logger.warn(msg),
@@ -2183,6 +2194,8 @@ export class WAStartupService {
         lastSeen: null,
         lastSeenIso: null,
         lastSeenHidden: null,
+        source: null,
+        viaJid: null,
         updatedAt: null,
       };
     }
@@ -2199,6 +2212,11 @@ export class WAStartupService {
       // True when WhatsApp answered `last="deny"`: the contact hides last seen,
       // or our own privacy setting revokes the right to see it (it is reciprocal).
       lastSeenHidden: snapshot.lastSeenHidden,
+      // 'direct' or 'group' — which channel last carried a signal for this
+      // contact. Kept even when stale: it describes where the reading came
+      // from, which stays true however old the reading is.
+      source: snapshot.source,
+      viaJid: snapshot.viaJid ?? null,
       groupOnlineCount: snapshot.groupOnlineCount ?? undefined,
       updatedAt: new Date(snapshot.updatedAt).toISOString(),
     };

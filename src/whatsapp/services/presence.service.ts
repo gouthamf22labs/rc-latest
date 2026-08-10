@@ -30,6 +30,17 @@ export type PresenceSnapshot = {
   lastSeen: number | null;
   lastSeenHidden: boolean;
   groupOnlineCount?: number;
+  /**
+   * Where this signal came from. A contact's presence reaches us either directly
+   * (a 1:1 `<presence>` node) or as chat-state inside a group they share with us
+   * — WhatsApp reports the group's jid but keys the state to the member, so a
+   * group is a genuine second channel for the same person. Recorded because a
+   * trigger that fired on group typing behaves differently from one that fired
+   * on a direct signal, and after the fact there is otherwise no way to tell.
+   */
+  source: 'direct' | 'group';
+  /** The group the signal arrived through, when `source` is 'group'. */
+  viaJid?: string;
   /** ms epoch of the update that produced this snapshot */
   updatedAt: number;
 };
@@ -88,8 +99,24 @@ export type PresenceWatcherDeps = {
   onOnline: (watches: PresenceWatch[], snapshot: PresenceSnapshot) => void;
   /** TTL elapsed without the contact ever coming online. */
   onExpire: (watches: PresenceWatch[]) => void;
+  /**
+   * Re-resolves a contact's jids (phone-number jid plus LID). The LID lookup at
+   * registration is a bounded USync round-trip that is allowed to fail, and a
+   * watch left without its LID is deaf to everything WhatsApp delivers under it
+   * — including group chat-state, which is always LID-keyed. Retried on the
+   * refresh cycle so a watch repairs itself instead of staying half-blind for
+   * its whole life. Optional: without it the watcher behaves as before.
+   */
+  expandJids?: (number: string) => Promise<string[]>;
   logger: WatcherLogger;
 };
+
+/**
+ * Ceiling on LID repairs attempted per refresh cycle. Each is a USync
+ * round-trip; the rest are picked up on the next cycle, so a large backlog
+ * drains steadily instead of saturating the socket.
+ */
+const MAX_LID_REPAIRS_PER_CYCLE = 25;
 
 /** Gap between subscribe nodes so a reconnect doesn't burst the socket. */
 const SUBSCRIBE_GAP_MS = 150;
@@ -129,6 +156,7 @@ export class PresenceWatcher {
 
   private readonly subscribeQueue = new Set<string>();
   private draining = false;
+  private repairing = false;
   private connected = false;
   private lastAnnouncedAt = 0;
   private refreshTimer?: NodeJS.Timeout;
@@ -375,12 +403,18 @@ export class PresenceWatcher {
       const jid = participant || payload.id;
       const lastKnownPresence = data?.lastKnownPresence ?? 'unavailable';
       const previous = this.snapshots.get(jid);
+      // A 1:1 node addresses the contact itself, so payload.id and the
+      // participant are the same jid. They differ only when the state arrived
+      // through a chat the contact is in — i.e. a group.
+      const isGroup = !!payload.id && payload.id !== jid;
 
       const snapshot: PresenceSnapshot = {
         jid,
         // composing/recording/paused all imply the contact has WhatsApp open.
         online: lastKnownPresence !== 'unavailable',
         lastKnownPresence,
+        source: isGroup ? 'group' : 'direct',
+        ...(isGroup ? { viaJid: payload.id } : {}),
         lastSeen: typeof data?.lastSeen === 'number' ? data.lastSeen : (previous?.lastSeen ?? null),
         // Only meaningful for an offline contact: WhatsApp omits `last` while a
         // contact is online, which is not the same as hiding it.
@@ -579,6 +613,64 @@ export class PresenceWatcher {
     for (const watch of this.watches.values()) {
       for (const jid of watch.jids) {
         this.subscribeQueue.add(jid);
+      }
+    }
+    void this.drain();
+    void this.repairMissingLids();
+  }
+
+  /**
+   * A watch whose LID lookup failed at registration carries only the phone-number
+   * jid, so nothing WhatsApp routes by LID can ever match it. Retry those here:
+   * the lookup is cheap, and one success converts a permanently deaf watch into a
+   * working one.
+   */
+  private async repairMissingLids() {
+    const expand = this.deps.expandJids;
+    // Each repair is a USync round-trip. One cycle at a time, and a cap per
+    // cycle, so a large backlog cannot outrun REFRESH_INTERVAL_MS and stack
+    // overlapping sweeps on the socket. The remainder is picked up next cycle.
+    if (!expand || this.repairing) {
+      return;
+    }
+    this.repairing = true;
+    try {
+      await this.repairSweep(expand);
+    } finally {
+      this.repairing = false;
+    }
+  }
+
+  private async repairSweep(expand: (number: string) => Promise<string[]>) {
+    const incomplete = [...this.watches.values()]
+      .filter((w) => !w.jids.some((j) => j.endsWith('@lid')))
+      .slice(0, MAX_LID_REPAIRS_PER_CYCLE);
+    for (const watch of incomplete) {
+      try {
+        const jids = await expand(watch.number);
+        const added = jids.filter(Boolean).filter((j) => !watch.jids.includes(j));
+        if (added.length === 0) {
+          continue;
+        }
+        // The watch may have fired or expired while the lookup was in flight.
+        if (this.watches.get(watch.watchId) !== watch) {
+          continue;
+        }
+        watch.jids = [...watch.jids, ...added];
+        for (const jid of added) {
+          const set = this.watchesByJid.get(jid) ?? new Set<string>();
+          set.add(watch.watchId);
+          this.watchesByJid.set(jid, set);
+          this.subscribeQueue.add(jid);
+        }
+        this.deps.logger.info(
+          `presence watch ${watch.watchId} repaired with ${added.join(', ')}`,
+        );
+      } catch (error) {
+        // Next refresh tries again — a failed repair must never break the sweep.
+        this.deps.logger.warn(
+          `presence jid repair failed for ${watch.number}: ${error?.message ?? error}`,
+        );
       }
     }
     void this.drain();
