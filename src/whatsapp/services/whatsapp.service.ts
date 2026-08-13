@@ -186,10 +186,10 @@ import {
 // repos (the RAM leak). We allow a short burst of RESCAN_MAX_ATTEMPTS rebuilds so
 // a user who fumbles the scan can retry immediately, then throttle with a cooldown
 // (after which a fresh burst is allowed) so background polling stops churning.
-// How many un-enriched channels fetchChannels will resolve inline before handing the
-// remainder to the background prewarm. Paced lookups under the caller's 30s timeout —
-// past roughly this many, the request dies and returns nothing rather than something.
-const FETCH_CHANNELS_MAX_LOOKUPS = 15;
+// Un-enriched channels resolved per fetchChannels call. Small enough that the batch is
+// never a burst WhatsApp throttles and never makes this hot path slow; repeated calls
+// converge, since a resolved channel costs nothing on the next one.
+const FETCH_CHANNELS_MAX_LOOKUPS = 5;
 
 const parsedRescanCooldown = Number.parseInt(process.env.RESCAN_COOLDOWN_MS ?? '', 10);
 const RESCAN_COOLDOWN_MS =
@@ -4031,42 +4031,34 @@ export class WAStartupService {
       orderBy: { id: 'desc' },
     });
 
-    // Anything already resolved needs no network call at all.
     const results: any[] = chats.map((chat) => ({
       chat,
       metadata: this.normalizeNewsletterMeta(chat.content as any),
     }));
 
-    // The rest are looked up one at a time with a small gap. This used to be a
-    // Promise.all across every unresolved channel, which on an account with more than
-    // a handful of them is a burst WhatsApp rate-limits — every lookup then came back
-    // null, every row was filtered out, and the caller saw an account with no channels
-    // at all. Same pacing as prewarmChannels, for the same reason.
-    // Bounded, because this is a request/response call sitting under a 30s client
-    // timeout: paced lookups across a large account would run past it and the caller
-    // would get nothing at all — worse than the partial answer it gets here. The rest
-    // are left to prewarmChannels, which is the background path with no such ceiling.
-    const allPending = results.filter((r) => r.metadata === null);
-    const pending = allPending.slice(0, FETCH_CHANNELS_MAX_LOOKUPS);
-    if (allPending.length > pending.length) {
-      this.logger.info(
-        `fetchChannels: enriching ${pending.length}/${allPending.length} inline, rest deferred to prewarm`,
+    // Enrich a few per call and let repeated calls converge, rather than trying to
+    // resolve a whole account at once. The two extremes both failed: an unthrottled
+    // Promise.all over every channel is a burst WhatsApp rate-limits, so every lookup
+    // returned null and the account looked empty; pacing them instead made this hot
+    // path slow and long-lived, and the background prewarm it kicked off re-entered
+    // here via the backend's cache clear. A small parallel batch is fast, cannot burst,
+    // and reaches the same place after a few calls — anything already resolved costs
+    // nothing, so the work shrinks each time.
+    const pending = results.filter((r) => r.metadata === null).slice(0, FETCH_CHANNELS_MAX_LOOKUPS);
+    if (pending.length > 0 && this.stateConnection.state === 'open') {
+      await Promise.all(
+        pending.map(async (entry) => {
+          try {
+            const meta = await this.client.newsletterMetadata('jid', entry.chat.remoteJid);
+            if (meta) {
+              await this.repository.chat
+                .update({ where: { id: entry.chat.id }, data: { content: meta as any } })
+                .catch(() => {});
+              entry.metadata = this.normalizeNewsletterMeta(meta);
+            }
+          } catch { /* best-effort */ }
+        }),
       );
-      this.prewarmChannels().catch(() => null);
-    }
-    for (let i = 0; i < pending.length; i++) {
-      if (this.stateConnection.state !== 'open') break;
-      const entry = pending[i];
-      try {
-        const meta = await this.client.newsletterMetadata('jid', entry.chat.remoteJid);
-        if (meta) {
-          await this.repository.chat
-            .update({ where: { id: entry.chat.id }, data: { content: meta as any } })
-            .catch(() => {});
-          entry.metadata = this.normalizeNewsletterMeta(meta);
-        }
-      } catch { /* best-effort */ }
-      if (i < pending.length - 1) await delay(150); // matches prewarmChannels' pacing
     }
 
     const unresolved = results.filter((r) => r.metadata === null).length;
