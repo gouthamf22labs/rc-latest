@@ -186,6 +186,11 @@ import {
 // repos (the RAM leak). We allow a short burst of RESCAN_MAX_ATTEMPTS rebuilds so
 // a user who fumbles the scan can retry immediately, then throttle with a cooldown
 // (after which a fresh burst is allowed) so background polling stops churning.
+// How many un-enriched channels fetchChannels will resolve inline before handing the
+// remainder to the background prewarm. Paced lookups under the caller's 30s timeout —
+// past roughly this many, the request dies and returns nothing rather than something.
+const FETCH_CHANNELS_MAX_LOOKUPS = 15;
+
 const parsedRescanCooldown = Number.parseInt(process.env.RESCAN_COOLDOWN_MS ?? '', 10);
 const RESCAN_COOLDOWN_MS =
   Number.isFinite(parsedRescanCooldown) && parsedRescanCooldown > 0
@@ -1227,22 +1232,48 @@ export class WAStartupService {
             });
             list.push(create);
           } else {
-            const update = await this.repository.chat.update({
-              where: {
-                id: find.id,
-              },
-              data: {
-                content: item as any,
-                updatedAt: new Date(),
-              },
-            });
-            list.push(update);
+            // Never trade resolved channel metadata for a thinner payload. When the
+            // newsletterMetadata lookup above fails — rate limit, not yet synced, a
+            // transient socket error — `item` is still the bare chat event, and writing
+            // that over a good record loses a name and description WhatsApp will not
+            // hand back on request. There is no API to list an account's channels, so
+            // what we already hold is the only copy. Keep it and let the next event,
+            // or the prewarm sweep, enrich again.
+            const wouldDowngrade =
+              isNewsletter &&
+              !this.normalizeNewsletterMeta(item) &&
+              !!this.normalizeNewsletterMeta(find.content as any);
+
+            if (wouldDowngrade) {
+              this.logger.warn(
+                `chats.upsert: keeping stored metadata for ${chat.id} — incoming payload has none`,
+              );
+              list.push(find);
+            } else {
+              const update = await this.repository.chat.update({
+                where: {
+                  id: find.id,
+                },
+                data: {
+                  content: item as any,
+                  updatedAt: new Date(),
+                },
+              });
+              list.push(update);
+            }
           }
           this.ws.send(this.instance.name, 'chats.upsert', list);
           await this.sendDataWebhook('chatsUpsert', list);
 
           if (isNewsletter) {
-            const channelPayload = { remoteJid: chat.id, metadata: item };
+            // Publish what is actually stored, not what arrived. When the lookup failed
+            // and the stored record was kept, announcing the bare event would tell every
+            // consumer this channel has no name and no subscribers.
+            const stored = list[0]?.content;
+            const metadata = this.normalizeNewsletterMeta(item)
+              ? item
+              : (this.normalizeNewsletterMeta(stored as any) ? stored : item);
+            const channelPayload = { remoteJid: chat.id, metadata };
             this.ws.send(this.instance.name, 'channel.upsert', channelPayload);
             await this.sendDataWebhook('channelUpsert', channelPayload);
           }
@@ -1315,6 +1346,14 @@ export class WAStartupService {
     'chats.delete': async (chats: string[]) => {
       await this.sendDataWebhook('chatsDeleted', [...chats]);
       for (const chat of chats) {
+        // Clearing a channel from the chat list is not unfollowing it, and the row is
+        // the only record of the JID — WhatsApp will not enumerate an account's
+        // channels, so a deleted one cannot be rediscovered without the user opening
+        // it again. Keep newsletters; a normal chat carries no such cost.
+        if (isJidNewsletter(chat)) {
+          this.logger.info(`chats.delete: keeping newsletter row for ${chat}`);
+          continue;
+        }
         const c = await this.repository.chat.findFirst({
           where: {
             remoteJid: chat,
@@ -3992,31 +4031,56 @@ export class WAStartupService {
       orderBy: { id: 'desc' },
     });
 
-    const results = await Promise.all(
-      chats.map(async (chat) => {
-        const content = chat.content as any;
-        const normalized = this.normalizeNewsletterMeta(content);
+    // Anything already resolved needs no network call at all.
+    const results: any[] = chats.map((chat) => ({
+      chat,
+      metadata: this.normalizeNewsletterMeta(chat.content as any),
+    }));
 
-        if (normalized) {
-          return { ...chat, metadata: normalized };
+    // The rest are looked up one at a time with a small gap. This used to be a
+    // Promise.all across every unresolved channel, which on an account with more than
+    // a handful of them is a burst WhatsApp rate-limits — every lookup then came back
+    // null, every row was filtered out, and the caller saw an account with no channels
+    // at all. Same pacing as prewarmChannels, for the same reason.
+    // Bounded, because this is a request/response call sitting under a 30s client
+    // timeout: paced lookups across a large account would run past it and the caller
+    // would get nothing at all — worse than the partial answer it gets here. The rest
+    // are left to prewarmChannels, which is the background path with no such ceiling.
+    const allPending = results.filter((r) => r.metadata === null);
+    const pending = allPending.slice(0, FETCH_CHANNELS_MAX_LOOKUPS);
+    if (allPending.length > pending.length) {
+      this.logger.info(
+        `fetchChannels: enriching ${pending.length}/${allPending.length} inline, rest deferred to prewarm`,
+      );
+      this.prewarmChannels().catch(() => null);
+    }
+    for (let i = 0; i < pending.length; i++) {
+      if (this.stateConnection.state !== 'open') break;
+      const entry = pending[i];
+      try {
+        const meta = await this.client.newsletterMetadata('jid', entry.chat.remoteJid);
+        if (meta) {
+          await this.repository.chat
+            .update({ where: { id: entry.chat.id }, data: { content: meta as any } })
+            .catch(() => {});
+          entry.metadata = this.normalizeNewsletterMeta(meta);
         }
+      } catch { /* best-effort */ }
+      if (i < pending.length - 1) await delay(150); // matches prewarmChannels' pacing
+    }
 
-        // Content is stale chat data — fetch real metadata, normalize, and persist
-        try {
-          const meta = await this.client.newsletterMetadata('jid', chat.remoteJid);
-          if (meta) {
-            await this.repository.chat
-              .update({ where: { id: chat.id }, data: { content: meta as any } })
-              .catch(() => {});
-            return { ...chat, metadata: this.normalizeNewsletterMeta(meta) };
-          }
-        } catch { /* best-effort */ }
+    const unresolved = results.filter((r) => r.metadata === null).length;
+    if (unresolved > 0) {
+      // Worth a line: consumers see "fewer channels than expected", never "some could
+      // not be read", and the two used to be indistinguishable from the outside.
+      this.logger.warn(
+        `fetchChannels: ${unresolved}/${results.length} channels could not be enriched`,
+      );
+    }
 
-        return { ...chat, metadata: null };
-      }),
-    );
-
-    return results.filter((r) => r.metadata !== null);
+    return results
+      .filter((r) => r.metadata !== null)
+      .map((r) => ({ ...r.chat, metadata: r.metadata }));
   }
 
   public async fetchChats(type?: string) {
