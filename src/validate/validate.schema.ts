@@ -638,6 +638,9 @@ export const watchPresenceSchema: JSONSchema7 = {
     ttlSeconds: { type: 'integer', minimum: 60, maximum: 604800 },
     requireTyping: { type: 'boolean' },
     fireIfAlreadyOnline: { type: 'boolean', enum: [true, false] },
+    // ms epoch. The watch is registered now but stays deaf until this moment —
+    // "when they come online, but not before Monday 9am".
+    notBefore: { type: 'integer', minimum: 0 },
   },
   required: ['number', 'watchId'],
   ...isNotEmpty('number', 'watchId'),

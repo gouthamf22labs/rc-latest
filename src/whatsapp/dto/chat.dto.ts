@@ -70,6 +70,13 @@ export class WatchPresenceDto extends NumberDto {
   watchId: string;
   ttlSeconds?: number;
   fireIfAlreadyOnline?: boolean;
+  /** Fire only on a typing signal — see PresenceWatch.requireTyping. */
+  requireTyping?: boolean;
+  /**
+   * ms epoch before which the watch must not fire. Omit for a watch that is
+   * armed as soon as it is registered, which is the default.
+   */
+  notBefore?: number;
 }
 
 export class UnwatchPresenceDto {

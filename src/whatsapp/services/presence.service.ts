@@ -76,6 +76,18 @@ export type PresenceWatch = {
    * group when nobody had said anything, which is not what was asked for.
    */
   requireTyping: boolean;
+  /**
+   * ms epoch before which this watch must not fire. Undefined means "armed from
+   * the moment it is registered", which is every watch that existed before this
+   * field.
+   *
+   * "Send it when they come online on Monday after 9am" is a different trigger
+   * from "send it when they come online": the contact appearing on Friday
+   * evening must be ignored, not acted on. The watch is still registered ahead
+   * of the window so the subscription is warm and WhatsApp is already pushing by
+   * the time it opens — only the *firing* is held back.
+   */
+  notBefore?: number;
 };
 
 export type PresenceWatchInput = {
@@ -88,6 +100,8 @@ export type PresenceWatchInput = {
   fireIfAlreadyOnline?: boolean;
   /** See PresenceWatch.requireTyping. */
   requireTyping?: boolean;
+  /** See PresenceWatch.notBefore. ms epoch. */
+  notBefore?: number;
 };
 
 type WatcherLogger = {
@@ -332,6 +346,9 @@ export class PresenceWatcher {
       expiresAt: Date.now() + input.ttlSeconds * 1000,
       fireIfAlreadyOnline: input.fireIfAlreadyOnline ?? true,
       requireTyping: input.requireTyping ?? false,
+      ...(typeof input.notBefore === 'number' && Number.isFinite(input.notBefore)
+        ? { notBefore: input.notBefore }
+        : {}),
     };
 
     // A re-registration may move the jids; clear the old index entries first.
@@ -351,6 +368,7 @@ export class PresenceWatcher {
     const known = this.getSnapshot(...watch.jids);
     if (
       watch.fireIfAlreadyOnline &&
+      this.isArmed(watch) &&
       known?.online &&
       this.isFresh(known) &&
       (!watch.requireTyping || isTypingPresence(known.lastKnownPresence))
@@ -469,6 +487,11 @@ export class PresenceWatcher {
         .map((id) => this.watches.get(id))
         .filter((w): w is PresenceWatch => {
           if (!w) return false;
+          // Outside its window this watch is deaf on purpose — the contact being
+          // online today says nothing about the Monday morning that was asked
+          // for. It stays registered, so the subscription is live and warm when
+          // the window does open.
+          if (!this.isArmed(w)) return false;
           // A typing-only watch ignores a bare "available": the contact opening
           // WhatsApp is not them saying something.
           if (w.requireTyping && !isTypingPresence(lastKnownPresence)) return false;
@@ -554,6 +577,11 @@ export class PresenceWatcher {
    */
   public isFresh(snapshot: PresenceSnapshot) {
     return Date.now() - snapshot.updatedAt < PRESENCE_FRESH_MS;
+  }
+
+  /** A watch is armed once its `notBefore` window has opened (or it has none). */
+  private isArmed(watch: PresenceWatch) {
+    return watch.notBefore === undefined || Date.now() >= watch.notBefore;
   }
 
   // ─── subscribe throttling ───────────────────────────────────────────────────
@@ -709,7 +737,53 @@ export class PresenceWatcher {
     void this.drain();
   }
 
+  /**
+   * Releases windowed watches at the moment their window opens.
+   *
+   * Firing is driven by `presence.update`, and WhatsApp only sends one when
+   * something changes. Someone who opened WhatsApp at 08:55 and left it sitting
+   * there produces no event at 09:00, so a watch that waited purely for the next
+   * update would sleep through its whole window and go out at its backstop
+   * instead — the one outcome "send it Monday when they're online" must not have.
+   *
+   * Two cases, and each watch is handled exactly once:
+   *  - a fresh online snapshot is already on hand: fire immediately;
+   *  - otherwise the window is simply dropped, which turns this into an ordinary
+   *    armed watch, and the contact is re-subscribed so WhatsApp answers with
+   *    their current presence within seconds rather than at the next refresh.
+   */
+  private fireWindowsJustOpened() {
+    let resubscribe = false;
+    for (const watch of [...this.watches.values()]) {
+      if (watch.notBefore === undefined || !this.isArmed(watch)) {
+        continue;
+      }
+      const known = this.getSnapshot(...watch.jids);
+      if (
+        watch.fireIfAlreadyOnline &&
+        known?.online &&
+        this.isFresh(known) &&
+        (!watch.requireTyping || isTypingPresence(known.lastKnownPresence))
+      ) {
+        this.fire([watch], known);
+        continue;
+      }
+      // The window has done its job; from here this is a plain watch. Clearing it
+      // also keeps this loop off the watch on every subsequent sweep.
+      watch.notBefore = undefined;
+      for (const jid of watch.jids) {
+        this.subscribeQueue.add(jid);
+      }
+      resubscribe = true;
+    }
+    if (resubscribe) {
+      void this.drain();
+    }
+  }
+
   private sweep() {
+    this.fireWindowsJustOpened();
+
     const now = Date.now();
     const expired = [...this.watches.values()].filter((w) => w.expiresAt <= now);
     if (expired.length === 0) {

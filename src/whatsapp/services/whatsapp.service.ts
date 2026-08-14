@@ -2302,6 +2302,12 @@ export class WAStartupService {
     fireIfAlreadyOnline?: boolean;
     /** Fire only on a typing signal — see PresenceWatch.requireTyping. */
     requireTyping?: boolean;
+    /**
+     * ms epoch before which the watch must not fire — see PresenceWatch.notBefore.
+     * Registered ahead of the window on purpose, so the subscription is already
+     * warm when it opens.
+     */
+    notBefore?: number;
   }) {
     this.assertConnected();
     const jids = await this.presenceJids(data.number);
@@ -2315,6 +2321,17 @@ export class WAStartupService {
     // its watch alive. A watch is a live subscription, not storage, so it is
     // never allowed to outlive the longest fallback the backend will accept.
     const ttlSeconds = Math.min(Math.max(data.ttlSeconds ?? 86400, 60), 7 * 86400);
+
+    // A window that opens after the watch has already expired can never fire, so
+    // it is a caller mistake rather than something to silently accept. A window
+    // in the past is not — a re-registration of an already-open window is the
+    // normal steady state — so it is simply dropped.
+    const expiresAt = Date.now() + ttlSeconds * 1000;
+    if (typeof data.notBefore === 'number' && data.notBefore >= expiresAt) {
+      throw new BadRequestException('notBefore is after the watch expires — the trigger could never fire');
+    }
+    const notBefore =
+      typeof data.notBefore === 'number' && data.notBefore > Date.now() ? data.notBefore : undefined;
 
     // Issue the trusted-contact token now rather than waiting for the throttled
     // subscribe queue, so the answer below reflects this watch's real chances.
@@ -2360,6 +2377,7 @@ export class WAStartupService {
       ttlSeconds,
       fireIfAlreadyOnline: data.fireIfAlreadyOnline,
       requireTyping: data.requireTyping,
+      notBefore,
     });
 
     return {
@@ -2367,6 +2385,12 @@ export class WAStartupService {
       number: watch.number,
       jid: watch.jid,
       expiresAt: new Date(watch.expiresAt).toISOString(),
+      /**
+       * When this watch starts listening. Null means immediately. Until then the
+       * contact coming online is ignored — the subscription is held open so the
+       * trigger is ready the instant the window opens.
+       */
+      notBefore: watch.notBefore ? new Date(watch.notBefore).toISOString() : null,
       // The watch already fired (contact was online): the webhook has been sent
       // and no watch remains registered.
       firedImmediately,
