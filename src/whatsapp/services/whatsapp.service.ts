@@ -191,6 +191,32 @@ import {
 // converge, since a resolved channel costs nothing on the next one.
 const FETCH_CHANNELS_MAX_LOOKUPS = 5;
 
+// Matches prewarmChannels' PER_CALL_DELAY_MS — both walk a channel list issuing one
+// live WhatsApp lookup per entry, so they have to be equally polite to the socket.
+const ADD_CHANNEL_PER_CALL_DELAY_MS = 150;
+
+// Webhook delivery must never be able to wedge this process. axios defaults to no
+// timeout at all, and several Baileys handlers below `await` the post — so a consumer
+// that accepts the connection but never answers leaves the request pending forever,
+// pinning a socket and retaining its payload. The pool bounds a burst: past
+// maxSockets, further posts queue inside the agent instead of opening new
+// connections, and keepAlive avoids a TCP+TLS handshake per post when the whole fleet
+// reconnects at once.
+const parsedWebhookTimeout = Number.parseInt(process.env.WEBHOOK_TIMEOUT_MS ?? '', 10);
+const WEBHOOK_TIMEOUT_MS =
+  Number.isFinite(parsedWebhookTimeout) && parsedWebhookTimeout > 0 ? parsedWebhookTimeout : 10_000;
+
+const webhookHttpAgent = new HttpAgent({ keepAlive: true, maxSockets: 32 });
+const webhookHttpsAgent = new HttpsAgent({ keepAlive: true, maxSockets: 32 });
+
+const WEBHOOK_POST_CONFIG = {
+  timeout: WEBHOOK_TIMEOUT_MS,
+  httpAgent: webhookHttpAgent,
+  httpsAgent: webhookHttpsAgent,
+  maxContentLength: 64 * 1024,
+  maxRedirects: 0,
+} as const;
+
 const parsedRescanCooldown = Number.parseInt(process.env.RESCAN_COOLDOWN_MS ?? '', 10);
 const RESCAN_COOLDOWN_MS =
   Number.isFinite(parsedRescanCooldown) && parsedRescanCooldown > 0
@@ -598,7 +624,7 @@ export class WAStartupService {
               instance: this.instance,
               data,
             },
-            { headers: { 'Resource-Owner': this.instance.ownerJid } },
+            { headers: { 'Resource-Owner': this.instance.ownerJid }, ...WEBHOOK_POST_CONFIG },
           );
         }
         if (!this.webhook?.events) {
@@ -609,7 +635,7 @@ export class WAStartupService {
               instance: this.instance,
               data,
             },
-            { headers: { 'Resource-Owner': this.instance.ownerJid } },
+            { headers: { 'Resource-Owner': this.instance.ownerJid }, ...WEBHOOK_POST_CONFIG },
           );
         }
       }
@@ -636,7 +662,7 @@ export class WAStartupService {
             instance: this.instance,
             data,
           },
-          { headers: { 'Resource-owner': this.instance.ownerJid } },
+          { headers: { 'Resource-owner': this.instance.ownerJid }, ...WEBHOOK_POST_CONFIG },
         );
       }
     } catch (error) {
@@ -4112,6 +4138,22 @@ export class WAStartupService {
   public async addChannelsByJid(channels: string[]) {
     const results = [];
     for (const channel of channels) {
+      // Every reconnect makes the backend replay this user's channels here, so on a
+      // fleet-wide reconnect this runs for every instance at once — each iteration
+      // being a live WhatsApp query. Un-paced, that is the burst that gets the
+      // socket dropped (405/428), which forces another reconnect, which replays the
+      // channels again. prewarmChannels already paces itself for exactly this
+      // reason; this path is the same work reached a different way, so it uses the
+      // same gap, and it stops the moment the socket is no longer open rather than
+      // hammering a connection that is already on its way down.
+      if (this.stateConnection.state !== 'open') {
+        results.push({ channel, status: 'skipped_disconnected' });
+        continue;
+      }
+      if (results.length > 0) {
+        await delay(ADD_CHANNEL_PER_CALL_DELAY_MS);
+      }
+
       // Detect if it's a JID or an invite code
       const isJid = channel.includes('@newsletter');
       const type: 'jid' | 'invite' = isJid ? 'jid' : 'invite';
