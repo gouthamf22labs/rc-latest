@@ -4358,13 +4358,38 @@ export class WAStartupService {
    * contact store, falling back to whatever Baileys holds in memory (`name`,
    * then the `notify` push-name). Null when no source knows them — the caller
    * shows the number instead.
+   *
+   * Only the jids in this group are read. The first version selected every contact row for the
+   * instance and then discarded all but a handful — a full scan of a table that reaches tens of
+   * thousands of rows on an active account. That was affordable in fetchAllGroups, which pays it
+   * once for every group at a time and runs on a ten-minute throttle, but findParticipants is on
+   * the participant-webhook path: one call per member joining or leaving, several groups at a
+   * time, each one re-reading the whole table. It starved the Postgres pool, which slowed the
+   * responses, which let more webhook-driven calls pile up on top — and group handling that had
+   * been fine before this enrichment started timing out. `@@index([instanceId, remoteJid])` turns
+   * the scoped form into an index lookup bounded by the size of the group.
    */
   private async withParticipantNames<T extends { id: string }>(participants: T[]) {
-    const contacts = await this.repository.contact.findMany({
-      where: { instanceId: this.instance.id },
-      select: { remoteJid: true, pushName: true },
-    });
-    const nameMap = new Map(contacts.map((c) => [c.remoteJid, c.pushName]));
+    // Exactly the keys the lookup below uses, so scoping cannot change which names resolve.
+    const jids = [
+      ...new Set(
+        participants
+          .map((p) => (p as any).phoneNumber ?? p.id)
+          .filter((jid): jid is string => typeof jid === 'string' && jid.length > 0),
+      ),
+    ];
+
+    // Chunked so a 2,000-member group does not become a single 2,000-term IN clause.
+    const CHUNK = 500;
+    const nameMap = new Map<string, string | null>();
+    for (let i = 0; i < jids.length; i += CHUNK) {
+      const contacts = await this.repository.contact.findMany({
+        where: { instanceId: this.instance.id, remoteJid: { in: jids.slice(i, i + CHUNK) } },
+        select: { remoteJid: true, pushName: true },
+      });
+      for (const c of contacts) nameMap.set(c.remoteJid, c.pushName);
+    }
+
     return participants.map((p) => {
       const jid = (p as any).phoneNumber ?? p.id;
       const inMemory = (this.client as any).contacts?.[jid];
