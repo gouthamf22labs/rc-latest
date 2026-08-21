@@ -2019,7 +2019,12 @@ export class WAStartupService {
   }
 
   // Check if the number is br
-  private formatBRNumber(jid: string) {
+  // Returns `jid` untouched unless this is a BR number needing the 9th-digit fix. The
+  // `return jid` sits at the end, not in an `else`: the 13-digit regex also matches MX
+  // (52) and AR (54) numbers, and with the early-out in an else branch those fell off
+  // the end as `undefined`, so createJid built `undefined@s.whatsapp.net` and never
+  // reached formatMXOrARNumber. Mirrors that function's shape for exactly this reason.
+  private formatBRNumber(jid: string): string {
     const regexp = new RegExp(/^(\d{2})(\d{2})\d{1}(\d{8})$/);
     if (regexp.test(jid)) {
       const match = regexp.exec(jid);
@@ -2031,13 +2036,19 @@ export class WAStartupService {
         }
         return match[1] + match[2] + match[3];
       }
-    } else {
-      return jid;
     }
+    return jid;
   }
 
   private createJid(number: string): string {
-    const regexp = new RegExp(/^\w+@(s.whatsapp.net|g.us|lid|broadcast|newsletter)$/i);
+    // `-` must be in the character class: legacy group ids are `creator-timestamp@g.us`
+    // (pre-2021 groups), and \w excludes `-`. Without it those ids miss this
+    // already-a-JID guard, fall through to the `includes('-')` branch below and come
+    // back double-suffixed (`...@g.us@g.us`), which every downstream WhatsApp query
+    // then fails on. Dots are escaped so the servers match literally.
+    const regexp = new RegExp(
+      /^[\w-]+@(s\.whatsapp\.net|g\.us|lid|broadcast|newsletter)$/i,
+    );
     if (regexp.test(number)) {
       return number;
     }
