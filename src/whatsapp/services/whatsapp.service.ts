@@ -336,6 +336,55 @@ const extractFailureNode = (
   return { tag, attrs };
 };
 
+/**
+ * True when the buffer is an HEVC-coded HEIF still (an iPhone .heic).
+ *
+ * sharp's prebuilt libvips compiles libheif AVIF-only — no HEVC decoder, for patent
+ * reasons — so these blow up in the thumbnail step with an opaque
+ * "source: bad seek to N / Support for this compression format has not been built in"
+ * dump that the caller surfaces verbatim as a PROVIDER 500. WhatsApp cannot render
+ * HEIC either, so the file is undeliverable rather than merely un-thumbnailable, and
+ * it is worth naming that plainly before the media is uploaded to the CDN.
+ *
+ * Detection reads the ISO-BMFF ftyp brand rather than the declared mimetype, which is
+ * routinely `application/octet-stream` for .heic. AVIF shares the container but decodes
+ * fine, so its brands are excluded.
+ */
+const isHeicBuffer = (buffer?: Buffer): boolean => {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 12) {
+    return false;
+  }
+  if (buffer.toString('ascii', 4, 8) !== 'ftyp') {
+    return false;
+  }
+
+  const avifBrands = new Set(['avif', 'avis', 'av01']);
+  const heicBrands = new Set([
+    'heic', 'heix', 'heim', 'heis', 'hevc', 'hevx', 'hevm', 'hevs', 'mif1', 'msf1',
+  ]);
+
+  // Compatible brands follow the 4-byte minor version at offset 16; an AVIF may declare
+  // the generic `mif1` HEIF brand as its major, so the whole list is scanned first.
+  const boxSize = buffer.readUInt32BE(0);
+  const end = Math.min(boxSize > 0 ? boxSize : buffer.length, buffer.length);
+  for (let offset = 16; offset + 4 <= end; offset += 4) {
+    if (avifBrands.has(buffer.toString('ascii', offset, offset + 4).toLowerCase())) {
+      return false;
+    }
+  }
+
+  const majorBrand = buffer.toString('ascii', 8, 12).toLowerCase();
+  return !avifBrands.has(majorBrand) && heicBrands.has(majorBrand);
+};
+
+/** Media may be a URL string or raw bytes; only the former belongs in an error message. */
+const mediaLabel = (fileName?: string, media?: unknown): string =>
+  fileName || (typeof media === 'string' ? media : 'attached image');
+
+const HEIC_UNSUPPORTED_MESSAGE =
+  'Unsupported image format: HEIC/HEIF. WhatsApp cannot render it and this server cannot ' +
+  'decode it (sharp ships an AVIF-only libheif). Convert the image to JPEG before sending';
+
 export class WAStartupService {
   constructor(
     private readonly configService: ConfigService,
@@ -2967,6 +3016,14 @@ export class WAStartupService {
         media = readFileSync(fileName);
       }
 
+      // Checked before prepareWAMessageMedia so an undeliverable image does not first
+      // get encrypted and uploaded to WhatsApp's CDN just to fail on the thumbnail below.
+      if (mediaMessage.mediatype === 'image' && isHeicBuffer(media)) {
+        throw new BadRequestException(
+          `${HEIC_UNSUPPORTED_MESSAGE}: "${mediaLabel(mediaMessage?.fileName, mediaMessage?.media)}"`,
+        );
+      }
+
       const prepareMedia = await prepareWAMessageMedia(
         { [mediaMessage.mediatype]: media } as any,
         { upload: this.client.waUploadToServer },
@@ -3001,12 +3058,23 @@ export class WAStartupService {
       }
 
       if (mediaMessage.mediatype === 'image') {
-        const p = await sharp(preview || media)
-          .resize(320, 240, { fit: 'contain' })
-          .toFormat('jpeg', { quality: 80 })
-          .toBuffer();
-
-        prepareMedia.imageMessage.jpegThumbnail = p;
+        // Best-effort: prepareWAMessageMedia has already encrypted and uploaded the real
+        // image, and this is only the 320x240 preview WhatsApp shows before it loads.
+        // sharp still rejects valid images for its own reasons (pixel limits, unusual
+        // colour spaces, truncated-but-renderable JPEGs); losing the preview must not
+        // lose the message. Formats WhatsApp genuinely cannot render are rejected above.
+        try {
+          prepareMedia.imageMessage.jpegThumbnail = await sharp(preview || media)
+            .resize(320, 240, { fit: 'contain' })
+            .toFormat('jpeg', { quality: 80 })
+            .toBuffer();
+        } catch (error) {
+          this.logger.warn(
+            `prepareMediaMessage: thumbnail generation failed, sending without preview [${
+              (error as Error)?.message
+            }]`,
+          );
+        }
       }
 
       return generateWAMessageFromContent(
@@ -3056,6 +3124,16 @@ export class WAStartupService {
         );
       }
 
+      // The exception classes in ../../exceptions throw a plain { status, error, message }
+      // payload out of their constructor rather than an Error subclass. One raised inside
+      // the try above (the HEIC rejection) is already classified, and re-wrapping it here
+      // would call toString() on a plain object — the caller would receive the literal
+      // "[object Object]" in place of the reason. Anything reaching this point is not an
+      // AxiosError, since that branch always throws.
+      if (error && typeof error === 'object' && 'status' in error && 'error' in error) {
+        throw error;
+      }
+
       this.logger.error(error);
 
       throw new InternalServerErrorException(error?.toString() || error);
@@ -3088,12 +3166,22 @@ export class WAStartupService {
       let thumbnailDirectPath: string | undefined;
       let thumbnailSha256: Buffer | undefined;
 
+      // Set inside the try below, acted on after it: the catch there deliberately swallows
+      // everything to fall back to the original media, which for HEIC would mean quietly
+      // publishing bytes no WhatsApp client can render.
+      let heicSource = false;
+
       if (mediatype === 'image') {
         try {
           const isURL = typeof media === 'string' && /^https?:\/\//.test(media);
           const srcBuffer = isURL
             ? Buffer.from((await axios.get(media as string, { responseType: 'arraybuffer' })).data)
             : (media as Buffer);
+
+          if (isHeicBuffer(srcBuffer)) {
+            heicSource = true;
+            throw new Error('heic');
+          }
 
           // Convert main image to JPEG buffer — ensures uploaded bytes, fileSha256,
           // fileLength and mimetype all agree. Passing { url } risks a PNG/JPEG mismatch.
@@ -3124,6 +3212,10 @@ export class WAStartupService {
           } catch { /* best-effort */ }
           try { unlinkSync(thumbPath); } catch { /* ignore */ }
         } catch { /* fall back to original if anything fails */ }
+      }
+
+      if (heicSource) {
+        throw new BadRequestException(`${HEIC_UNSUPPORTED_MESSAGE}: "${mediaLabel(fileName, media)}"`);
       }
 
       const content = { [mediatype]: mediaContent, caption, fileName, mimetype, jpegThumbnail, width, height, thumbnailDirectPath, thumbnailSha256 } as any;
