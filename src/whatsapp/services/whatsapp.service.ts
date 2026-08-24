@@ -2067,25 +2067,6 @@ export class WAStartupService {
     return jid;
   }
 
-  // WhatsApp usernames: 3-30 chars, letter-led, letters/digits/./_/- thereafter, with
-  // an optional leading `@` the user may or may not type.
-  private static readonly usernameRegexp = /^@?([a-zA-Z][a-zA-Z0-9._-]{2,29})$/;
-
-  // NOT a real JID server — there is no `@username` domain on the wire, and WhatsApp
-  // will reject anything addressed to one. This is a purely local marker so the
-  // synchronous createJid() can record "this is a username" for the asynchronous
-  // resolveRecipient() to trade for a real jid. Nothing carrying this suffix may ever
-  // reach the socket.
-  private static readonly USERNAME_SERVER = 'username';
-
-  private isUsernameJid(jid: string): boolean {
-    return jid?.endsWith(`@${WAStartupService.USERNAME_SERVER}`);
-  }
-
-  private usernameFromJid(jid: string): string {
-    return jid.slice(0, -(WAStartupService.USERNAME_SERVER.length + 1));
-  }
-
   // Check if the number is br
   // Returns `jid` untouched unless this is a BR number needing the 9th-digit fix. The
   // `return jid` sits at the end, not in an `else`: the 13-digit regex also matches MX
@@ -2115,19 +2096,10 @@ export class WAStartupService {
     // back double-suffixed (`...@g.us@g.us`), which every downstream WhatsApp query
     // then fails on. Dots are escaped so the servers match literally.
     const regexp = new RegExp(
-      /^[\w-]+@(s\.whatsapp\.net|g\.us|lid|broadcast|newsletter|username)$/i,
+      /^[\w-]+@(s\.whatsapp\.net|g\.us|lid|broadcast|newsletter)$/i,
     );
     if (regexp.test(number)) {
       return number;
-    }
-
-    // Must sit ahead of the phone formatters: a username is not a number, and
-    // formatBRNumber/formatMXOrARNumber would pass it through untouched only to have
-    // the final line glue `@s.whatsapp.net` onto it. The username test is
-    // letter-led, so it can never claim an input the phone path wants.
-    const username = WAStartupService.usernameRegexp.exec(number);
-    if (username) {
-      return `${username[1].toLowerCase()}@${WAStartupService.USERNAME_SERVER}`;
     }
 
     const formattedBRNumber = this.formatBRNumber(number);
@@ -2645,10 +2617,7 @@ export class WAStartupService {
     try {
       if (options?.delay) {
         await this.client.presenceSubscribe(recipient);
-        // `recipient`, not `jid`: for a username `jid` is still the local
-        // `@username` marker, which WhatsApp cannot route. Harmless for phone
-        // numbers, where the two only differ by the resolved-jid normalisation.
-        await this.client.sendPresenceUpdate(options?.presence ?? 'composing', recipient);
+        await this.client.sendPresenceUpdate(options?.presence ?? 'composing', jid);
         await delay(options.delay);
         await this.client.sendPresenceUpdate('paused', recipient);
       }
@@ -3715,32 +3684,6 @@ export class WAStartupService {
       return cached.jid || jid;
     }
 
-    if (this.isUsernameJid(jid)) {
-      const username = this.usernameFromJid(jid);
-      let resolved: string | undefined;
-      try {
-        resolved = await this.withLookupDeadline(
-          this.resolveUsername(username),
-          `resolveUsername(${username})`,
-        );
-      } catch (error) {
-        // No raw-jid fallback here, unlike the phone path below. `@username` is not a
-        // real server, so "send to the jid anyway and let the send be the judge"
-        // would just hand WhatsApp an address it cannot route. An unresolved username
-        // has no recipient at all.
-        throw new BadRequestException(
-          `username lookup unavailable for @${username}: ${error?.message ?? error}`,
-        );
-      }
-
-      if (!resolved) {
-        throw new BadRequestException(new OnWhatsAppDto(false, `@${username}`));
-      }
-
-      this.numberLookupCache.set(jid, new OnWhatsAppDto(true, resolved));
-      return resolved;
-    }
-
     let list: { jid: string; exists: boolean }[] | undefined;
     try {
       list = await this.withLookupDeadline(
@@ -3784,21 +3727,6 @@ export class WAStartupService {
         onWhatsapp.push(new OnWhatsAppDto(true, '', jid));
         continue;
       }
-      if (this.isUsernameJid(jid)) {
-        // Must intercept before the onWhatsApp branch: that builds a phone USync, so
-        // the `@username` marker would go up as the literal phone number
-        // `+goutham_wa@username` and come back unresolved every time.
-        const username = this.usernameFromJid(jid);
-        const resolved = await this.resolveUsername(username);
-        onWhatsapp.push(
-          new OnWhatsAppDto(
-            !!resolved,
-            resolved ?? `@${username}`,
-            isLidUser(resolved) ? resolved : undefined,
-          ),
-        );
-        continue;
-      }
       if (isJidGroup(jid)) {
         const group = await this.findGroup({ groupJid: jid }, 'inner');
         onWhatsapp.push(new OnWhatsAppDto(!!group?.id, group.id, '', group?.subject));
@@ -3821,30 +3749,6 @@ export class WAStartupService {
     }
 
     return onWhatsapp;
-  }
-
-  /**
-   * Trade a WhatsApp username for the jid messages are actually delivered to.
-   *
-   * Baileys exposes no helper for this. onWhatsApp() only ever builds withPhone()
-   * (Socket/socket.js) and would send `+goutham_wa` up as a phone number, and
-   * withUsernameProtocol() is the wrong direction — its getUserElement() returns
-   * null, so it can only report the username OF a jid you already hold. The contact
-   * protocol is the one that carries a username upward
-   * (USyncContactProtocol.getUserElement -> `<contact username=".." pin=".."/>`), and
-   * the reply's list node carries the resolved jid. Same shape as getLid() below.
-   */
-  private async resolveUsername(username: string): Promise<string | undefined> {
-    const q = new USyncQuery()
-      .withContactProtocol()
-      .withUser(new USyncUser().withUsername(username));
-
-    const results = await this.client.executeUSyncQuery(q);
-
-    // `contact` is the parsed `<contact type="in">` flag — true means WhatsApp knows
-    // the username. `id` is what it resolved to, typically an @lid: a username exists
-    // precisely so the phone number stays hidden, so do not expect a PN back.
-    return results?.list?.find((i) => !!i?.contact)?.id as string | undefined;
   }
 
   public async getLid(...jids: string[]): Promise<{ id: string; lid: string }[]> {
