@@ -105,9 +105,14 @@ const optionsSchema: JSONSchema7 = {
   },
 };
 
+// Two alternatives, not one loosened pattern. The first is the original
+// phone/jid form and is left byte-identical so nothing that validated before stops
+// validating. The second admits a WhatsApp username (3-30 chars, must start with a
+// letter, optional leading `@`) — deliberately required to start with a letter so it
+// can never overlap the digit-led phone form and make the recipient kind ambiguous.
 const numberDefinition: JSONSchema7Definition = {
   type: 'string',
-  pattern: '^\\d+[\\.@\\w-]+',
+  pattern: '^(?:\\d+[\\.@\\w-]+|@?[a-zA-Z][a-zA-Z0-9._-]{2,29}$)',
   description: 'Invalid format',
 };
 
