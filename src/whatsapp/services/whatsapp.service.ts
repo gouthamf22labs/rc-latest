@@ -3718,12 +3718,11 @@ export class WAStartupService {
     if (this.isUsernameJid(jid)) {
       const username = this.usernameFromJid(jid);
       let resolved: string | undefined;
-      let raw: unknown[] = [];
       try {
-        ({ jid: resolved, raw } = await this.withLookupDeadline(
+        resolved = await this.withLookupDeadline(
           this.resolveUsername(username),
           `resolveUsername(${username})`,
-        ));
+        );
       } catch (error) {
         // No raw-jid fallback here, unlike the phone path below. `@username` is not a
         // real server, so "send to the jid anyway and let the send be the judge"
@@ -3735,17 +3734,9 @@ export class WAStartupService {
       }
 
       if (!resolved) {
-        // Second arg carries what USync actually replied. A username can fail to
-        // resolve for reasons that look identical from outside — unknown handle, or a
-        // handle whose owner requires the username PIN — and the raw list is the only
-        // thing that tells them apart.
-        throw new BadRequestException(
-          new OnWhatsAppDto(false, `@${username}`),
-          { usync: raw },
-        );
+        throw new BadRequestException(new OnWhatsAppDto(false, `@${username}`));
       }
 
-      this.logger.info(`resolved @${username} -> ${resolved}`);
       this.numberLookupCache.set(jid, new OnWhatsAppDto(true, resolved));
       return resolved;
     }
@@ -3798,7 +3789,7 @@ export class WAStartupService {
         // the `@username` marker would go up as the literal phone number
         // `+goutham_wa@username` and come back unresolved every time.
         const username = this.usernameFromJid(jid);
-        const { jid: resolved } = await this.resolveUsername(username);
+        const resolved = await this.resolveUsername(username);
         onWhatsapp.push(
           new OnWhatsAppDto(
             !!resolved,
@@ -3843,32 +3834,17 @@ export class WAStartupService {
    * (USyncContactProtocol.getUserElement -> `<contact username=".." pin=".."/>`), and
    * the reply's list node carries the resolved jid. Same shape as getLid() below.
    */
-  private async resolveUsername(
-    username: string,
-  ): Promise<{ jid?: string; raw: unknown[] }> {
+  private async resolveUsername(username: string): Promise<string | undefined> {
     const q = new USyncQuery()
       .withContactProtocol()
-      // Adds `<username/>` to the query element. Costs nothing and makes the reply
-      // echo the username back, which is the difference between "WhatsApp does not
-      // know this handle" and "we asked the wrong question".
-      .withUsernameProtocol()
       .withUser(new USyncUser().withUsername(username));
 
     const results = await this.client.executeUSyncQuery(q);
-    const list = (results?.list ?? []) as any[];
 
-    // Two reads, in order of confidence. `contact` is USyncContactProtocol's parse of
-    // `<contact type="in">`, which is the phone-lookup reachability flag; a username
-    // reply is not documented to reuse it, and parseUSyncQueryResult keeps entries
-    // whose parser returned `false` (it only drops `null`). So a `contact: false`
-    // entry can still carry a perfectly good jid in `id`, taken from the list node's
-    // own `jid` attr — hence the fallback rather than trusting the flag alone.
-    const confirmed = list.find((i) => !!i?.contact)?.id;
-    const anyJid = list.find(
-      (i) => typeof i?.id === 'string' && i.id.includes('@'),
-    )?.id;
-
-    return { jid: (confirmed ?? anyJid) as string | undefined, raw: list };
+    // `contact` is the parsed `<contact type="in">` flag — true means WhatsApp knows
+    // the username. `id` is what it resolved to, typically an @lid: a username exists
+    // precisely so the phone number stays hidden, so do not expect a PN back.
+    return results?.list?.find((i) => !!i?.contact)?.id as string | undefined;
   }
 
   public async getLid(...jids: string[]): Promise<{ id: string; lid: string }[]> {
