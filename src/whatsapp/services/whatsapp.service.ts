@@ -237,6 +237,16 @@ const parsedQuiet = Number.parseInt(process.env.MAX_RECONNECT_BEFORE_QUIET ?? ''
 const MAX_RECONNECT_BEFORE_QUIET =
   Number.isFinite(parsedQuiet) && parsedQuiet > 0 ? parsedQuiet : 3;
 
+// How long a socket must stay open before we treat the connection as recovered and
+// clear the backoff. Reaching 'open' is NOT recovery on its own: a stream:error
+// conflict/replaced flap reaches 'open' on every cycle, so resetting there pins
+// reconnectAttempts at 1 - backoffDelay never leaves its base and
+// MAX_RECONNECT_BEFORE_QUIET can never be reached. Only a connection that HOLDS is
+// evidence the cause is gone.
+const parsedStable = Number.parseInt(process.env.STABLE_CONNECTION_MS ?? '', 10);
+const STABLE_CONNECTION_MS =
+  Number.isFinite(parsedStable) && parsedStable > 0 ? parsedStable : 60_000;
+
 // Media downloads used to be a single axios.get with no timeout and no retry, so
 // one dropped socket permanently failed the message (and refunded the user's
 // credit). Node >= 19 defaults http(s).globalAgent to keepAlive:true: a socket
@@ -493,6 +503,7 @@ export class WAStartupService {
   private reconnecting = false;
   private reconnectAttempts = 0;
   private reconnectTimer?: ReturnType<typeof setTimeout>;
+  private stableTimer?: ReturnType<typeof setTimeout>;
   private prewarmActive = false;
   private rescanFlaggedAt = 0;
   private rescanAttempts = 0;
@@ -540,6 +551,12 @@ export class WAStartupService {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
+    }
+    // Cleared here too so teardown (clearListeners -> stopReconnect) cannot leave a
+    // timer holding this service alive. The 'open' path arms it *after* calling this.
+    if (this.stableTimer) {
+      clearTimeout(this.stableTimer);
+      this.stableTimer = undefined;
     }
     this.reconnecting = false;
   }
@@ -1004,8 +1021,18 @@ export class WAStartupService {
       // Successful connection — clear the backoff so the next unrelated drop
       // starts again from the base delay instead of an inflated one, and cancel
       // any pending reconnect timer (the live socket owns the loop now).
-      this.reconnectAttempts = 0;
       this.stopReconnect();
+      // Do NOT clear the backoff here. See STABLE_CONNECTION_MS: a conflict/replaced
+      // flap reaches 'open' every cycle, so an immediate reset holds reconnectAttempts
+      // at 1 forever - the delay stays at its ~3s base and the quiet threshold is
+      // unreachable, which is what turns a transient conflict into a permanent storm.
+      // Arm it instead, and only reset if the socket is still open when it fires.
+      this.stableTimer = setTimeout(() => {
+        this.stableTimer = undefined;
+        if (this.stateConnection.state === 'open') {
+          this.reconnectAttempts = 0;
+        }
+      }, STABLE_CONNECTION_MS);
       // Recovered — drop the re-scan gate so future drops reconnect normally.
       this.stateConnection.requiresRescan = false;
       this.rescanFlaggedAt = 0;
