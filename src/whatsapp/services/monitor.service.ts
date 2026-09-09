@@ -229,9 +229,40 @@ export class WAMonitoringService {
         () => {
           const ref = this.waInstances.get(instance);
           const info = ref?.getInstance();
-          if (info?.status.state !== 'open') {
-            this.waInstances.delete(instance);
+          const state = info?.status?.state;
+          // 'connecting' is as protected as 'open'. Evicting mid-handshake only drops the
+          // map entry - the socket keeps its own handles and stays alive, so it can still
+          // reach 'open' with nothing referencing it. A later ensureInstance then builds a
+          // second socket for the same creds, and WhatsApp resolves the tie with
+          // stream:error conflict/replaced, which both sides retry forever.
+          if (state === 'open' || state === 'connecting') {
+            // Not evicted, so re-arm. This timer is otherwise only set by addInstance, so
+            // without this an instance that happens to be busy at its first check is never
+            // reconsidered and stays resident for the life of the process.
+            this.delInstanceTime(instance);
+            return;
           }
+          // Release what the service owns before dropping the reference, or the socket and
+          // its timers outlive the map entry. Mirrors the 'remove.instance' teardown minus
+          // cleaningUp: eviction is a memory reclaim, NOT a logout. Session rows and the
+          // Instance row are untouched, and ensureInstance restores it on demand.
+          try {
+            // Before anything else: a pending reconnect would otherwise fire
+            // connectToWhatsapp after the entry is gone and resurrect an orphan.
+            ref?.stopReconnect?.();
+            ref?.disposePresence?.();
+            // Dropped before the socket closes so the resulting 'close' cannot reach a
+            // handler that schedules another reconnect.
+            ref?.client?.ev?.removeAllListeners('connection.update');
+            ref?.client?.ev?.flush();
+            ref?.client?.ws?.close();
+          } catch (error) {
+            this.logger.error(`evict-instance: teardown failed for "${instance}"`, error);
+          }
+          this.waInstances.delete(instance);
+          this.logger.info(
+            `instance "${instance}" evicted from memory (state=${state ?? 'unknown'})`,
+          );
           delete this.instanceDelTimeout[instance];
         },
         1000 * 60 * time,
