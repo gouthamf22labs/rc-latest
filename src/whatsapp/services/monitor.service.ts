@@ -243,23 +243,21 @@ export class WAMonitoringService {
             return;
           }
           // Release what the service owns before dropping the reference, or the socket and
-          // its timers outlive the map entry. Mirrors the 'remove.instance' teardown minus
-          // cleaningUp: eviction is a memory reclaim, NOT a logout. Session rows and the
-          // Instance row are untouched, and ensureInstance restores it on demand.
-          try {
-            // Before anything else: a pending reconnect would otherwise fire
-            // connectToWhatsapp after the entry is gone and resurrect an orphan.
-            ref?.stopReconnect?.();
-            ref?.disposePresence?.();
-            // Dropped before the socket closes so the resulting 'close' cannot reach a
-            // handler that schedules another reconnect.
-            ref?.client?.ev?.removeAllListeners('connection.update');
-            ref?.client?.ev?.flush();
-            ref?.client?.ws?.close();
-          } catch (error) {
-            this.logger.error(`evict-instance: teardown failed for "${instance}"`, error);
-          }
-          this.waInstances.delete(instance);
+          // its timers outlive the map entry. Eviction is a memory reclaim, NOT a logout:
+          // session rows and the Instance row are untouched, and ensureInstance restores
+          // the instance on demand.
+          //
+          // This MUST delegate to clearListeners rather than tear down by hand. That is the
+          // one place that closes the socket completely - ws.close() AND client.end(), plus
+          // every listener, not just connection.update. A ws.close() on its own can leave the
+          // socket half-alive, and once the map entry is gone clearListeners can never finish
+          // the job, so the orphan is permanent: a later restore then puts two sockets on the
+          // same creds and WhatsApp answers with conflict/replaced.
+          //
+          // clearListeners also calls stopReconnect first (a pending reconnect would otherwise
+          // fire connectToWhatsapp after the entry is gone) and deletes the map entry itself.
+          ref?.disposePresence?.();
+          this.clearListeners(instance);
           this.logger.info(
             `instance "${instance}" evicted from memory (state=${state ?? 'unknown'})`,
           );
