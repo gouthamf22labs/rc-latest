@@ -206,8 +206,20 @@ const parsedWebhookTimeout = Number.parseInt(process.env.WEBHOOK_TIMEOUT_MS ?? '
 const WEBHOOK_TIMEOUT_MS =
   Number.isFinite(parsedWebhookTimeout) && parsedWebhookTimeout > 0 ? parsedWebhookTimeout : 10_000;
 
-const webhookHttpAgent = new HttpAgent({ keepAlive: true, maxSockets: 32 });
-const webhookHttpsAgent = new HttpsAgent({ keepAlive: true, maxSockets: 32 });
+// The pool is process-wide, shared by every instance on this node — so it is not just a
+// per-instance burst bound, it is the point where one slow backend stalls the whole fleet.
+// At 32, a backend answering in ~1s lets ~32 posts/s through for *all* instances combined;
+// once 32 are in flight every other instance's webhooks queue behind them, sockets drop,
+// and the reconnects feed still more connectionUpdate posts into the same jam. Size it for
+// the fleet (roughly instances x expected posts/s x latency), not for one instance.
+const parsedWebhookMaxSockets = Number.parseInt(process.env.WEBHOOK_MAX_SOCKETS ?? '', 10);
+const WEBHOOK_MAX_SOCKETS =
+  Number.isFinite(parsedWebhookMaxSockets) && parsedWebhookMaxSockets > 0
+    ? parsedWebhookMaxSockets
+    : 256;
+
+const webhookHttpAgent = new HttpAgent({ keepAlive: true, maxSockets: WEBHOOK_MAX_SOCKETS });
+const webhookHttpsAgent = new HttpsAgent({ keepAlive: true, maxSockets: WEBHOOK_MAX_SOCKETS });
 
 const WEBHOOK_POST_CONFIG = {
   timeout: WEBHOOK_TIMEOUT_MS,
@@ -1300,6 +1312,14 @@ export class WAStartupService {
 
   private readonly chatHandle = {
     'chats.upsert': async (chats: Chat[]) => {
+      // Collected across the loop and posted once at the end. A history sync hands us
+      // every followed newsletter in a single chats.upsert, and one awaited POST per
+      // channel put hundreds of undeduped entries into the backend's per-instance
+      // ordered lane, where connectionUpdate for other instances queues behind them.
+      // The backend has always normalised this event with `Array.isArray(data) ? data
+      // : [data]`, so a batch is accepted by old and new consumers alike.
+      const channelPayloads: { remoteJid: string; metadata: any }[] = [];
+
       for (const chat of chats) {
         try {
           let item: any = { ...chat };
@@ -1375,13 +1395,22 @@ export class WAStartupService {
             const metadata = this.normalizeNewsletterMeta(item)
               ? item
               : (this.normalizeNewsletterMeta(stored as any) ? stored : item);
-            const channelPayload = { remoteJid: chat.id, metadata };
-            this.ws.send(this.instance.name, 'channel.upsert', channelPayload);
-            await this.sendDataWebhook('channelUpsert', channelPayload);
+            // The local websocket hub stays per-channel and keeps the full blob: it is
+            // an in-process emit with no queue behind it, so it costs nothing to send,
+            // and its subscribers expect one event per channel.
+            this.ws.send(this.instance.name, 'channel.upsert', { remoteJid: chat.id, metadata });
+            channelPayloads.push({
+              remoteJid: chat.id,
+              metadata: this.trimNewsletterMetaForWebhook(metadata),
+            });
           }
         } catch (error) {
           this.logger.error(error);
         }
+      }
+
+      if (channelPayloads.length) {
+        await this.sendDataWebhook('channelUpsert', channelPayloads);
       }
     },
 
@@ -1561,16 +1590,20 @@ export class WAStartupService {
         where: { id: existing.id },
         data: { content: meta as any },
       });
-      const channelPayload = { remoteJid: jid, metadata: meta };
-      this.ws.send(this.instance.name, 'channel.update', channelPayload);
-      await this.sendDataWebhook('channelUpdated', channelPayload);
+      this.ws.send(this.instance.name, 'channel.update', { remoteJid: jid, metadata: meta });
+      await this.sendDataWebhook('channelUpdated', {
+        remoteJid: jid,
+        metadata: this.trimNewsletterMetaForWebhook(meta),
+      });
     } else {
       await this.repository.chat.create({
         data: { remoteJid: jid, instanceId: this.instance.id, content: meta as any },
       });
-      const channelPayload = { remoteJid: jid, metadata: meta };
-      this.ws.send(this.instance.name, 'channel.upsert', channelPayload);
-      await this.sendDataWebhook('channelUpsert', channelPayload);
+      this.ws.send(this.instance.name, 'channel.upsert', { remoteJid: jid, metadata: meta });
+      await this.sendDataWebhook('channelUpsert', {
+        remoteJid: jid,
+        metadata: this.trimNewsletterMetaForWebhook(meta),
+      });
     }
   }
 
@@ -1961,9 +1994,11 @@ export class WAStartupService {
             await this.repository.chat.create({
               data: { remoteJid: jid, instanceId: this.instance.id, content: content ?? undefined },
             });
-            const channelPayload = { remoteJid: jid, metadata: content };
-            this.ws.send(this.instance.name, 'channel.upsert', channelPayload);
-            await this.sendDataWebhook('channelUpsert', channelPayload);
+            this.ws.send(this.instance.name, 'channel.upsert', { remoteJid: jid, metadata: content });
+            await this.sendDataWebhook('channelUpsert', {
+              remoteJid: jid,
+              metadata: this.trimNewsletterMetaForWebhook(content),
+            });
             this.logger.info(`newsletter joined/created from phone saved: ${jid}`);
           }
         }
@@ -4179,6 +4214,50 @@ export class WAStartupService {
     }
 
     return meta;
+  }
+
+  /**
+   * Strip a newsletter metadata blob down to the fields a webhook consumer reads.
+   *
+   * WhatsApp's newsletterMetadata response is mostly ballast for us: `preview` and
+   * `picture` carry long direct_path strings, and `creation_time`, `handle`, `state`,
+   * `mute`, and the `id`/`update_time` stamps on every name and description are never
+   * looked at downstream. On a history sync that blob arrives once per followed
+   * channel and is then JSON-stringified into Redis and parsed back out, so the waste
+   * is paid several times over.
+   *
+   * The nested shape is kept exactly as-is rather than flattened. Consumers read
+   * `thread_metadata.description.text`, `thread_metadata.subscribers_count`,
+   * `thread_metadata.picture.direct_path`, `thread_metadata.verification` and
+   * `thread_metadata.invite` with no flat fallback, so flattening here (the shape
+   * `normalizeNewsletterMeta` produces for the fetchChannels REST response) would
+   * silently blank those columns. Same shape, fewer keys, so old and new consumers
+   * both keep working and this can deploy in either order.
+   */
+  private trimNewsletterMetaForWebhook(meta: any) {
+    // Already flat, from parseNewsletterCreateResponse / createChannel. Nothing to
+    // trim, and the flat keys are the ones a consumer falls back to.
+    if (!meta || typeof meta !== 'object' || typeof meta.name === 'string') return meta;
+
+    const tm = meta.thread_metadata;
+    if (!tm) return meta;
+
+    const thread_metadata: Record<string, any> = {};
+    if (tm.name?.text != null) thread_metadata.name = { text: tm.name.text };
+    if (tm.description?.text != null) thread_metadata.description = { text: tm.description.text };
+    if (tm.subscribers_count != null) thread_metadata.subscribers_count = tm.subscribers_count;
+    if (tm.picture?.direct_path != null) thread_metadata.picture = { direct_path: tm.picture.direct_path };
+    if (tm.verification != null) thread_metadata.verification = tm.verification;
+    if (tm.invite != null) thread_metadata.invite = tm.invite;
+
+    const trimmed: Record<string, any> = { thread_metadata };
+    // The only viewer_metadata field anyone reads. Dropping it does not error, it
+    // makes every channel look role-less, which downstream treats as postable — a
+    // silent permissions change rather than a visible failure. Always carry it.
+    const role = meta.viewer_metadata?.role ?? meta.role;
+    if (role != null) trimmed.viewer_metadata = { role };
+
+    return trimmed;
   }
 
   private normalizeNewsletterMeta(meta: any) {
