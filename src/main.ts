@@ -72,10 +72,64 @@ export async function bootstrap() {
 
 bootstrap();
 
-process.on('SIGINT', async () => {
-  context.get('module:provider').onModuleDestroy();
-  context.get('module:repository').onModuleDestroy();
-  context.get('module:logger').warn('APP MODULE - OFF');
-  context.get('server:logger').warn('HTTP - OFF');
+/**
+ * Graceful shutdown.
+ *
+ * SIGTERM is the signal that actually matters: it is what Docker and the process manager
+ * send on a deploy, and it was not handled at all — only SIGINT was. So every deploy
+ * killed the container with its WhatsApp sockets still connected, the replacement
+ * reconnected the same credentials, and WhatsApp resolved the overlap by terminating the
+ * older connections with `conflict: replaced` — ~60 instances inside eight seconds,
+ * each alerting its user and each leaking the signal repo of the socket it churned.
+ *
+ * Closing the sockets first turns that into a handover. It is not a logout: sockets are
+ * closed, credentials are left alone, and the replacement restores from them.
+ *
+ * Bounded, and exits by itself. A handler that only stops work would leave the process
+ * alive — registering one suppresses Node's default exit-on-signal — so it would be
+ * SIGKILLed mid-drain, which is the outage this exists to avoid.
+ */
+const SHUTDOWN_DEADLINE_MS = Number.parseInt(process.env.SHUTDOWN_DEADLINE_MS ?? '', 10) || 10_000;
+// A close frame still has to reach WhatsApp after ws.close() returns; exiting in the same
+// tick would drop it and leave the socket live on their side, which is the very overlap
+// being avoided here.
+const SOCKET_FLUSH_MS = Number.parseInt(process.env.SHUTDOWN_FLUSH_MS ?? '', 10) || 500;
+
+let shuttingDown = false;
+
+async function onShutdownSignal(signal: string) {
+  // Deploys can deliver SIGTERM then SIGKILL, and a stuck drain can see two signals.
+  if (shuttingDown) {
+    return;
+  }
+  shuttingDown = true;
+
+  // Hard ceiling, armed before any awaiting: whatever happens below, this process exits
+  // well inside the orchestrator's grace period rather than being killed mid-drain.
+  const deadline = setTimeout(() => process.exit(0), SHUTDOWN_DEADLINE_MS);
+  deadline.unref();
+
+  try {
+    context.get('server:logger')?.warn(`${signal} received - draining`);
+    const closed = context.get('module:monitor')?.shutdown?.() ?? 0;
+    context.get('server:logger')?.warn(`closed ${closed} whatsapp socket(s)`);
+    await new Promise((resolve) => setTimeout(resolve, SOCKET_FLUSH_MS));
+  } catch (error) {
+    context.get('server:logger')?.error(['shutdown drain failed', error]);
+  }
+
+  try {
+    context.get('module:provider')?.onModuleDestroy();
+    context.get('module:repository')?.onModuleDestroy();
+    context.get('module:logger')?.warn('APP MODULE - OFF');
+    context.get('server:logger')?.warn('HTTP - OFF');
+  } catch {
+    /* never let teardown logging hold the exit */
+  }
+
+  clearTimeout(deadline);
   process.exit(0);
-});
+}
+
+process.on('SIGTERM', () => void onShutdownSignal('SIGTERM'));
+process.on('SIGINT', () => void onShutdownSignal('SIGINT'));

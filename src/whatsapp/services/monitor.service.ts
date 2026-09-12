@@ -196,6 +196,45 @@ export class WAMonitoringService {
     }
   }
 
+  /**
+   * Close every live socket before the process exits.
+   *
+   * Without this, a deploy is a fleet-wide outage in miniature. The container is killed
+   * with its sockets still connected to WhatsApp, the replacement boots and reconnects
+   * the same credentials, and WhatsApp resolves the overlap the only way it can — by
+   * terminating the older connection with `conflict: replaced`. Observed in production
+   * as ~60 instances taking a 440 within eight seconds of a deploy, each one alerting
+   * the user as "WhatsApp opened on another device" and each one churning a socket whose
+   * WASM signal repo the arena never returns to the OS.
+   *
+   * Closing first means the old process hands over instead of being replaced: no 440,
+   * no alert, no churn.
+   *
+   * This is NOT a logout. clearListeners calls ws.close() and client.end(); it never
+   * calls client.logout(), and it does not touch Session, Auth or Instance rows. The
+   * credentials survive, the replacement restores from them, and nobody re-scans a QR.
+   *
+   * Returns how many sockets were closed so the caller can log it.
+   */
+  public shutdown(): number {
+    // Stop anything that could open a *new* socket while we are closing the old ones.
+    this.stopReconnectSweep();
+    for (const timer of Object.values(this.instanceDelTimeout)) {
+      clearTimeout(timer as NodeJS.Timeout);
+    }
+
+    // Snapshot first: clearListeners deletes from the map it is iterating.
+    const names = [...this.waInstances.keys()];
+    for (const name of names) {
+      try {
+        this.clearListeners(name);
+      } catch {
+        /* best-effort: one bad socket must not strand the rest */
+      }
+    }
+    return names.length;
+  }
+
   private readonly db: Partial<Database> = {};
 
   private readonly logger: Logger;

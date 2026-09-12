@@ -228,5 +228,7 @@ export async function AppModule(context: Map<string, any>) {
   context.set('module:logger', logger);
   context.set('module:repository', repository);
   context.set('module:provider', providerFiles);
+  // Exposed so the shutdown handler in main.ts can close every socket before exit.
+  context.set('module:monitor', waMonitor);
   context.set('module:config', configService);
 }
