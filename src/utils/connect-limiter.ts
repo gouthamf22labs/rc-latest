@@ -12,7 +12,7 @@
  * WASM high-water mark stays bounded. It is process-global (shared across every
  * instance) on purpose. Tune via CONNECT_CONCURRENCY (default 5).
  */
-class Semaphore {
+export class Semaphore {
   private queue: Array<() => void> = [];
   private active = 0;
 

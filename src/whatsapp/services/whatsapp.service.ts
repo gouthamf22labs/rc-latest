@@ -169,7 +169,8 @@ import { getJidUser, getUserGroup } from '../../utils/extract-id';
 import { getObjectUrl } from '../../integrations/minio/minio.utils';
 import { encodeProps } from '../../utils/encode.props';
 import { backoffDelay } from '../../utils/reconnect-backoff';
-import { connectLimiter } from '../../utils/connect-limiter';
+import { connectLimiter, Semaphore } from '../../utils/connect-limiter';
+import { yieldToLoop } from '../../utils/yield-to-loop';
 import { socketLease } from '../../utils/socket-lease';
 import { PresenceWatcher, PresenceSnapshot } from './presence.service';
 // Not re-exported from the package root, but the package publishes no `exports`
@@ -229,6 +230,21 @@ const WEBHOOK_POST_CONFIG = {
   maxContentLength: 64 * 1024,
   maxRedirects: 0,
 } as const;
+
+// The largest accounts sit in 1,000+ groups with 80k+ participants. Passes over their group
+// payloads yield to the event loop at these intervals, so one account's groups cannot stall
+// every other request for seconds. What the passes produce is unchanged.
+const GROUP_YIELD_EVERY_GROUPS = 50;
+const GROUP_YIELD_EVERY_PARTICIPANTS = 5000;
+// Must equal BULK_ROSTER_SYNC_GROUPS in wa-send-later-be src/common/utils/groupWebhookPayload.ts.
+const BULK_ROSTER_SYNC_GROUPS = 25;
+const parsedGroupFetchConcurrency = Number.parseInt(process.env.GROUP_FETCH_CONCURRENCY ?? '', 10);
+// Process-wide cap on accounts building a full group list at once (see fetchAllGroups).
+const groupFetchLimiter = new Semaphore(
+  Number.isFinite(parsedGroupFetchConcurrency) && parsedGroupFetchConcurrency > 0
+    ? parsedGroupFetchConcurrency
+    : 2,
+);
 
 const parsedRescanCooldown = Number.parseInt(process.env.RESCAN_COOLDOWN_MS ?? '', 10);
 const RESCAN_COOLDOWN_MS =
@@ -1964,15 +1980,11 @@ export class WAStartupService {
 
   private readonly groupHandler = {
     'groups.upsert': (groupMetadata: GroupMetadata[]) => {
-      const payload = this.annotateGroupRights(groupMetadata);
-      this.ws.send(this.instance.name, 'groups.upsert', payload);
-      this.sendDataWebhook('groupsUpsert', payload);
+      void this.emitGroupEvent('groups.upsert', 'groupsUpsert', groupMetadata);
     },
 
     'groups.update': (groupMetadataUpdate: Partial<GroupMetadata>[]) => {
-      const payload = this.annotateGroupRights(groupMetadataUpdate);
-      this.ws.send(this.instance.name, 'groups.update', payload);
-      this.sendDataWebhook('groupsUpdated', payload);
+      void this.emitGroupEvent('groups.update', 'groupsUpdated', groupMetadataUpdate);
     },
 
     'group-participants.update': (participantsUpdate: {
@@ -3513,6 +3525,72 @@ export class WAStartupService {
     });
   }
 
+  /**
+   * groups.upsert / groups.update, annotated and forwarded.
+   *
+   * Baileys emits the account's complete group list as a groups.update after every
+   * groupFetchAllParticipating — each fetchAllGroups call, and every dirty-groups notification
+   * WhatsApp sends on its own. Forwarding that inline re-annotated and serialised every group
+   * with every participant in one blocking pass. Two changes, neither altering what any
+   * consumer ends up with:
+   *
+   * - A large list is annotated in slices with event-loop yields between them. Lists of at most
+   *   GROUP_YIELD_EVERY_GROUPS keep the old synchronous path, so ordinary partial updates
+   *   (a rename, an announce toggle) are forwarded exactly as before.
+   * - The webhook omits rosters for a bulk list. See withoutBulkRosters.
+   *
+   * The local websocket hub still gets the full annotated list; it serialises nothing when no
+   * client is subscribed.
+   */
+  private async emitGroupEvent(
+    event: 'groups.upsert' | 'groups.update',
+    webhookEvent: WebhookEventsType,
+    groups: Partial<GroupMetadata>[],
+  ) {
+    if (!Array.isArray(groups) || groups.length <= GROUP_YIELD_EVERY_GROUPS) {
+      const payload = this.annotateGroupRights(groups);
+      this.ws.send(this.instance.name, event, payload);
+      this.sendDataWebhook(webhookEvent, this.withoutBulkRosters(payload));
+      return;
+    }
+    try {
+      const annotated: Partial<GroupMetadata>[] = [];
+      for (let i = 0; i < groups.length; i += GROUP_YIELD_EVERY_GROUPS) {
+        annotated.push(...this.annotateGroupRights(groups.slice(i, i + GROUP_YIELD_EVERY_GROUPS)));
+        await yieldToLoop();
+      }
+      this.ws.send(this.instance.name, event, annotated);
+      await this.sendDataWebhook(webhookEvent, this.withoutBulkRosters(annotated));
+    } catch (error) {
+      this.logger.error(error);
+    }
+  }
+
+  /**
+   * The group webhook payload with participants removed when it is a bulk sync.
+   *
+   * wa-send-later-be (buildGroupWebhookEntries) treats a groups.upsert/groups.update in which
+   * more than BULK_ROSTER_SYNC_GROUPS groups carry a participants array as a history replay and
+   * drops every roster before storing anything. Sending those megabytes only for the backend to
+   * discard them cost a full serialisation here and a multi-megabyte POST. Without them the same
+   * groups produce the same stored entries there — no roster either way — because the backend
+   * reads is_member/is_admin from the flags annotated above, not from the roster.
+   *
+   * The count mirrors the backend's exactly: groups with an id and a participants array. Keep the
+   * two in step; payloads at or under the threshold are sent untouched, rosters included.
+   */
+  private withoutBulkRosters<T extends Partial<GroupMetadata>>(groups: T[]): T[] {
+    if (!Array.isArray(groups)) return groups;
+    const rostered = groups.filter((g) => g?.id && Array.isArray(g.participants)).length;
+    if (rostered <= BULK_ROSTER_SYNC_GROUPS) return groups;
+    return groups.map((g) => {
+      if (!g || !('participants' in g)) return g;
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { participants, ...rest } = g;
+      return rest as T;
+    });
+  }
+
   /** True when a group participant entry refers to this instance. */
   private isSelfParticipant(participant: any): boolean {
     const ids = this.selfIds;
@@ -3523,7 +3601,37 @@ export class WAStartupService {
       .some((v) => ids.has(bare(v)));
   }
 
-  public async fetchAllGroups() {
+  /**
+   * Every group the account is in, with every participant, named.
+   *
+   * For the largest accounts building this blocked the event loop for seconds at a time, and the
+   * backend asks for it on a cadence, so every other request queued behind it. The result is
+   * unchanged; three things change how it is produced:
+   *
+   * - Concurrent callers for the same instance share one in-flight fetch rather than each
+   *   asking WhatsApp for, and building, the same list.
+   * - At most GROUP_FETCH_CONCURRENCY accounts (default 2) build at once, process-wide.
+   * - The build yields to the event loop every GROUP_YIELD_EVERY_PARTICIPANTS participants.
+   */
+  public fetchAllGroups(): Promise<any> {
+    if (!this.allGroupsInFlight) {
+      this.allGroupsInFlight = (async () => {
+        await groupFetchLimiter.acquire();
+        try {
+          return await this.buildAllGroups();
+        } finally {
+          groupFetchLimiter.release();
+        }
+      })().finally(() => {
+        this.allGroupsInFlight = undefined;
+      });
+    }
+    return this.allGroupsInFlight;
+  }
+
+  private allGroupsInFlight?: Promise<any>;
+
+  private async buildAllGroups() {
     try {
       const groups = await this.client.groupFetchAllParticipating();
       const groupList = Object.values(groups).filter((g) => g?.id);
@@ -3534,7 +3642,9 @@ export class WAStartupService {
       });
       const nameMap = new Map(contacts.map((c) => [c.remoteJid, c.pushName]));
 
-      return groupList.map((g) => {
+      const result = [];
+      let sinceYield = 0;
+      for (const g of groupList) {
         const participants = g.participants.map((p) => {
           const jid = (p as any).phoneNumber ?? p.id;
           const inMemory = (this.client as any).contacts?.[jid];
@@ -3549,15 +3659,22 @@ export class WAStartupService {
         // the group uses. See isSelfParticipant.
         const self = participants.find((p) => this.isSelfParticipant(p));
 
-        return {
+        result.push({
           ...g,
           participants,
           // Posting rights, for consumers to combine: canSend = isMember && (!announce || isAdmin).
           // admin is 'admin' | 'superadmin' | null — both admin kinds may post to announce groups.
           isMember: !!self,
           isAdmin: !!self?.admin,
-        };
-      });
+        });
+
+        sinceYield += participants.length;
+        if (sinceYield >= GROUP_YIELD_EVERY_PARTICIPANTS) {
+          sinceYield = 0;
+          await yieldToLoop();
+        }
+      }
+      return result;
     } catch (error) {
       // groupFetchAllParticipating can fail when a deleted group remains in the Baileys
       // socket's in-memory state. Return empty list instead of 500 so the caller is not

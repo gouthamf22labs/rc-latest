@@ -35,6 +35,7 @@
  */
 
 import compression from 'compression';
+import { sendJsonChunked } from '../../utils/json-stream';
 import { RequestHandler, Router } from 'express';
 import {
   createGroupSchema,
@@ -136,7 +137,9 @@ export function GroupRouter(
         execute: (instance) => groupController.fetchAllGroups(instance),
       });
 
-      res.status(HttpStatus.OK).json(response);
+      // Streamed in slices: for the largest accounts this array is tens of MB of JSON, and a
+      // single res.json() serialises all of it in one blocking pass. Same bytes either way.
+      await sendJsonChunked(res, HttpStatus.OK, response);
     })
     .delete(routerPath('leaveGroup'), ...guards, async (req, res) => {
       const response = await groupValidate<GroupJid>({

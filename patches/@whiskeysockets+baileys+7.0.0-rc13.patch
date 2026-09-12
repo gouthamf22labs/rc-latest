@@ -21,10 +21,30 @@ index 9a7947f..0063450 100644
          return privacySettings;
      };
 diff --git a/node_modules/@whiskeysockets/baileys/lib/Socket/groups.js b/node_modules/@whiskeysockets/baileys/lib/Socket/groups.js
-index df19870..992e0fd 100644
+index df19870..c940516 100644
 --- a/node_modules/@whiskeysockets/baileys/lib/Socket/groups.js
 +++ b/node_modules/@whiskeysockets/baileys/lib/Socket/groups.js
-@@ -61,8 +61,13 @@ export const makeGroupsSocket = (config) => {
+@@ -43,6 +43,7 @@ export const makeGroupsSocket = (config) => {
+         const groupsChild = getBinaryNodeChild(result, 'groups');
+         if (groupsChild) {
+             const groups = getBinaryNodeChildren(groupsChild, 'group');
++            let extracted = 0;
+             for (const groupNode of groups) {
+                 const meta = extractGroupMetadata({
+                     tag: 'result',
+@@ -50,6 +51,11 @@ export const makeGroupsSocket = (config) => {
+                     content: [groupNode]
+                 });
+                 data[meta.id] = meta;
++                // rc-latest: accounts in 1,000+ groups made this loop block the event loop for
++                // seconds. Yield every 50 groups so other work runs in between; data is unchanged.
++                if (++extracted % 50 === 0) {
++                    await new Promise((resolve) => setImmediate(resolve));
++                }
+             }
+         }
+         // TODO: properly parse LID / PN DATA
+@@ -61,8 +67,13 @@ export const makeGroupsSocket = (config) => {
          if (attrs.type !== 'groups') {
              return;
          }
