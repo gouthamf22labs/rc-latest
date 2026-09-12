@@ -246,6 +246,21 @@ const groupFetchLimiter = new Semaphore(
     : 2,
 );
 
+/**
+ * A plain-JSON copy of a Baileys object, for a Prisma Json column.
+ *
+ * Baileys hands over protobuf-decoded objects: 64-bit fields are long.js `Long` instances whose
+ * methods (toInt, toNumber, ...) are enumerable on the prototype, and Prisma's Json validation walks
+ * them with for..in and rejects the whole write — "Invalid value for argument `toInt`: We could not
+ * serialize [object Function] value". Every chat and message in a history sync carries such a
+ * timestamp, so none of them were ever stored. messages.upsert has always saved through this same
+ * round-trip; this gives the other writes the identical stored shape (a Long becomes
+ * {low, high, unsigned}, a Buffer {type, data}), which is also exactly what the webhooks already
+ * put on the wire when they serialise the same objects.
+ */
+const toJsonValue = (value: unknown): PrismType.Prisma.JsonValue =>
+  value === undefined ? null : JSON.parse(JSON.stringify(value));
+
 const parsedRescanCooldown = Number.parseInt(process.env.RESCAN_COOLDOWN_MS ?? '', 10);
 const RESCAN_COOLDOWN_MS =
   Number.isFinite(parsedRescanCooldown) && parsedRescanCooldown > 0
@@ -1533,7 +1548,7 @@ export class WAStartupService {
             const create = await this.repository.chat.create({
               data: {
                 remoteJid: chat.id,
-                content: item as any,
+                content: toJsonValue(item) as any,
                 instanceId: this.instance.id,
               },
             });
@@ -1562,7 +1577,7 @@ export class WAStartupService {
                   id: find.id,
                 },
                 data: {
-                  content: item as any,
+                  content: toJsonValue(item) as any,
                   updatedAt: new Date(),
                 },
               });
@@ -1616,7 +1631,7 @@ export class WAStartupService {
         return {
           remoteJid: chat.id,
           instanceId: this.instance.id,
-          content: item,
+          content: toJsonValue(item),
         } as PrismType.Chat;
       });
       this.ws.send(this.instance.name, 'chats.update', chatsRaw);
@@ -1812,7 +1827,7 @@ export class WAStartupService {
           return {
             remoteJid: id,
             instanceId: this.instance.id,
-            content: item,
+            content: toJsonValue(item),
           } as PrismType.Chat;
         });
         await this.sendDataWebhook('chatsSet', chatsRaw);
@@ -1846,7 +1861,7 @@ export class WAStartupService {
             keyParticipant: group?.jid,
             keyParticipantLid: group?.lid,
             messageType,
-            content: m.message[messageType] as PrismType.Prisma.JsonValue,
+            content: toJsonValue(m.message[messageType]),
             messageTimestamp: timestamp,
             instanceId: this.instance.id,
             device: getDevice(m.key.id),
