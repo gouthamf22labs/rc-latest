@@ -276,6 +276,15 @@ const parsedStable = Number.parseInt(process.env.STABLE_CONNECTION_MS ?? '', 10)
 const STABLE_CONNECTION_MS =
   Number.isFinite(parsedStable) && parsedStable > 0 ? parsedStable : 60_000;
 
+// After a QR scan WhatsApp always ends the stream with 515 restartRequired, and the new
+// credentials only work on a fresh socket. That restart is part of pairing, not a failure,
+// so it reconnects immediately instead of through the jittered backoff (which cost every
+// scan 2-4s). A 515 repeating inside this window is treated as a real fault and falls back
+// to the normal backoff, so a server that keeps answering 515 cannot drive a tight loop.
+const parsedRestartWindow = Number.parseInt(process.env.RESTART_REQUIRED_FAST_WINDOW_MS ?? '', 10);
+const RESTART_REQUIRED_FAST_WINDOW_MS =
+  Number.isFinite(parsedRestartWindow) && parsedRestartWindow > 0 ? parsedRestartWindow : 30_000;
+
 // Media downloads used to be a single axios.get with no timeout and no retry, so
 // one dropped socket permanently failed the message (and refunded the user's
 // credit). Node >= 19 defaults http(s).globalAgent to keepAlive:true: a socket
@@ -530,6 +539,10 @@ export class WAStartupService {
   private authStateProvider: AuthStateProvider;
   private phoneNumber: string;
   private reconnecting = false;
+  // When the last immediate restart-required reconnect ran; see RESTART_REQUIRED_FAST_WINDOW_MS.
+  private lastRestartReconnectAt = 0;
+  // Timestamps of the connect attempt in progress, logged when it reaches 'open'.
+  private connectTiming?: { startedAt: number; authMs?: number; socketMs?: number };
   private reconnectAttempts = 0;
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private stableTimer?: ReturnType<typeof setTimeout>;
@@ -546,16 +559,19 @@ export class WAStartupService {
    * closed with no pending retry. The timer handle is stored so a removed
    * instance can cancel it (stopReconnect) instead of resurrecting itself.
    */
-  private scheduleReconnect() {
+  private scheduleReconnect(opts: { immediate?: boolean } = {}) {
     if (this.reconnecting) return;
     this.reconnecting = true;
     // Jittered exponential backoff de-synchronizes instances that all dropped
     // together, so retries don't hammer WhatsApp in lockstep waves (the lockstep
     // is what earns repeated 428 connectionClosed).
-    const delay = backoffDelay(this.reconnectAttempts);
-    this.reconnectAttempts++;
+    // An immediate reconnect is not a failed attempt, so it neither waits nor grows the backoff.
+    const delay = opts.immediate ? 0 : backoffDelay(this.reconnectAttempts);
+    if (!opts.immediate) this.reconnectAttempts++;
     this.logger.info(
-      `reconnect scheduled in ${delay}ms (attempt ${this.reconnectAttempts})`,
+      opts.immediate
+        ? 'reconnecting immediately after restart-required (515)'
+        : `reconnect scheduled in ${delay}ms (attempt ${this.reconnectAttempts})`,
     );
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = setTimeout(async () => {
@@ -1097,9 +1113,18 @@ export class WAStartupService {
         // we're here), so we simply stop. A fresh /instance/connect starts a
         // new QR session on demand. restartRequired is handled by the else.
         this.logger.info('unpaired instance closed - not reconnecting');
+      } else if (
+        isRestartRequired &&
+        Date.now() - this.lastRestartReconnectAt > RESTART_REQUIRED_FAST_WINDOW_MS
+      ) {
+        // Post-scan (or server-requested) stream restart: reconnect now. See
+        // RESTART_REQUIRED_FAST_WINDOW_MS for why a repeat goes through the backoff below.
+        this.lastRestartReconnectAt = Date.now();
+        this.scheduleReconnect({ immediate: true });
       } else {
-        // Paired instance OR post-scan restartRequired → continuous self-healing
-        // reconnect (jittered backoff, reschedules itself if an attempt throws).
+        // Paired instance, or a restartRequired repeating inside the fast window →
+        // continuous self-healing reconnect (jittered backoff, reschedules itself if
+        // an attempt throws).
         this.scheduleReconnect();
       }
     }
@@ -1125,19 +1150,43 @@ export class WAStartupService {
       this.rescanFlaggedAt = 0;
       this.rescanAttempts = 0;
       this.instance.ownerJid = this.client.user.id.replace(/:\d+/, '');
-      this.instance.profilePicUrl = (
-        await this.profilePicture(this.instance.ownerJid)
-      ).profilePictureUrl;
       this.instance.connectionStatus = 'ONLINE';
 
+      const timing = this.connectTiming;
+      this.connectTiming = undefined;
+      if (timing) {
+        this.logger.info(
+          `connection open ${Date.now() - timing.startedAt}ms after connect started ` +
+            `(auth state loaded at ${timing.authMs ?? '?'}ms, socket built at ${timing.socketMs ?? '?'}ms)`,
+        );
+      }
+
+      // ONLINE and the owner are persisted the moment the socket opens. The profile picture used
+      // to be awaited first — a WhatsApp round trip — which held back this write (what codechat's
+      // fetchInstances reports) and everything below it, on every connect including right after a
+      // QR scan. Nothing waits on the picture, so it is fetched alongside and saved when it lands.
       this.repository.instance
         .update({
           where: { id: this.instance.id },
           data: {
             ownerJid: this.instance.ownerJid,
-            profilePicUrl: this.instance.profilePicUrl,
             connectionStatus: this.instance.connectionStatus,
           },
+        })
+        .catch((err) => this.logger.error(err));
+
+      const socketAtOpen = this.client;
+      const pictureStartedAt = Date.now();
+      this.profilePicture(this.instance.ownerJid)
+        .then(({ profilePictureUrl }) => {
+          // A newer socket owns the instance now; its own 'open' fetches and saves the picture.
+          if (this.client !== socketAtOpen) return;
+          this.instance.profilePicUrl = profilePictureUrl;
+          this.logger.debug(`profile picture fetched in ${Date.now() - pictureStartedAt}ms`);
+          return this.repository.instance.update({
+            where: { id: this.instance.id },
+            data: { profilePicUrl: profilePictureUrl },
+          });
         })
         .catch((err) => this.logger.error(err));
 
@@ -1214,6 +1263,7 @@ export class WAStartupService {
     this.endSession = false;
 
     this.authState = await this.defineAuthState();
+    if (this.connectTiming) this.connectTiming.authMs = Date.now() - this.connectTiming.startedAt;
 
     const { version } = fetchLatestBaileysVersionV2();
     const session = this.configService.get<ConfigSessionPhone>('CONFIG_SESSION_PHONE');
@@ -1260,7 +1310,9 @@ export class WAStartupService {
       transactionOpts: { maxCommitRetries: 5, delayBetweenTriesMs: 50 },
     };
 
-    return makeWASocket(socketConfig);
+    const socket = makeWASocket(socketConfig);
+    if (this.connectTiming) this.connectTiming.socketMs = Date.now() - this.connectTiming.startedAt;
+    return socket;
   }
 
   public async reloadConnection(): Promise<WASocket> {
@@ -1296,6 +1348,7 @@ export class WAStartupService {
       return this.client;
     }
     this.stateConnection.state = 'connecting';
+    this.connectTiming = { startedAt: Date.now() };
 
     try {
       // Tear down any existing socket first. Two live sockets on the same
