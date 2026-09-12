@@ -111,9 +111,14 @@ async function onShutdownSignal(signal: string) {
 
   try {
     context.get('server:logger')?.warn(`${signal} received - draining`);
+    // Before the drain: a reconnect timer firing mid-drain must not open a new socket.
+    context.get('module:socketLease')?.close?.();
     const closed = context.get('module:monitor')?.shutdown?.() ?? 0;
     context.get('server:logger')?.warn(`closed ${closed} whatsapp socket(s)`);
     await new Promise((resolve) => setTimeout(resolve, SOCKET_FLUSH_MS));
+    // Sockets are closed and flushed, so the successor can take over now instead of
+    // waiting out the lease TTL.
+    await context.get('module:socketLease')?.release?.();
   } catch (error) {
     context.get('server:logger')?.error(['shutdown drain failed', error]);
   }

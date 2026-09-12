@@ -73,6 +73,7 @@ import { ProviderFiles } from './provider/sessions';
 import { Websocket } from './websocket/server';
 import { createServer } from 'http';
 import { RequestIdMiddleware } from './middle/req-id.middle';
+import { socketLease } from './utils/socket-lease';
 
 export function describeRoutes(
   rootPath: string,
@@ -118,6 +119,10 @@ export async function AppModule(context: Map<string, any>) {
   const repository = new Repository(configService);
   await repository.onModuleInit();
   logger.info('repository:on');
+
+  // Before WAMonitoringService exists, so nothing can open a socket ahead of it.
+  // loadInstance() below then waits inside connectToWhatsapp until the lease is won.
+  socketLease.start(repository, logger.setCtx('socket-lease'));
 
   const wss = new Websocket(configService);
   wss.server(server);
@@ -230,5 +235,6 @@ export async function AppModule(context: Map<string, any>) {
   context.set('module:provider', providerFiles);
   // Exposed so the shutdown handler in main.ts can close every socket before exit.
   context.set('module:monitor', waMonitor);
+  context.set('module:socketLease', socketLease);
   context.set('module:config', configService);
 }

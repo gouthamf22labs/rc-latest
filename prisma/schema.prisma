@@ -190,3 +190,10 @@ model Session {
   @@unique([instanceId, sessionKey])
   @@index([instanceId])
 }
+
+/// Which codechat process may hold WhatsApp sockets. See src/utils/socket-lease.ts.
+model SocketLease {
+  id        String   @id @db.VarChar(64)
+  owner     String   @db.VarChar(200)
+  expiresAt DateTime @db.Timestamptz(3)
+}

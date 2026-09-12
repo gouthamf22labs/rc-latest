@@ -170,6 +170,7 @@ import { getObjectUrl } from '../../integrations/minio/minio.utils';
 import { encodeProps } from '../../utils/encode.props';
 import { backoffDelay } from '../../utils/reconnect-backoff';
 import { connectLimiter } from '../../utils/connect-limiter';
+import { socketLease } from '../../utils/socket-lease';
 import { PresenceWatcher, PresenceSnapshot } from './presence.service';
 // Not re-exported from the package root, but the package publishes no `exports`
 // map so the subpath is importable. Using Baileys' own helpers keeps the stored
@@ -1263,7 +1264,13 @@ export class WAStartupService {
   }
 
   public async connectToWhatsapp(): Promise<WASocket> {
-    // In-flight guard (synchronous, before any await): if a connection attempt
+    // No socket until this process owns the socket lease: during a deploy the outgoing
+    // process still holds these credentials (see utils/socket-lease.ts). Free once held.
+    if (!socketLease.isHeld) {
+      await socketLease.ready();
+    }
+    // In-flight guard (synchronous: nothing awaits between this check and marking
+    // 'connecting'): if a connection attempt
     // is already running for this instance, return the existing socket instead
     // of opening a second one. The backend polls /instance/connect every ~90s;
     // without this, a poll landing mid-(re)connect spawns a duplicate socket on

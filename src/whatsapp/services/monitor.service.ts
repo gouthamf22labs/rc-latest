@@ -383,6 +383,16 @@ export class WAMonitoringService {
       this.eventEmitter.emit('remove.instance', instance);
       return undefined;
     }
+    // Boot and on-demand restores (InstanceGuard -> ensureInstance) can reach the same name
+    // concurrently, and either may have registered it while this one awaited the DB.
+    // addInstance would replace that service, but clearListeners can only close a socket
+    // that already exists: a service still waiting to connect (on the socket lease, or the
+    // connect limiter) drops out of the map and then connects anyway — a second socket on
+    // the same creds (440 conflict) that nothing, shutdown included, ever closes again.
+    const current = this.waInstances.get(name);
+    if (current) {
+      return current;
+    }
     const init = new WAStartupService(
       this.configService,
       this.eventEmitter,
@@ -413,6 +423,13 @@ export class WAMonitoringService {
     }
     if (!init) {
       return false;
+    }
+    // Reused a live or mid-connect service: connecting again would tear down its socket and
+    // rebuild it for nothing. One still waiting falls through, and connectToWhatsapp's
+    // in-flight guard collapses the two attempts into one.
+    const state = init.getInstance()?.status?.state;
+    if (state === 'open' || state === 'connecting') {
+      return true;
     }
     try {
       await init.connectToWhatsapp();
