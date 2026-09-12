@@ -285,6 +285,14 @@ const parsedRestartWindow = Number.parseInt(process.env.RESTART_REQUIRED_FAST_WI
 const RESTART_REQUIRED_FAST_WINDOW_MS =
   Number.isFinite(parsedRestartWindow) && parsedRestartWindow > 0 ? parsedRestartWindow : 30_000;
 
+// A reconnect reloads credentials from Postgres, so it must not start while a save of new
+// credentials is still in flight — after a QR scan that save carries the pairing itself, and a
+// socket built from the previous, unpaired copy fails the link. Reconnects wait for pending saves,
+// but never longer than this: a database that hangs must not strand the instance offline.
+const parsedCredsSaveWait = Number.parseInt(process.env.CREDS_SAVE_WAIT_MS ?? '', 10);
+const CREDS_SAVE_WAIT_MS =
+  Number.isFinite(parsedCredsSaveWait) && parsedCredsSaveWait > 0 ? parsedCredsSaveWait : 10_000;
+
 // Media downloads used to be a single axios.get with no timeout and no retry, so
 // one dropped socket permanently failed the message (and refunded the user's
 // credit). Node >= 19 defaults http(s).globalAgent to keepAlive:true: a socket
@@ -541,6 +549,8 @@ export class WAStartupService {
   private reconnecting = false;
   // When the last immediate restart-required reconnect ran; see RESTART_REQUIRED_FAST_WINDOW_MS.
   private lastRestartReconnectAt = 0;
+  // Credential saves still writing to Postgres; see CREDS_SAVE_WAIT_MS.
+  private readonly credsSaves = new Set<Promise<void>>();
   // Timestamps of the connect attempt in progress, logged when it reaches 'open'.
   private connectTiming?: { startedAt: number; authMs?: number; socketMs?: number };
   private reconnectAttempts = 0;
@@ -595,6 +605,17 @@ export class WAStartupService {
         return;
       }
 
+      // The socket about to be built loads credentials from Postgres; do not let it read them
+      // while newer ones are still being written. See CREDS_SAVE_WAIT_MS.
+      await this.waitForPendingCredsSaves();
+      // Re-read: the state can change while waiting, which the narrowing above cannot see.
+      const stateAfterWait: string = this.stateConnection.state;
+      if (stateAfterWait === 'open') {
+        this.logger.info('reconnect skipped - instance is already open');
+        this.reconnecting = false;
+        return;
+      }
+
       try {
         await this.connectToWhatsapp();
         // Success: a live socket now owns the loop — its connection.update
@@ -608,6 +629,36 @@ export class WAStartupService {
         this.scheduleReconnect();
       }
     }, delay);
+  }
+
+  /** Start persisting the current credentials and remember the save until it settles. */
+  private trackCredsSave(): Promise<void> {
+    const save = this.authState.saveCreds();
+    this.credsSaves.add(save);
+    const settle = () => this.credsSaves.delete(save);
+    save.then(settle, settle);
+    return save;
+  }
+
+  /** Resolve once every in-flight credentials save has settled, or after CREDS_SAVE_WAIT_MS. */
+  private async waitForPendingCredsSaves(): Promise<void> {
+    if (this.credsSaves.size === 0) return;
+    const startedAt = Date.now();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = await Promise.race([
+      Promise.allSettled([...this.credsSaves]).then(() => false),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(true), CREDS_SAVE_WAIT_MS);
+      }),
+    ]);
+    clearTimeout(timer);
+    if (timedOut) {
+      this.logger.warn(
+        `credentials save still pending after ${CREDS_SAVE_WAIT_MS}ms - reconnecting anyway`,
+      );
+    } else {
+      this.logger.info(`waited ${Date.now() - startedAt}ms for credentials save before reconnecting`);
+    }
   }
 
   /** Cancel any pending reconnect (instance removed / recovered / shutdown). */
@@ -2139,12 +2190,18 @@ export class WAStartupService {
 
     this.client.ev.process(async (events) => {
       if (!this.endSession) {
+        // Start the credentials save before connection.update from the same batch is handled.
+        // After a QR scan both arrive together — the new pairing and the 515 restart — and the
+        // restart reconnects straight away, reloading credentials from Postgres. Registering the
+        // save first is what lets that reconnect wait for it (waitForPendingCredsSaves).
+        const credsSave = events?.['creds.update'] ? this.trackCredsSave() : undefined;
+
         if (events?.['connection.update']) {
           this.connectionUpdate(events['connection.update']);
         }
 
-        if (events?.['creds.update']) {
-          await this.authState.saveCreds();
+        if (credsSave) {
+          await credsSave;
         }
 
         if (events?.['messaging-history.set']) {
