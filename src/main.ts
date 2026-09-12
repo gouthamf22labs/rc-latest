@@ -36,6 +36,7 @@ import { ConfigService, HttpServer } from './config/env.config';
 import { onUnexpectedError } from './config/error.config';
 import { Logger } from './config/logger.config';
 import { AppModule } from './app.module';
+import { startRuntimeStats } from './utils/runtime-stats';
 
 // Baileys registers one process.on('exit') listener per socket connection.
 // With many concurrent instances this exceeds the default limit of 10.
@@ -52,6 +53,7 @@ export async function bootstrap() {
 
   context.get('module:logger').info('initialized');
   context.set('server:logger', logger);
+  startRuntimeStats(new Logger(configService, 'runtime-stats'));
 
   const httpServer = configService.get<HttpServer>('SERVER');
 
