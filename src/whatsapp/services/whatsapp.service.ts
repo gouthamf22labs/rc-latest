@@ -543,6 +543,25 @@ export class WAStartupService {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = undefined;
+
+      // A live socket may have taken over while this timer was pending, and reconnecting
+      // on top of it is actively harmful: connectToWhatsapp only short-circuits on
+      // 'connecting', so an 'open' instance falls through to teardown-and-rebuild. The
+      // replacement lands on the same creds before the old socket's close reaches
+      // WhatsApp, which answers 440 conflict/replaced — killing a healthy connection and
+      // scheduling yet another reconnect. That is a self-sustaining flap, and the only
+      // thing it needs to start is one stale timer outliving the drop that armed it.
+      //
+      // stopReconnect() on 'open' normally cancels this, so reaching here while open means
+      // the close that scheduled it was processed *after* the replacement opened — the
+      // exact ordering a conflict/replaced produces, since the new socket must connect
+      // before WhatsApp terminates the old one.
+      if (this.stateConnection.state === 'open') {
+        this.logger.info('reconnect skipped - instance is already open');
+        this.reconnecting = false;
+        return;
+      }
+
       try {
         await this.connectToWhatsapp();
         // Success: a live socket now owns the loop — its connection.update
@@ -958,6 +977,8 @@ export class WAStartupService {
       this.presenceWatcher.onConnectionClosed();
       // Canonical Baileys pattern: reconnect on everything except loggedOut (401).
       const isLoggedOut = closeStatusCode === DisconnectReason.loggedOut;
+      // 403 is the other answer retrying cannot change — see the branch below.
+      const isForbidden = closeStatusCode === DisconnectReason.forbidden;
 
       if (isLoggedOut) {
         // 401 — session is dead. Remove instance + delete session.
@@ -968,6 +989,43 @@ export class WAStartupService {
         this.eventEmitter.emit('remove.instance', this.instance, 'inner');
         this.client?.ws?.close();
         this.client.end(new Error('Close connection'));
+      } else if (isForbidden) {
+        // 403 — WhatsApp is refusing this account outright (banned, blocked, or
+        // otherwise barred). No amount of reconnecting changes that answer, but the
+        // "reconnect on everything except 401" rule above sent it to scheduleReconnect
+        // regardless, so a forbidden account rebuilt a socket on every backoff tick
+        // forever. One was observed in production at **attempt 95**.
+        //
+        // The cost is not just wasted connects. Every rebuild constructs a WASM signal
+        // repo whose memory the arena never returns to the OS, so a permanently-
+        // forbidden instance leaks steadily for as long as the process lives — which is
+        // a large part of why RSS climbs between restarts.
+        //
+        // Deliberately NOT deleting the session the way 401 does. A 401 is WhatsApp
+        // saying this session is dead; a 403 is a judgement about the account, and it
+        // can be lifted. Destroying the credentials would force a re-scan that may not
+        // even be accepted, so the session is kept and the instance is simply parked.
+        //
+        // No extra webhook either: connectionUpdated already carries statusReason 403,
+        // which is what drives the "Forbidden — account banned or blocked" alert.
+        this.stopReconnect();
+        this.logger.error(
+          'connection forbidden (403) - not reconnecting; the account itself needs attention',
+        );
+        // Flip OFFLINE once, for the same reason the creds-lost branch does: the backend
+        // only pokes instances the DB believes are ONLINE, so this stops it asking for a
+        // socket that WhatsApp will refuse. Guarded so a repeat close cannot re-spam it.
+        if (this.instance.connectionStatus !== 'OFFLINE') {
+          this.instance.connectionStatus = 'OFFLINE';
+          this.repository.instance
+            .update({
+              where: { id: this.instance.id },
+              data: { connectionStatus: 'OFFLINE' },
+            })
+            .catch((err) =>
+              this.logger.error('failed to mark forbidden instance OFFLINE', err),
+            );
+        }
       } else if (credsLost && !isRestartRequired) {
         // Unrecoverable without a human scanning a QR. Stop retrying and tell
         // the product so it can prompt a re-scan, instead of burning ~1
