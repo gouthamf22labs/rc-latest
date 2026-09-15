@@ -692,6 +692,37 @@ export class WAStartupService {
   }
 
   /**
+   * Log the instance out and wipe its session.
+   *
+   * Baileys' logout() first tells WhatsApp to remove this companion device, and that send
+   * throws "Connection Closed" whenever the socket is not open — an instance parked on a
+   * 403, waiting out a reconnect backoff, or mid-handshake. Its end() is then a no-op on an
+   * already-closed socket, so no close event would ever arrive either: /instance/logout
+   * answered 500 and the session stayed, including the backend's own logout of banned
+   * accounts. With no socket to send on, run the same 401 close a completed logout
+   * produces, so the webhooks, backend logout and session wipe all still happen.
+   * WhatsApp is not told in that case; the phone keeps listing the device until it expires.
+   */
+  public async logout(reason: string) {
+    if (this.client?.ws?.isOpen) {
+      await this.client.logout(reason);
+      return;
+    }
+    this.logger.warn(
+      `logout requested while the socket is not open (state: ${this.stateConnection.state}) - ` +
+        'removing the session locally',
+    );
+    this.stopReconnect();
+    await this.connectionUpdate({
+      connection: 'close',
+      lastDisconnect: {
+        error: new Boom(reason, { statusCode: DisconnectReason.loggedOut }),
+        date: new Date(),
+      },
+    });
+  }
+
+  /**
    * True when a creds-lost instance has used up its burst of RESCAN_MAX_ATTEMPTS
    * rebuilds and is still inside the cooldown. The connect controller checks this
    * to skip building another doomed socket (each build leaks a WASM signal repo)
@@ -1087,7 +1118,7 @@ export class WAStartupService {
         });
         this.eventEmitter.emit('remove.instance', this.instance, 'inner');
         this.client?.ws?.close();
-        this.client.end(new Error('Close connection'));
+        this.client?.end(new Error('Close connection'));
       } else if (isForbidden) {
         // 403 — WhatsApp is refusing this account outright (banned, blocked, or
         // otherwise barred). No amount of reconnecting changes that answer, but the

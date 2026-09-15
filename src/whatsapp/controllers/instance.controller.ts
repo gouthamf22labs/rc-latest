@@ -316,9 +316,11 @@ export class InstanceController {
 
   public async logout({ instanceName }: InstanceDto) {
     try {
+      // Not client.logout() directly: that throws on a socket that is not open. See
+      // WAStartupService.logout.
       await this.waMonitor.waInstances
         .get(instanceName)
-        ?.client?.logout('Log out instance: ' + instanceName);
+        ?.logout('Log out instance: ' + instanceName);
       // client.logout() resolves once the logout is sent; the session wipe happens later,
       // driven by the resulting close event. Wait for it so a 200 here means the instance
       // is genuinely torn down and the caller can immediately re-connect and scan. The
