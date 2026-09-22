@@ -72,14 +72,28 @@ export class Repository extends PrismaClient {
           // connections multiplexed onto ~5-9 real ones), so a large client-side
           // pool buys nothing: it only churns connect/disconnect traffic.
           max: 20,
-          // 30s here was the lockout window: a burst grew the pool to `max` and
-          // held every connection idle for 30s afterwards, so a momentary spike
-          // locked out every other client (other replicas, wa-send-later-be, the
-          // reconnect poller, `prisma migrate deploy`) long after the work was
-          // done. Draining in 5s keeps the same burst ceiling at a fraction of
-          // the exposure; the cost is more reconnect churn on a quiet pool.
-          idleTimeoutMillis: 5000,
-          connectionTimeoutMillis: 5000,
+          // The 5s drain that used to live here was written against `max: 100`,
+          // where a burst really could hold the server's whole connection budget
+          // idle. That premise died with PgBouncer: at MAX_CLIENT_CONN=2000 a
+          // warm pool of 20 is 1% of the client budget, and in transaction mode a
+          // server slot is held only for the length of a transaction, so 20 idle
+          // clients lock out nobody. What the 5s drain did buy was a connect on
+          // the hot path of nearly every query - the pool emptied faster than the
+          // ~8 queries/s refilled it - and each of those logins pays a
+          // scram-sha-256 handshake on PgBouncer's single thread. Cron ticks that
+          // open 6-8 connections in the same millisecond serialize behind that
+          // and can push one handshake past the connect budget, which is how
+          // `Connection terminated due to connection timeout` got raised. Staying
+          // warm for 30s removes those logins entirely.
+          idleTimeoutMillis: 30000,
+          // 10s, matching PgBouncer's QUERY_WAIT_TIMEOUT, so a transient stall
+          // queues instead of destroying the socket mid-handshake. Note this
+          // covers establishing a connection, not waiting for a free slot on a
+          // saturated pool - that path raises its own error and is unaffected.
+          connectionTimeoutMillis: 10000,
+          // Idle sockets on the overlay network get dropped silently; without
+          // keepalives a pool that now stays warm would hand out dead ones.
+          keepAlive: true,
         }),
         {
           onConnectionError(err) {
