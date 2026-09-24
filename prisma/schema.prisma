@@ -146,7 +146,7 @@ model Chat {
 model Contact {
   id            Int       @id @default(autoincrement())
   remoteJid     String    @db.VarChar(100)
-  pushName      String?   @db.VarChar(100)
+  pushName      String?
   profilePicUrl String?   @db.VarChar(500)
   createdAt     DateTime? @default(now())
   updatedAt     DateTime? @updatedAt
