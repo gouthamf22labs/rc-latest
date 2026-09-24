@@ -62,19 +62,11 @@ export class WebhookService {
         }
 
         if (i?.Webhook) {
-          const update = await this.repository.webhook.update({
-            where: { id: i.Webhook.id },
-            data: {
-              url: data.url,
-              enabled: data.enabled,
-            },
+          return await this.repository.updateWebhook(i.Webhook.id, {
+            url: data.url,
+            enabled: data.enabled,
+            events: data?.events,
           });
-          if (data?.events) {
-            update.events = data.events as any;
-            await this.repository.updateWebhook(update.id, update);
-          }
-
-          return update;
         }
 
         return await this.repository.webhook.create({

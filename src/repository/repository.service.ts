@@ -41,7 +41,7 @@ export class Query<T> {
   offset?: number;
 }
 
-import { Prisma, PrismaClient, Webhook } from '@prisma/client';
+import { PrismaClient, Webhook } from '@prisma/client';
 import { WebhookEvents } from '../whatsapp/dto/webhook.dto';
 import {
   BadRequestException,
@@ -86,11 +86,21 @@ export class Repository extends PrismaClient {
           // `Connection terminated due to connection timeout` got raised. Staying
           // warm for 30s removes those logins entirely.
           idleTimeoutMillis: 30000,
-          // 10s, matching PgBouncer's QUERY_WAIT_TIMEOUT, so a transient stall
-          // queues instead of destroying the socket mid-handshake. Note this
-          // covers establishing a connection, not waiting for a free slot on a
-          // saturated pool - that path raises its own error and is unaffected.
-          connectionTimeoutMillis: 10000,
+          // One budget, two errors (pg-pool/index.js):
+          //  - "Connection terminated due to connection timeout": a new login to
+          //    PgBouncer did not finish in time.
+          //  - "timeout exceeded when trying to connect": all `max` clients were
+          //    taken and none came back in time. Clients still mid-login count
+          //    toward `max`, so if PgBouncer stops answering logins, 20 hung
+          //    handshakes fill the pool and every other query gets this error.
+          // Seeing only the second one means the pool is saturated; seeing both
+          // together means PgBouncer (or the path to it) is not accepting logins.
+          //
+          // Kept above PgBouncer's QUERY_WAIT_TIMEOUT (10s): while PgBouncer queues
+          // our queries it holds our clients checked out for up to 10s, and a
+          // caller waiting for one of them should outlast that queue, not fail
+          // first. The cost is that a hung login takes 15s to be abandoned.
+          connectionTimeoutMillis: 15000,
           // Idle sockets on the overlay network get dropped silently; without
           // keepalives a pool that now stays warm would hand out dead ones.
           keepAlive: true,
@@ -119,45 +129,58 @@ export class Repository extends PrismaClient {
 
   public async updateWebhook(
     webhookId: number,
-    data: Partial<Webhook> & { events?: WebhookEvents },
+    data: Partial<Pick<Webhook, 'url' | 'enabled'>> & { events?: WebhookEvents },
   ) {
     const find = await this.webhook.findUnique({
       where: {
         id: webhookId,
+      },
+      select: {
+        id: true,
+        url: true,
+        enabled: true,
+        events: true,
+        instanceId: true,
       },
     });
     if (!find) {
       throw new NotFoundException(['Webhook not found', `Webhook id: ${webhookId}`]);
     }
     try {
-      for await (const [key, value] of Object.entries(data?.events)) {
-        if (value === undefined) {
-          continue;
+      // The backend re-sends the full webhook config on every poll, so this runs
+      // constantly and almost never changes anything. Merge the events in memory
+      // and write once, and only when something differs - it used to issue one
+      // UPDATE per event key (~25 round trips per call) whether or not it changed.
+      const current = (find.events ?? null) as Record<string, boolean> | null;
+      let events: Record<string, boolean> | undefined;
+      if (data?.events) {
+        const patch: Record<string, boolean> = {};
+        for (const [key, value] of Object.entries(data.events)) {
+          if (value === undefined) {
+            continue;
+          }
+          patch[key] = value === true || (value as unknown) === 'true';
         }
-
-        if (!find?.events) {
-          break;
+        const changed =
+          !current || Object.entries(patch).some(([key, value]) => current[key] !== value);
+        if (changed) {
+          events = { ...(current ?? {}), ...patch };
         }
-
-        const k = `ARRAY['${key}']`;
-        const v = `to_jsonb(${value as string}::boolean)`;
-
-        await this.$queryRaw(
-          Prisma.sql`UPDATE "Webhook" SET events = jsonb_set(events, ${Prisma.raw(
-            k,
-          )}, ${Prisma.raw(v)}) WHERE id = ${webhookId}`,
-        );
       }
 
-      const updated = await this.webhook.update({
+      const url = data?.url !== undefined && data.url !== find.url ? data.url : undefined;
+      const enabled =
+        data?.enabled !== undefined && data.enabled !== find.enabled ? data.enabled : undefined;
+
+      if (url === undefined && enabled === undefined && events === undefined) {
+        return find;
+      }
+
+      return await this.webhook.update({
         where: {
           id: webhookId,
         },
-        data: {
-          url: data?.url,
-          enabled: data?.enabled,
-          events: !find?.events ? data?.events : undefined,
-        },
+        data: { url, enabled, events },
         select: {
           id: true,
           url: true,
@@ -166,8 +189,6 @@ export class Repository extends PrismaClient {
           instanceId: true,
         },
       });
-
-      return updated;
     } catch (error) {
       throw new BadRequestException([error?.message, error?.stack]);
     }
