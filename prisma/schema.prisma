@@ -54,7 +54,7 @@ model Instance {
   profilePicUrl      String?                   @db.VarChar(500)
   createdAt          DateTime?                 @default(now())
   updatedAt          DateTime?                 @updatedAt
-  externalAttributes Json?                     @db.Json
+  externalAttributes Json?                     @default("{}") @db.Json
   Auth               Auth?
   Chat               Chat[]
   Contact            Contact[]
@@ -108,6 +108,7 @@ model Message {
 
   @@index([keyId], name: "keyId")
   @@index([instanceId, keyId])
+  @@index([instanceId], map: "idx_message_instanceid")
 }
 
 model Media {
@@ -141,6 +142,7 @@ model Chat {
 
   @@unique([instanceId, remoteJid])
   @@index([instanceId, remoteJid])
+  @@index([instanceId], map: "idx_chat_instanceid")
 }
 
 model Contact {
@@ -154,6 +156,10 @@ model Contact {
   instanceId    Int
 
   @@index([instanceId, remoteJid])
+  // Also has "Contact_instanceId_remoteJid_inc_id_idx" (instanceId, remoteJid) INCLUDE (id),
+  // created in migration 20260930120000. Prisma cannot model INCLUDE, so `prisma migrate dev`
+  // will propose DROP INDEX for it — delete that line from any generated migration. It is the
+  // hottest index on prod.
 }
 
 model Webhook {
@@ -176,6 +182,9 @@ model ActivityLogs {
   description String?   @db.VarChar(500)
   Instance    Instance? @relation(fields: [instanceId], references: [id], onDelete: Cascade)
   instanceId  Int?      @db.Integer
+
+  @@index([instanceId], map: "idx_activitylogs_instanceid")
+  @@index([dateTime], map: "idx_activitylogs_datetime")
 }
 
 model Session {

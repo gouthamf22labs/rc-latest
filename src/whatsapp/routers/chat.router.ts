@@ -182,7 +182,9 @@ export function ChatRouter(chatController: ChatController, ...guards: RequestHan
       const response = await dataValidate<DeleteMessage>({
         request: req,
         schema: deleteMessageSchema,
-        execute: (instance, data) => chatController.deleteMessage(instance, data),
+        // The route name is the contract: it revokes for everyone whatever the body says.
+        execute: (instance, data) =>
+          chatController.deleteMessage(instance, { ...data, everyOne: 'true' }),
       });
 
       res.status(HttpStatus.CREATED).json(response);

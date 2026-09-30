@@ -1342,6 +1342,35 @@ export class WAStartupService {
     }
   }
 
+  /**
+   * What Baileys calls when a recipient asks for a message to be re-sent (decryption retry).
+   *
+   * Separate from getMessage, which takes database-shaped fields: Baileys passes a WhatsApp
+   * key (remoteJid / id / fromMe), and used to be handed getMessage unbound, so the lookup
+   * threw on `this` and fell back to `{ conversation: '' }` — an empty message offered for
+   * the retry. Returning undefined when the message is unknown lets Baileys skip it instead.
+   * An arrow function so `this` survives being passed to the socket config.
+   */
+  private getMessageForRetry = async (
+    key: proto.IMessageKey,
+  ): Promise<proto.IMessage | undefined> => {
+    if (!key?.id || !this.instance?.id) return undefined;
+    try {
+      const message = await this.repository.message.findFirst({
+        where: {
+          instanceId: this.instance.id,
+          keyId: key.id,
+          ...(key.remoteJid ? { keyRemoteJid: key.remoteJid } : {}),
+        },
+        orderBy: { messageTimestamp: 'desc' },
+      });
+      if (!message?.content) return undefined;
+      return { [message.messageType]: message.content } as proto.IMessage;
+    } catch {
+      return undefined;
+    }
+  };
+
   private async defineAuthState() {
     if (this.configService.get<ProviderSession>('PROVIDER')?.ENABLED) {
       return await this.authStateProvider.authStateProvider(this.instance.name);
@@ -1400,7 +1429,7 @@ export class WAStartupService {
       msgRetryCounterCache: this.msgRetryCounterCache,
       retryRequestDelayMs: 5 * 1000,
       maxMsgRetryCount: 1000,
-      getMessage: this.getMessage as any,
+      getMessage: this.getMessageForRetry,
       generateHighQualityLinkPreview: true,
       syncFullHistory: true,
       userDevicesCache: this.userDevicesCache,
@@ -1677,13 +1706,19 @@ export class WAStartupService {
           })
           .then((result) => {
             if (result?.id) {
+              // chats.update carries only the fields that changed (unreadCount, archived, ...),
+              // so replacing content wiped everything else the chat had. Merge instead.
+              const merged = {
+                ...((result.content as Record<string, unknown>) ?? {}),
+                ...((chat.content as Record<string, unknown>) ?? {}),
+              };
               this.repository.chat
                 .update({
                   where: {
                     id: result.id,
                   },
                   data: {
-                    content: chat.content,
+                    content: toJsonValue(merged),
                     updatedAt: new Date(),
                   },
                 })
@@ -4181,16 +4216,15 @@ export class WAStartupService {
    */
   public async markMessageAsRead(data: ReadMessageDto) {
     try {
-      const keys: proto.IMessageKey[] = [];
-      data.readMessages.forEach((read) => {
-        if (isJidGroup(read.remoteJid) || isLidUser(read.remoteJid)) {
-          keys.push({
-            remoteJid: read.remoteJid,
-            fromMe: read.fromMe,
-            id: read.id,
-          });
-        }
-      });
+      // Every chat type is read, not just groups and @lid: the old filter silently dropped
+      // plain @s.whatsapp.net keys, so a 1:1 chat — the common case — was never marked read.
+      // A group receipt names the sender, which WhatsApp needs to route it.
+      const keys: proto.IMessageKey[] = data.readMessages.map((read) => ({
+        remoteJid: read.remoteJid,
+        fromMe: read.fromMe,
+        id: read.id,
+        participant: isJidGroup(read.remoteJid) ? read.participant : undefined,
+      }));
       await this.client.readMessages(keys);
       return { message: 'Read messages', read: 'success' };
     } catch (error) {
@@ -4200,8 +4234,10 @@ export class WAStartupService {
 
   public async deleteChat(chatId: string) {
     try {
+      // Scoped to this instance: two instances can share a contact, and without the filter the
+      // "last message" could be another instance's, sending that instance's key to WhatsApp.
       const lastMessage = await this.repository.message.findFirst({
-        where: { keyRemoteJid: this.createJid(chatId) },
+        where: { instanceId: this.instance.id, keyRemoteJid: this.createJid(chatId) },
         orderBy: { messageTimestamp: 'desc' },
       });
       if (!lastMessage) {
@@ -4235,7 +4271,8 @@ export class WAStartupService {
     const keys: proto.IMessageKey[] = [];
     try {
       const messages = await this.repository.message.findMany({
-        where: { id: { in: data.messageId } },
+        // Scoped to this instance so a caller cannot mark another instance's messages read.
+        where: { id: { in: data.messageId }, instanceId: this.instance.id },
         select: {
           keyFromMe: true,
           keyId: true,
@@ -4290,25 +4327,34 @@ export class WAStartupService {
     try {
       const id = Number.parseInt(del.id);
       const everyOne = del?.everyOne === 'true';
-      const message = await this.repository.message.findUnique({
-        where: { id },
+      const message = await this.repository.message.findFirst({
+        where: { id, instanceId: this.instance.id },
       });
+      if (!message) {
+        throw new Error('Message not found');
+      }
 
+      // "Delete for me" must stop here. It used to fall through to the revoke below, so a
+      // delete meant to hide a message from this device removed it from the other person's
+      // phone as well. deleteForMe is Baileys' app-state action for this; the old
+      // `clear: { messages }` shape is not one it accepts.
       if (!everyOne) {
         await this.client.chatModify(
           {
-            clear: {
-              messages: [
-                {
-                  id: message.keyId,
-                  fromMe: message.keyFromMe,
-                  timestamp: message.messageTimestamp,
-                },
-              ],
+            deleteForMe: {
+              deleteMedia: false,
+              key: {
+                id: message.keyId,
+                fromMe: message.keyFromMe,
+                remoteJid: message.keyRemoteJid,
+                participant: message?.keyParticipant,
+              },
+              timestamp: message.messageTimestamp,
             },
-          } as any,
+          },
           message.keyRemoteJid,
         );
+        return { deletedAt: new Date(), message, everyOne: false };
       }
 
       await this.client.sendMessage(message.keyRemoteJid, {
@@ -4674,10 +4720,15 @@ export class WAStartupService {
 
   public async fetchChats(type?: string) {
     const where = { instanceId: this.instance.id };
-    if (['chats', 'group'].includes(type)) {
-      where['remoteJid'] = {
-        contains: '@s.whatsapp.net',
-      };
+    // type=group used to share the 1:1 filter, so asking for groups returned people.
+    // 1:1 chats can be keyed by phone jid or, on newer accounts, by @lid.
+    if (type === 'group') {
+      where['remoteJid'] = { endsWith: '@g.us' };
+    } else if (type === 'chats') {
+      where['OR'] = [
+        { remoteJid: { endsWith: '@s.whatsapp.net' } },
+        { remoteJid: { endsWith: '@lid' } },
+      ];
     }
     return await this.repository.chat.findMany({ where });
   }

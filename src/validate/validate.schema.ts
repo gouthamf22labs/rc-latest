@@ -576,6 +576,7 @@ export const readMessageSchema: JSONSchema7 = {
           id: { type: 'string' },
           fromMe: { type: 'boolean', enum: [true, false] },
           remoteJid: { type: 'string' },
+          participant: { type: 'string' },
         },
         required: ['id', 'fromMe', 'remoteJid'],
         ...isNotEmpty('id', 'remoteJid'),

@@ -88,6 +88,8 @@ class Key {
   id: string;
   fromMe: boolean;
   remoteJid: string;
+  /** Group messages only: the sender's jid, needed for the read receipt. */
+  participant?: string;
 }
 export class ReadMessageDto {
   readMessages: Key[];
