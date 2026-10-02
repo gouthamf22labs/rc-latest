@@ -26,7 +26,7 @@ RUN npx prisma generate
 
 RUN npm run build
 
-RUN npm prune --production
+RUN npm prune --omit=dev --legacy-peer-deps
 
 # sharp ships per-platform native binaries as optionalDependencies; a lockfile
 # generated on macOS plus `npm install --force` can leave the linux binary out,
