@@ -22,10 +22,11 @@ import {
   type ToWorker,
 } from './voip.protocol';
 
-const PORT = Number(process.env.VOIP_WORKER_PORT);
+/** 0: any free port; it is reported to the main process in 'ready'. */
+const PORT = Number(process.env.VOIP_WORKER_PORT || 0);
 const SECRET = process.env.VOIP_TOKEN_SECRET || '';
 const MAX_CALLS = Number(process.env.VOIP_MAX_CALLS_PER_WORKER || 20);
-const MAX_CALLS_PER_INSTANCE = Number(process.env.VOIP_MAX_CALLS_PER_INSTANCE || 3);
+const MAX_CALLS_PER_INSTANCE = Number(process.env.VOIP_MAX_CALLS_PER_INSTANCE || 6);
 const LOG_LEVEL = process.env.VOIP_LOG_LEVEL || 'warn';
 /**
  * No media from the caller for this long while active: the call is gone (a lost terminate).
@@ -66,6 +67,8 @@ function rpc(instance: string, request: HostRequest): Promise<any> {
 // ── Instances ──────────────────────────────────────────────────────────────────
 
 const hosts = new Map<string, InstanceHost>();
+/** Per instance, the tail of its stanza chain (see the 'node' handler). */
+const queues = new Map<string, Promise<unknown>>();
 
 function hostFor(instance: string): InstanceHost {
   let host = hosts.get(instance);
@@ -86,6 +89,8 @@ type Bridge = {
   host: InstanceHost;
   callId: string;
   lastInbound: number;
+  /** The caller muted: they send nothing, which must not look like a dead call. */
+  peerMuted: boolean;
   /** After a dropped video frame, wait for a key frame before sending video again. */
   needKeyFrame: boolean;
 };
@@ -110,7 +115,16 @@ function closeBridge(callId: string, reason: string) {
 function wireHost(host: InstanceHost) {
   host.on('voip_call_state', (call: any) => {
     const bridge = bridges.get(call.callId);
-    if (bridge) control(bridge.ws, { t: 'state', state: call.stateData?.state });
+    if (!bridge) return;
+    bridge.lastInbound = Date.now();
+    control(bridge.ws, { t: 'state', state: call.stateData?.state });
+  });
+  host.on('voip_call_peer_mute', ({ call, muted }: { call: any; muted: boolean }) => {
+    const bridge = bridges.get(call.callId);
+    if (!bridge) return;
+    bridge.peerMuted = Boolean(muted);
+    bridge.lastInbound = Date.now();
+    control(bridge.ws, { t: 'peerMute', muted: Boolean(muted) });
   });
   host.on('voip_call_ended', (call: any) => {
     closeBridge(call.callId, call.stateData?.reason || 'ended');
@@ -192,6 +206,7 @@ async function answer(ws: WebSocket, instance: string, callId: string) {
     host,
     callId,
     lastInbound: Date.now(),
+    peerMuted: false,
     needKeyFrame: false,
   };
   bridges.set(callId, bridge);
@@ -233,13 +248,18 @@ async function answer(ws: WebSocket, instance: string, callId: string) {
   });
 
   try {
+    // Before accepting: the browser starts sending as soon as the call is live, and the engine
+    // ignores live audio until this is on.
+    host.engine.setExternalAudioMode(callId, true);
     if (call.stateData?.state === 'incoming_ringing')
       await host.engine.acceptCall(callId);
-    host.engine.setExternalAudioMode(callId, true);
     control(ws, { t: 'state', state: host.engine.getCall(callId)?.stateData?.state });
   } catch (error) {
     log('accept failed', { instance, callId, error: (error as Error).message });
-    control(ws, { t: 'error', code: 'accept_failed' });
+    // Half-accepted: end it here so it doesn't hang in 'connecting' (the phone can still answer
+    // a call that hasn't reached accept).
+    void host.engine.endCall(callId).catch(() => undefined);
+    control(ws, { t: 'error', code: 'failed' });
     bridges.delete(callId);
     ws.close(4000, 'accept_failed');
   }
@@ -264,14 +284,29 @@ wss.on('connection', (ws, req) => {
     ws.close(1011, 'error');
   });
 });
-wss.on('listening', () => send({ kind: 'ready', port: PORT }));
+wss.on('listening', () => {
+  const address = wss.address();
+  send({
+    kind: 'ready',
+    port: typeof address === 'object' && address ? address.port : PORT,
+  });
+});
+// Can't listen (port taken, …): exit so the supervisor starts a fresh worker.
+wss.on('error', (error) => {
+  log('call socket server failed', { error: error.message });
+  process.exit(1);
+});
 
 // Calls whose hang-up never arrived: the caller's media stops, so end them.
 setInterval(() => {
   const now = Date.now();
   for (const bridge of bridges.values()) {
     const state = bridge.host.engine.getCall(bridge.callId)?.stateData?.state;
-    if (state === 'active' && now - bridge.lastInbound > SILENCE_MS) {
+    if (
+      state === 'active' &&
+      !bridge.peerMuted &&
+      now - bridge.lastInbound > SILENCE_MS
+    ) {
       log('ending silent call', { callId: bridge.callId });
       void bridge.host.engine.endCall(bridge.callId).catch(() => undefined);
       closeBridge(bridge.callId, 'connection_lost');
@@ -298,13 +333,23 @@ process.on('message', (message: ToWorker) => {
     } else if (message.kind === 'node') {
       const host = hostFor(message.instance);
       host.setCredentials(message.credentials);
-      void host.dispatch(message.node).catch((error) =>
-        log('call node failed', {
-          instance: message.instance,
-          tag: message.node?.tag,
-          error: (error as Error).message,
-        }),
-      );
+      // One instance's stanzas in arrival order: a terminate handled while its offer is still
+      // being set up would be lost and leave the call ringing here.
+      const node = message.node;
+      const previous = queues.get(message.instance) ?? Promise.resolve();
+      const next = previous
+        .then(() => host.dispatch(node))
+        .catch((error) =>
+          log('call node failed', {
+            instance: message.instance,
+            tag: node?.tag,
+            error: (error as Error).message,
+          }),
+        );
+      queues.set(message.instance, next);
+      void next.then(() => {
+        if (queues.get(message.instance) === next) queues.delete(message.instance);
+      });
     } else if (message.kind === 'instanceGone') {
       const host = hosts.get(message.instance);
       if (!host) return;

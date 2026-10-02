@@ -33,7 +33,6 @@ export type VoipInstance = {
 
 const SECRET = process.env.VOIP_TOKEN_SECRET || '';
 const WORKERS = Math.max(1, Number(process.env.VOIP_WORKERS || 2));
-const PORT_BASE = Number(process.env.VOIP_WORKER_PORT_BASE || 9300);
 /** Receipts that belong to a call (the rest are message receipts and stay with Baileys). */
 const CALL_RECEIPT_TAGS = new Set([
   'offer',
@@ -73,7 +72,7 @@ class VoipSupervisor {
     for (let index = 0; index < WORKERS; index++) {
       const slot: Slot = {
         index,
-        port: PORT_BASE + index,
+        port: 0, // the worker picks a free one and reports it
         child: null,
         ready: false,
         restarts: 0,
@@ -116,13 +115,9 @@ class VoipSupervisor {
       const first = Array.isArray(node.content) ? node.content[0] : undefined;
       if (first && CALL_RECEIPT_TAGS.has(first.tag)) forward(node);
     });
-    sock.ws.on('close', () => {
-      if (instance.client && instance.client !== sock) return; // replaced by a newer socket
-      this.toWorker(instance.instanceName, {
-        kind: 'instanceGone',
-        instance: instance.instanceName,
-      });
-    });
+    // A socket closing is usually a reconnect; the calls' media doesn't ride it, so they carry
+    // on (signalling resumes on the new socket). Calls whose number is really gone end through
+    // the worker's silence watchdog.
   }
 
   /** The browser's media socket: hand the raw connection to the worker that owns the call. */
@@ -130,7 +125,11 @@ class VoipSupervisor {
     if (!this.enabled) return;
     server.on('upgrade', (req: IncomingMessage, socket: Socket, head: Buffer) => {
       const url = new URL(req.url || '/', 'http://local');
-      if (url.pathname !== '/voip/ws') return;
+      if (!url.pathname.startsWith('/voip/')) return;
+      if (url.pathname !== '/voip/ws') {
+        socket.destroy();
+        return;
+      }
       const instance = peekTicketInstance(url.searchParams.get('token') || '');
       const slot = instance ? this.slotFor(instance) : null;
       if (!slot?.ready) {
@@ -161,7 +160,7 @@ class VoipSupervisor {
   private spawn(slot: Slot) {
     const ts = __filename.endsWith('.ts');
     const child = fork(join(__dirname, ts ? 'voip.worker.ts' : 'voip.worker.js'), [], {
-      env: { ...process.env, VOIP_WORKER_PORT: String(slot.port) },
+      env: { ...process.env, VOIP_WORKER_PORT: '0' },
       execArgv: ts ? ['-r', 'ts-node/register/transpile-only'] : [],
       serialization: 'advanced',
       stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
@@ -211,6 +210,7 @@ class VoipSupervisor {
 
   private fromWorker(slot: Slot, message: FromWorker) {
     if (message.kind === 'ready') {
+      slot.port = message.port;
       slot.ready = true;
       log('info', 'call worker ready', { worker: slot.index, port: message.port });
     } else if (message.kind === 'stats') {
@@ -221,13 +221,14 @@ class VoipSupervisor {
           instances: message.instances,
         });
     } else if (message.kind === 'request') {
+      // Reply to the worker that asked: after a restart, its replacement reuses request ids.
+      const child = slot.child;
+      const reply = (m: ToWorker) =>
+        child === slot.child && child?.connected && child.send(m);
       void this.serve(message.instance, message.request).then(
-        (value) =>
-          slot.child?.connected &&
-          slot.child.send({ kind: 'reply', id: message.id, ok: true, value }),
+        (value) => reply({ kind: 'reply', id: message.id, ok: true, value }),
         (error) =>
-          slot.child?.connected &&
-          slot.child.send({
+          reply({
             kind: 'reply',
             id: message.id,
             ok: false,
@@ -240,7 +241,20 @@ class VoipSupervisor {
   // ── Requests from a worker, served with the instance's socket ──────────────────
 
   private credentials(sock: any): VoipCredentials {
-    return { meJid: sock?.user?.id, meLid: sock?.user?.lid };
+    return {
+      meJid: sock?.user?.id,
+      meLid: sock?.user?.lid,
+      signedIdentity: sock?.authState?.creds?.account,
+    };
+  }
+
+  /** Baileys keeps Signal sessions under the LID: map a phone-number jid first, as it does. */
+  private async sessionJid(sock: any, jid: string): Promise<string> {
+    if (!jid.endsWith('@s.whatsapp.net')) return jid;
+    const lid = await sock.signalRepository?.lidMapping
+      ?.getLIDForPN(jid)
+      .catch(() => null);
+    return lid || jid;
   }
 
   private async serve(instanceName: string, request: HostRequest): Promise<unknown> {
@@ -253,7 +267,7 @@ class VoipSupervisor {
         return this.credentials(sock);
       case 'decrypt':
         return sock.signalRepository.decryptMessage({
-          jid: request.jid,
+          jid: await this.sessionJid(sock, request.jid),
           type: request.type,
           ciphertext: Buffer.from(request.ciphertext),
         });
@@ -287,8 +301,13 @@ class VoipSupervisor {
               .catch(() => null),
           })),
         );
+      case 'encrypt':
+        return sock.signalRepository.encryptMessage({
+          jid: await this.sessionJid(sock, request.jid),
+          data: Buffer.from(request.data),
+        });
       case 'assertSession':
-        return sock.assertSessions([request.jid]);
+        return sock.assertSessions([await this.sessionJid(sock, request.jid)]);
       default:
         throw new Error('unknown request');
     }

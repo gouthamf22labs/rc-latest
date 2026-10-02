@@ -168,6 +168,9 @@ export class InstanceHost extends EventEmitter {
             type: message.type,
             ciphertext: message.ciphertext,
           }),
+        // Answering re-encrypts the call key to the caller's device.
+        encryptMessage: (address: any, data: Uint8Array) =>
+          rpc({ op: 'encrypt', jid: addressToJid(address), data }),
         encryptMessagesBatch: async () => {
           throw new Error('placing calls is not supported');
         },

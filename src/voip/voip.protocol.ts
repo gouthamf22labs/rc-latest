@@ -14,7 +14,12 @@ export type VoipNode = {
 };
 
 /** The number's own jids, as the engine needs them on every call. */
-export type VoipCredentials = { meJid?: string; meLid?: string };
+export type VoipCredentials = {
+  meJid?: string;
+  meLid?: string;
+  /** ADVSignedDeviceIdentity (Baileys creds.account), sent with a pkmsg accept. */
+  signedIdentity?: unknown;
+};
 
 /** Main → worker. */
 export type ToWorker =
@@ -28,6 +33,7 @@ export type HostRequest =
   | { op: 'sendNode'; node: VoipNode }
   | { op: 'credentials' }
   | { op: 'decrypt'; jid: string; type: 'pkmsg' | 'msg'; ciphertext: Uint8Array }
+  | { op: 'encrypt'; jid: string; data: Uint8Array }
   | { op: 'devices'; jids: string[] }
   | { op: 'lidForPn'; jids: string[] }
   | { op: 'assertSession'; jid: string };
@@ -91,7 +97,7 @@ export function peekTicketInstance(token: string): string | null {
 // ── Browser media frames ───────────────────────────────────────────────────────
 // Binary WebSocket frames between the browser and a worker; the first byte says what follows.
 //   0x01 audio  — float32 little-endian PCM, 16 kHz mono (both directions)
-//   0x02 video  — worker→browser: [keyFrame u8][timestamp f64 µs][H.264 Annex-B access unit]
+//   0x02 video  — worker→browser: [keyFrame u8][timestamp f64, RTP 90 kHz ticks][H.264 Annex-B AU]
 //                 browser→worker: [timestamp f64 µs][H.264 Annex-B access unit]
 // Text frames carry JSON control messages ({ t: 'state' | 'ended' | 'error' | 'hangup' | 'mute' ... }).
 export const FRAME_AUDIO = 0x01;
