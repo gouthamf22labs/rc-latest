@@ -8,7 +8,7 @@ WORKDIR /codechat
 
 RUN apt-get update && apt-get install -y git ffmpeg && rm -rf /var/lib/apt/lists/*
 
-COPY package*.json ./
+COPY package*.json .npmrc ./
 RUN npm install --force
 
 COPY tsconfig.json .

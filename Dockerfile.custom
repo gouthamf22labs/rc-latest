@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git ffmpeg \
 
 WORKDIR /codechat
 
-COPY package*.json ./
+COPY package*.json .npmrc ./
 COPY ./patches ./patches
 
 RUN npm install --force
