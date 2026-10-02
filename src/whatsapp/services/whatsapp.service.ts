@@ -150,6 +150,7 @@ import { Websocket } from '../../websocket/server';
 import { ulid } from 'ulid';
 import { isValidUlid } from '../../validate/ulid';
 import sharp from 'sharp';
+import { voiceWaveform } from '../../utils/audio-waveform';
 import ffmpeg from 'fluent-ffmpeg';
 import { PassThrough } from 'stream';
 import {
@@ -3385,6 +3386,11 @@ export class WAStartupService {
         // WhatsApp plays voice notes as Opus in OGG, and phones (iOS especially) go by this exact type.
         if (/ogg|opus/.test(prepareMedia.audioMessage.mimetype || '')) {
           prepareMedia.audioMessage.mimetype = 'audio/ogg; codecs=opus';
+        }
+        // The waveform phones and WhatsApp Web draw; without it they show a flat line.
+        if (!prepareMedia.audioMessage.waveform) {
+          const waveform = await voiceWaveform(media);
+          if (waveform) prepareMedia.audioMessage.waveform = waveform;
         }
       }
 
