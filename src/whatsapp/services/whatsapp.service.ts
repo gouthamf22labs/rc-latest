@@ -840,6 +840,14 @@ export class WAStartupService {
     });
   }
 
+  /**
+   * The instance as webhooks describe it, with the account's own LID added: receivers need it to
+   * tell our own devices (on calls, or "message yourself") from the people we talk to.
+   */
+  private get webhookInstance() {
+    return { ...this.instance, ownerLid: (this.client?.user as { lid?: string } | undefined)?.lid ?? null };
+  }
+
   private async sendDataWebhook<T = any>(event: WebhookEventsType, data: T) {
     const eventDesc = WebhookEventsEnum[event];
 
@@ -850,7 +858,7 @@ export class WAStartupService {
             this.webhook.url,
             {
               event: eventDesc,
-              instance: this.instance,
+              instance: this.webhookInstance,
               data,
             },
             { headers: { 'Resource-Owner': this.instance.ownerJid }, ...WEBHOOK_POST_CONFIG },
@@ -861,7 +869,7 @@ export class WAStartupService {
             this.webhook.url,
             {
               event: eventDesc,
-              instance: this.instance,
+              instance: this.webhookInstance,
               data,
             },
             { headers: { 'Resource-Owner': this.instance.ownerJid }, ...WEBHOOK_POST_CONFIG },
@@ -888,7 +896,7 @@ export class WAStartupService {
           globalWebhook.URL,
           {
             event: eventDesc,
-            instance: this.instance,
+            instance: this.webhookInstance,
             data,
           },
           { headers: { 'Resource-owner': this.instance.ownerJid }, ...WEBHOOK_POST_CONFIG },
