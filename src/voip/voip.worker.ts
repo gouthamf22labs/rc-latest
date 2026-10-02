@@ -79,6 +79,8 @@ async function endDeclinedOutgoing(host: InstanceHost, node: VoipNode) {
   const call = host.engine.getCall(callId);
   if (!call || call.isEnded || call.direction !== 'outgoing') return;
   if (call.stateData?.state === 'active') return;
+  // Tell the browser why first: the engine reports its own generic reason for the end.
+  closeBridge(callId, 'rejected');
   await host.engine.endCall(callId, 'rejected').catch(() => undefined);
 }
 
