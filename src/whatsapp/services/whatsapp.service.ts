@@ -3381,7 +3381,8 @@ export class WAStartupService {
       prepareMedia[mediaType].mimetype = mediaMessage?.mimetype || mimetype;
       prepareMedia[mediaType].fileName = mediaMessage.fileName;
 
-      if (isAccOrOgg) {
+      // Only an audio message can be a voice note (an .ogg sent as a document stays a document).
+      if (isAccOrOgg && prepareMedia.audioMessage) {
         prepareMedia.audioMessage.ptt = true;
         // WhatsApp plays voice notes as Opus in OGG, and phones (iOS especially) go by this exact type.
         if (/ogg|opus/.test(prepareMedia.audioMessage.mimetype || '')) {
