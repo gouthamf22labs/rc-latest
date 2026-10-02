@@ -79,6 +79,8 @@ export class Websocket {
 
     server.on('upgrade', (req, socket, head) => {
       const url = new URL(req.url, `http://${req.headers.host}`);
+      // The call media socket has its own handler (voip.supervisor).
+      if (url.pathname.startsWith('/voip/')) return;
       const params = url.searchParams;
 
       const event = params.get('event') as EventsType;

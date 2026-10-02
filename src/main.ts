@@ -37,6 +37,7 @@ import { onUnexpectedError } from './config/error.config';
 import { Logger } from './config/logger.config';
 import { AppModule } from './app.module';
 import { startRuntimeStats } from './utils/runtime-stats';
+import { voipSupervisor } from './voip/voip.supervisor';
 
 // Baileys registers one process.on('exit') listener per socket connection.
 // With many concurrent instances this exceeds the default limit of 10.
@@ -115,6 +116,7 @@ async function onShutdownSignal(signal: string) {
     context.get('server:logger')?.warn(`${signal} received - draining`);
     // Before the drain: a reconnect timer firing mid-drain must not open a new socket.
     context.get('module:socketLease')?.close?.();
+    voipSupervisor.stop();
     const closed = context.get('module:monitor')?.shutdown?.() ?? 0;
     context.get('server:logger')?.warn(`closed ${closed} whatsapp socket(s)`);
     await new Promise((resolve) => setTimeout(resolve, SOCKET_FLUSH_MS));

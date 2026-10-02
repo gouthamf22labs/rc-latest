@@ -1,0 +1,43 @@
+diff --git a/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js b/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
+index c48c448..a711db1 100644
+--- a/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
++++ b/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
+@@ -146,10 +146,8 @@ class WaCallMediaSession {
+         const callCreator = this.info.callCreator;
+         const peerJid = this.info.peerJid;
+         const isVideo = this.info.mediaType === types_js_1.CallMediaType.Video;
+-        const peerBase = (0, protocol_1.toUserJid)(peerJid);
+-        const participantPeers = this.info.relayData?.participantJids?.filter((jid) => (0, protocol_1.toUserJid)(jid) === peerBase && /:\d+@/.test(jid)) || [];
+-        const participantPeerJid = participantPeers.find((jid) => !/:0@/.test(jid)) || participantPeers[0];
+-        this.acceptedByJid = participantPeerJid || peerJid;
++        // Local patch (zapo PR #288): the offer's sender is the calling device.
++        this.acceptedByJid = this.ensureDeviceJid(peerJid);
+         const resolvedPeerSsrc = (0, ssrc_js_1.generateSecureSsrc)(callId, this.ensureDeviceJid(this.acceptedByJid));
+         this.peerSsrcs = [resolvedPeerSsrc];
+         this.sctpRelay.setSubscriptionSsrc(resolvedPeerSsrc);
+@@ -697,7 +695,24 @@ class WaCallMediaSession {
+         const inner = nodeInfo.innerNode;
+         const callId = inner.attrs?.['call-id'] || this.info.callId;
+         const callCreator = inner.attrs?.['call-creator'] || this.info.callCreator;
+-        const teNodes = (0, transport_1.getNodeChildrenByTag)(inner, 'te');
++        // Local patch (zapo PR #288): answer only for relays we dial, with our own latency/address.
++        const ownByName = new Map();
++        const seenEp = new Set();
++        for (const ep of this.info.relayData?.endpoints ?? []) {
++            if ((ep.protocol ?? 0) !== 0) continue;
++            const k = ep.ip + ':' + ep.port;
++            if (seenEp.has(k)) continue;
++            seenEp.add(k);
++            if (!ep.key || !ep.rawToken || !ep.relayName || !ep.addressBytes || ownByName.has(ep.relayName)) continue;
++            ownByName.set(ep.relayName, { latency: ep.c2rRtt || 0, address: ep.addressBytes });
++        }
++        const teNodes = [];
++        for (const te of (0, transport_1.getNodeChildrenByTag)(inner, 'te')) {
++            const name = te.attrs?.relay_name;
++            const own = name ? ownByName.get(name) : undefined;
++            if (!name || !own) continue;
++            teNodes.push({ tag: 'te', attrs: { relay_name: name, latency: String(0x2000000 + own.latency) }, content: own.address });
++        }
+         if (teNodes.length === 0)
+             return;
+         const destinationJids = this.info.relayData?.participantJids || [];

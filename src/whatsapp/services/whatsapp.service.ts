@@ -169,6 +169,7 @@ import { fetchLatestBaileysVersionV2 } from '../../utils/wa-version';
 import { getJidUser, getUserGroup } from '../../utils/extract-id';
 import { getObjectUrl } from '../../integrations/minio/minio.utils';
 import { encodeProps } from '../../utils/encode.props';
+import { voipSupervisor } from '../../voip/voip.supervisor';
 import { backoffDelay } from '../../utils/reconnect-backoff';
 import { connectLimiter, Semaphore } from '../../utils/connect-limiter';
 import { yieldToLoop } from '../../utils/yield-to-loop';
@@ -1509,6 +1510,17 @@ export class WAStartupService {
       try {
         this.client = await this.setSocket();
         this.eventHandler();
+        // Calls answered in the CRM: hand this socket's call stanzas to the call workers.
+        const self = this;
+        voipSupervisor.attach({
+          instanceName: this.instanceName,
+          get client() {
+            return self.client;
+          },
+          get webhook() {
+            return self.webhook;
+          },
+        });
       } finally {
         connectLimiter.release();
       }

@@ -71,6 +71,7 @@ import { ErrorMiddle } from './middle/error.middle';
 import { docsRouter } from './config/swagger.config';
 import { ProviderFiles } from './provider/sessions';
 import { Websocket } from './websocket/server';
+import { voipSupervisor } from './voip/voip.supervisor';
 import { createServer } from 'http';
 import { RequestIdMiddleware } from './middle/req-id.middle';
 import { socketLease } from './utils/socket-lease';
@@ -127,6 +128,10 @@ export async function AppModule(context: Map<string, any>) {
   const wss = new Websocket(configService);
   wss.server(server);
   logger.info('ws-server:on');
+
+  // Calls answered in the CRM (off unless VOIP_TOKEN_SECRET is set).
+  voipSupervisor.attachUpgrade(server);
+  voipSupervisor.start();
 
   const waMonitor = new WAMonitoringService(
     eventEmitter,
