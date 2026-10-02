@@ -1,5 +1,102 @@
+diff --git a/node_modules/@zapo-js/voip/dist/call/WaCallManager.js b/node_modules/@zapo-js/voip/dist/call/WaCallManager.js
+index 471a964..c90520f 100644
+--- a/node_modules/@zapo-js/voip/dist/call/WaCallManager.js
++++ b/node_modules/@zapo-js/voip/dist/call/WaCallManager.js
+@@ -152,6 +152,8 @@ class WaCallManager extends node_events_1.EventEmitter {
+                 const creds = this.deps.authClient.getCurrentCredentials();
+                 const selfLid = creds?.meLid || creds?.meJid || '';
+                 const peerDeviceJids = await this.resolvePeerDeviceJids(peerJid);
++                if (this.endedDuringSetup(session))
++                    return;
+                 if (info.relayData) {
+                     info.relayData.participantJids = [
+                         ...peerDeviceJids,
+@@ -162,10 +164,16 @@ class WaCallManager extends node_events_1.EventEmitter {
+                     ? peerDeviceJids.find((jid) => /:[1-9]\d*@/.test(jid)) || peerJid
+                     : peerJid;
+                 await session.initMedia(selfLid, mediaPeerJid);
++                if (this.endedDuringSetup(session))
++                    return;
+                 await session.sendIncomingPreaccept(peerJid);
++                if (this.endedDuringSetup(session))
++                    return;
+                 await session.sendIncomingRelayLatency();
+             }
+             catch (err) {
++                if (this.endedDuringSetup(session))
++                    return;
+                 this.logger.error('incoming call activation failed', {
+                     callId,
+                     message: (0, util_1.toError)(err).message
+@@ -193,6 +201,8 @@ class WaCallManager extends node_events_1.EventEmitter {
+                 maxConcurrentCalls: this.maxConcurrentCalls
+             });
+         }
++        if (this.endedDuringSetup(session))
++            return;
+         this.emit('call_incoming', info);
+         this.emitState(info);
+         this.logger.debug('incoming call', {
+@@ -209,6 +219,11 @@ class WaCallManager extends node_events_1.EventEmitter {
+         if (!session)
+             return;
+         await session.handleCallAccept(node, peerJid);
++        // Local patch (zapo PR #290): an incoming call picked up on another device ends here.
++        if (session.info.isEnded) {
++            this.calls.delete(session.callId);
++            await this.maybeUnblockWaitingCalls();
++        }
+     }
+     async handleCallPreaccept(node, peerJid) {
+         const session = this.resolveSessionFromNode(node);
+@@ -266,7 +281,7 @@ class WaCallManager extends node_events_1.EventEmitter {
+             });
+             return;
+         }
+-        session.handleCallTerminate();
++        session.handleCallTerminate(action?.attrs?.reason);
+         this.calls.delete(session.callId);
+         await this.maybeUnblockWaitingCalls();
+     }
+@@ -420,6 +435,8 @@ class WaCallManager extends node_events_1.EventEmitter {
+         const creds = this.deps.authClient.getCurrentCredentials();
+         const selfLid = creds?.meLid || creds?.meJid || '';
+         const peerDeviceJids = await this.resolvePeerDeviceJids(session.info.peerJid);
++        if (this.endedDuringSetup(session))
++            return;
+         if (session.info.relayData) {
+             session.info.relayData.participantJids = [
+                 ...peerDeviceJids,
+@@ -430,10 +447,27 @@ class WaCallManager extends node_events_1.EventEmitter {
+             ? peerDeviceJids.find((jid) => /:[1-9]\d*@/.test(jid)) || session.info.peerJid
+             : session.info.peerJid;
+         await session.initMedia(selfLid, mediaPeerJid);
++        if (this.endedDuringSetup(session))
++            return;
+         await session.sendIncomingPreaccept(session.info.peerJid);
++        if (this.endedDuringSetup(session))
++            return;
+         await session.sendIncomingRelayLatency();
++        if (this.endedDuringSetup(session))
++            return;
+         this.emitState(session.info);
+         this.logger.debug('waiting incoming call unblocked', { callId: session.callId });
+     }
++    /**
++     * Local patch (zapo PR #290): a terminate (or an accept from another device of this account)
++     * can end an incoming call while it is still being set up; stop there and release what setup
++     * allocated after that cleanup ran.
++     */
++    endedDuringSetup(session) {
++        if (!session.info.isEnded)
++            return false;
++        session.cleanup();
++        return true;
++    }
+ }
+ exports.WaCallManager = WaCallManager;
 diff --git a/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js b/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
-index c48c448..a711db1 100644
+index c48c448..492a57f 100644
 --- a/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
 +++ b/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
 @@ -146,10 +146,8 @@ class WaCallMediaSession {
@@ -15,7 +112,31 @@ index c48c448..a711db1 100644
          const resolvedPeerSsrc = (0, ssrc_js_1.generateSecureSsrc)(callId, this.ensureDeviceJid(this.acceptedByJid));
          this.peerSsrcs = [resolvedPeerSsrc];
          this.sctpRelay.setSubscriptionSsrc(resolvedPeerSsrc);
-@@ -697,7 +695,24 @@ class WaCallMediaSession {
+@@ -342,6 +340,9 @@ class WaCallMediaSession {
+         const destinationJids = this.info.relayData.participantJids || [];
+         const seenRelayNames = new Set();
+         for (const ep of this.info.relayData.endpoints) {
++            // Local patch (zapo PR #290): the call can end while an earlier send is in flight.
++            if (this.info.isEnded)
++                return;
+             const name = ep.relayName || '';
+             if (!name || seenRelayNames.has(name))
+                 continue;
+@@ -366,6 +367,13 @@ class WaCallMediaSession {
+         }
+     }
+     async handleCallAccept(node, peerJid) {
++        // Local patch (zapo PR #290): on a call this device is receiving, an <accept> means
++        // another device of the account picked it up. Stop ringing here and send nothing.
++        if (this.info.direction === types_js_1.CallDirection.Incoming) {
++            if (this.info.isRinging)
++                this.handleCallTerminate('accepted_elsewhere');
++            return;
++        }
+         const nodeInfo = (0, signaling_js_1.extractNodeInfo)(node);
+         if (!nodeInfo)
+             return;
+@@ -697,7 +705,24 @@ class WaCallMediaSession {
          const inner = nodeInfo.innerNode;
          const callId = inner.attrs?.['call-id'] || this.info.callId;
          const callCreator = inner.attrs?.['call-creator'] || this.info.callCreator;
@@ -41,3 +162,25 @@ index c48c448..a711db1 100644
          if (teNodes.length === 0)
              return;
          const destinationJids = this.info.relayData?.participantJids || [];
+@@ -760,11 +785,19 @@ class WaCallMediaSession {
+             });
+         }
+     }
+-    handleCallTerminate() {
++    handleCallTerminate(reason) {
++        // Local patch (zapo PR #290): keep "answered/declined on another device" apart.
++        let endReason = types_js_1.EndCallReason.UserEnded;
++        if (this.info.direction === types_js_1.CallDirection.Incoming) {
++            if (reason === 'accepted_elsewhere')
++                endReason = 'accepted_elsewhere';
++            else if (reason === 'rejected_elsewhere')
++                endReason = 'rejected_elsewhere';
++        }
+         try {
+             this.info.applyTransition({
+                 type: 'terminated',
+-                reason: types_js_1.EndCallReason.UserEnded
++                reason: endReason
+             });
+         }
+         catch (err) {

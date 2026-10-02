@@ -27,8 +27,11 @@ const SECRET = process.env.VOIP_TOKEN_SECRET || '';
 const MAX_CALLS = Number(process.env.VOIP_MAX_CALLS_PER_WORKER || 20);
 const MAX_CALLS_PER_INSTANCE = Number(process.env.VOIP_MAX_CALLS_PER_INSTANCE || 3);
 const LOG_LEVEL = process.env.VOIP_LOG_LEVEL || 'warn';
-/** No media from the caller for this long while active: the call is gone (a lost terminate). */
-const SILENCE_MS = 20_000;
+/**
+ * No media from the caller for this long while active: the call is gone (a lost terminate).
+ * Generous, because WhatsApp sends almost nothing while a caller is silent or muted.
+ */
+const SILENCE_MS = 45_000;
 /** A browser that stops reading: drop video (then audio) rather than buffer without bound. */
 const VIDEO_BACKLOG = 1_500_000;
 const AUDIO_BACKLOG = 4_000_000;
