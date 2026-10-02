@@ -401,10 +401,10 @@ export const reactionMessageSchema: JSONSchema7 = {
           required: ['id', 'remoteJid', 'fromMe'],
           ...isNotEmpty('id', 'remoteJid'),
         },
+        // An empty reaction removes the one sent before, as in WhatsApp itself.
         reaction: { type: 'string' },
       },
       required: ['key', 'reaction'],
-      ...isNotEmpty('reaction'),
     },
   },
   required: ['reactionMessage'],

@@ -128,7 +128,8 @@ export class SendMessageController {
   }
 
   public async sendReaction({ instanceName }: InstanceDto, data: SendReactionDto) {
-    if (!data.reactionMessage.reaction.match(/[^()\w\sà-ú"-+]+/)) {
+    // "" takes a reaction back; anything else must be an emoji.
+    if (data.reactionMessage.reaction !== '' && !data.reactionMessage.reaction.match(/[^()\w\sà-ú"-+]+/)) {
       throw new BadRequestException('"reaction" must be an emoji');
     }
     return await this.waMonitor.waInstances.get(instanceName).reactionMessage(data);
