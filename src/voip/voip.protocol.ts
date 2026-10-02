@@ -36,7 +36,11 @@ export type HostRequest =
   | { op: 'encrypt'; jid: string; data: Uint8Array }
   | { op: 'devices'; jids: string[] }
   | { op: 'lidForPn'; jids: string[] }
-  | { op: 'assertSession'; jid: string };
+  | { op: 'assertSession'; jid: string }
+  // Placing a call
+  | { op: 'encryptBatch'; items: { jid: string; data: Uint8Array }[] }
+  | { op: 'assertSessions'; jids: string[] }
+  | { op: 'tcToken'; jid: string };
 
 /** Worker → main. */
 export type FromWorker =
@@ -50,8 +54,11 @@ export type FromWorker =
 export type CallTicket = {
   /** CodeChat instance (the number's current connection). */
   i: string;
-  /** WhatsApp call id. */
+  /** WhatsApp call id, to answer a ringing call ('' when placing one). */
   c: string;
+  /** To place a call: who to call (phone or LID jid), and whether with video. */
+  p?: string;
+  v?: boolean;
   /** CRM member, for logs. */
   m: string;
   /** Expiry, unix ms. */
@@ -75,7 +82,9 @@ export function readCallTicket(token: string, secret: string): CallTicket | null
   if (given.length !== expected.length || !timingSafeEqual(given, expected)) return null;
   try {
     const t = JSON.parse(Buffer.from(body, 'base64url').toString()) as CallTicket;
-    if (!t?.i || !t?.c || typeof t.e !== 'number' || t.e < Date.now()) return null;
+    // An answer names the call (c); a new call names who to call (p).
+    if (!t?.i || !(t?.c || t?.p) || typeof t.e !== 'number' || t.e < Date.now())
+      return null;
     return t;
   } catch {
     return null;

@@ -33,6 +33,8 @@ const LOG_LEVEL = process.env.VOIP_LOG_LEVEL || 'warn';
  * Generous, because WhatsApp sends almost nothing while a caller is silent or muted.
  */
 const SILENCE_MS = 45_000;
+/** A call we place rings this long before we give up (WhatsApp's own ring is about a minute). */
+const RING_MS = 60_000;
 /** A browser that stops reading: drop video (then audio) rather than buffer without bound. */
 const VIDEO_BACKLOG = 1_500_000;
 const AUDIO_BACKLOG = 4_000_000;
@@ -107,6 +109,9 @@ type Bridge = {
   peerMuted: boolean;
   /** After a dropped video frame, wait for a key frame before sending video again. */
   needKeyFrame: boolean;
+  /** Placed from the CRM (rings on the customer's phone) rather than answered. */
+  outgoing: boolean;
+  startedAt: number;
 };
 const bridges = new Map<string, Bridge>();
 
@@ -198,40 +203,24 @@ function wireHost(host: InstanceHost) {
   });
 }
 
-async function answer(ws: WebSocket, instance: string, callId: string) {
-  const host = hosts.get(instance);
-  const call = host?.engine.getCall(callId);
-  if (!host || !call || call.isEnded) {
-    // The ring never reached this connection, or it is already over.
-    control(ws, { t: 'error', code: 'not_ringing' });
-    ws.close(4004, 'not_ringing');
-    return;
-  }
-  if (bridges.has(callId)) {
-    control(ws, { t: 'error', code: 'taken' });
-    ws.close(4009, 'taken');
-    return;
-  }
-  if (bridges.size >= MAX_CALLS) {
-    control(ws, { t: 'error', code: 'busy' });
-    ws.close(4029, 'busy');
-    return;
-  }
-
+/** Joins a browser to a call: media both ways, hang-up and mute, and the call ends with it. */
+function attachBridge(
+  ws: WebSocket,
+  host: InstanceHost,
+  callId: string,
+  outgoing: boolean,
+): Bridge {
   const bridge: Bridge = {
     ws,
     host,
     callId,
+    outgoing,
+    startedAt: Date.now(),
     lastInbound: Date.now(),
     peerMuted: false,
     needKeyFrame: false,
   };
   bridges.set(callId, bridge);
-  control(ws, {
-    t: 'call',
-    video: call.mediaType === 'video',
-    peer: call.callerPn || call.peerJid,
-  });
 
   ws.on('message', (data: Buffer, isBinary: boolean) => {
     try {
@@ -263,6 +252,29 @@ async function answer(ws: WebSocket, instance: string, callId: string) {
       void host.engine.endCall(callId).catch(() => undefined);
     }
   });
+  return bridge;
+}
+
+const refuse = (ws: WebSocket, code: string, closeCode: number) => {
+  control(ws, { t: 'error', code });
+  ws.close(closeCode, code);
+};
+
+async function answer(ws: WebSocket, instance: string, callId: string) {
+  const host = hosts.get(instance);
+  const call = host?.engine.getCall(callId);
+  // The ring never reached this connection, or it is already over.
+  if (!host || !call || call.isEnded) return refuse(ws, 'not_ringing', 4004);
+  if (bridges.has(callId)) return refuse(ws, 'taken', 4009);
+  if (bridges.size >= MAX_CALLS) return refuse(ws, 'busy', 4029);
+
+  attachBridge(ws, host, callId, false);
+  control(ws, {
+    t: 'call',
+    callId,
+    video: call.mediaType === 'video',
+    peer: call.callerPn || call.peerJid,
+  });
 
   try {
     // Before accepting: the browser starts sending as soon as the call is live, and the engine
@@ -276,9 +288,30 @@ async function answer(ws: WebSocket, instance: string, callId: string) {
     // Half-accepted: end it here so it doesn't hang in 'connecting' (the phone can still answer
     // a call that hasn't reached accept).
     void host.engine.endCall(callId).catch(() => undefined);
-    control(ws, { t: 'error', code: 'failed' });
     bridges.delete(callId);
-    ws.close(4000, 'accept_failed');
+    refuse(ws, 'failed', 4000);
+  }
+}
+
+/** Calls the customer from the CRM: the call rings on their phone until they pick up. */
+async function place(ws: WebSocket, instance: string, peerJid: string, video: boolean) {
+  if (bridges.size >= MAX_CALLS) return refuse(ws, 'busy', 4029);
+  const host = hostFor(instance);
+  try {
+    // A number that hasn't had a call yet has no credentials here: ask for them.
+    host.setCredentials(await rpc(instance, { op: 'credentials' }));
+    const callId = await host.engine.startCall({ peerJid, isVideo: video });
+    if (ws.readyState !== ws.OPEN) {
+      void host.engine.endCall(callId).catch(() => undefined);
+      return;
+    }
+    attachBridge(ws, host, callId, true);
+    host.engine.setExternalAudioMode(callId, true);
+    control(ws, { t: 'call', callId, video, peer: peerJid, outgoing: true });
+    control(ws, { t: 'state', state: host.engine.getCall(callId)?.stateData?.state });
+  } catch (error) {
+    log('placing call failed', { instance, error: (error as Error).message });
+    refuse(ws, 'failed', 4000);
   }
 }
 
@@ -296,8 +329,11 @@ wss.on('connection', (ws, req) => {
     ws.close(4001, 'unauthorized');
     return;
   }
-  void answer(ws, ticket.i, ticket.c).catch((error) => {
-    log('answer crashed', { error: (error as Error).message });
+  const start = ticket.p
+    ? place(ws, ticket.i, ticket.p, Boolean(ticket.v))
+    : answer(ws, ticket.i, ticket.c);
+  void start.catch((error) => {
+    log('call start crashed', { error: (error as Error).message });
     ws.close(1011, 'error');
   });
 });
@@ -314,11 +350,17 @@ wss.on('error', (error) => {
   process.exit(1);
 });
 
-// Calls whose hang-up never arrived: the caller's media stops, so end them.
+// Calls whose hang-up never arrived: the caller's media stops, so end them. And calls we placed
+// that nobody picked up.
 setInterval(() => {
   const now = Date.now();
   for (const bridge of bridges.values()) {
     const state = bridge.host.engine.getCall(bridge.callId)?.stateData?.state;
+    if (bridge.outgoing && state !== 'active' && now - bridge.startedAt > RING_MS) {
+      void bridge.host.engine.endCall(bridge.callId).catch(() => undefined);
+      closeBridge(bridge.callId, 'no_answer');
+      continue;
+    }
     if (
       state === 'active' &&
       !bridge.peerMuted &&

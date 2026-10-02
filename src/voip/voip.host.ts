@@ -62,6 +62,7 @@ type Handler = {
 
 /** The engine's public surface we drive (WaVoipCoordinator). */
 export type VoipEngine = {
+  startCall(options: { peerJid: string; isVideo?: boolean }): Promise<string>;
   acceptCall(callId: string): Promise<void>;
   rejectCall(callId: string, reason?: string): Promise<void>;
   endCall(callId: string, reason?: string): Promise<void>;
@@ -94,8 +95,13 @@ export class InstanceHost extends EventEmitter {
       logger,
       deps: this.deps(),
       stores: {
-        // Only read when we place a call (not supported yet); none known.
-        privacyToken: { getByJid: async () => null },
+        // The customer's privacy token, which WhatsApp wants on a call we place.
+        privacyToken: {
+          getByJid: async (jid: string) => {
+            const tcToken = await rpc({ op: 'tcToken', jid }).catch(() => null);
+            return tcToken ? { tcToken } : null;
+          },
+        },
       },
       emit: (event: string | symbol, ...args: unknown[]) => this.emit(event, ...args),
       on: () => undefined,
@@ -171,17 +177,25 @@ export class InstanceHost extends EventEmitter {
         // Answering re-encrypts the call key to the caller's device.
         encryptMessage: (address: any, data: Uint8Array) =>
           rpc({ op: 'encrypt', jid: addressToJid(address), data }),
-        encryptMessagesBatch: async () => {
-          throw new Error('placing calls is not supported');
-        },
+        // Placing a call encrypts the call key to each of the customer's devices.
+        encryptMessagesBatch: (items: { address: any; plaintext: Uint8Array }[]) =>
+          rpc({
+            op: 'encryptBatch',
+            items: items.map((item) => ({
+              jid: addressToJid(item.address),
+              data: item.plaintext,
+            })),
+          }),
       },
       signalDeviceSync: {
         syncDeviceList: (jids: string[]) => rpc({ op: 'devices', jids }),
         queryLidsByPhoneJids: (jids: string[]) => rpc({ op: 'lidForPn', jids }),
       },
       sessionResolver: {
-        ensureSessionsBatch: async () => {
-          throw new Error('placing calls is not supported');
+        // Baileys keeps the sessions; these entries only line up with the devices.
+        ensureSessionsBatch: async (jids: string[]) => {
+          await rpc({ op: 'assertSessions', jids });
+          return jids.map(() => ({ address: null, session: null }));
         },
       },
       messageDispatch: {

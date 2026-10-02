@@ -308,6 +308,29 @@ class VoipSupervisor {
         });
       case 'assertSession':
         return sock.assertSessions([await this.sessionJid(sock, request.jid)]);
+      case 'assertSessions':
+        return sock.assertSessions(
+          await Promise.all(request.jids.map((jid) => this.sessionJid(sock, jid))),
+        );
+      case 'encryptBatch': {
+        const out: { type: string; ciphertext: Uint8Array }[] = [];
+        for (const item of request.items) {
+          out.push(
+            await sock.signalRepository.encryptMessage({
+              jid: await this.sessionJid(sock, item.jid),
+              data: Buffer.from(item.data),
+            }),
+          );
+        }
+        return out;
+      }
+      case 'tcToken': {
+        // Stored per user under the LID, as Baileys does for its own 1:1 sends.
+        const user = request.jid.replace(/:\d+@/, '@');
+        const key = await this.sessionJid(sock, user);
+        const entry = (await sock.authState?.keys?.get('tctoken', [key]))?.[key];
+        return entry?.token?.length ? entry.token : null;
+      }
       default:
         throw new Error('unknown request');
     }
