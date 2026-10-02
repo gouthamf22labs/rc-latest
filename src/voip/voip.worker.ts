@@ -14,6 +14,7 @@
 import { WebSocketServer, type WebSocket } from 'ws';
 import { InstanceHost } from './voip.host';
 import {
+  type VoipNode,
   FRAME_AUDIO,
   FRAME_VIDEO,
   readCallTicket,
@@ -64,6 +65,21 @@ function rpc(instance: string, request: HostRequest): Promise<any> {
     pending.set(id, { resolve, reject, timer });
     send({ kind: 'request', id, instance, request });
   });
+}
+
+/**
+ * The customer declined a call we placed. The engine ignores a <reject> (it only expects one on
+ * calls it receives), so the call would ring on here until the no-answer timeout: end it now.
+ */
+async function endDeclinedOutgoing(host: InstanceHost, node: VoipNode) {
+  if (node.tag !== 'call' || !Array.isArray(node.content)) return;
+  const reject = node.content.find((child) => child?.tag === 'reject');
+  const callId = reject?.attrs?.['call-id'];
+  if (!callId) return;
+  const call = host.engine.getCall(callId);
+  if (!call || call.isEnded || call.direction !== 'outgoing') return;
+  if (call.stateData?.state === 'active') return;
+  await host.engine.endCall(callId, 'rejected').catch(() => undefined);
 }
 
 /** An H.264 Annex-B access unit a decoder can start from: it carries an IDR slice or an SPS. */
@@ -398,6 +414,7 @@ process.on('message', (message: ToWorker) => {
       const previous = queues.get(message.instance) ?? Promise.resolve();
       const next = previous
         .then(() => host.dispatch(node))
+        .then(() => endDeclinedOutgoing(host, node))
         .catch((error) =>
           log('call node failed', {
             instance: message.instance,
