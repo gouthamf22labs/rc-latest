@@ -3380,6 +3380,10 @@ export class WAStartupService {
 
       if (isAccOrOgg) {
         prepareMedia.audioMessage.ptt = true;
+        // WhatsApp plays voice notes as Opus in OGG, and phones (iOS especially) go by this exact type.
+        if (/ogg|opus/.test(prepareMedia.audioMessage.mimetype || '')) {
+          prepareMedia.audioMessage.mimetype = 'audio/ogg; codecs=opus';
+        }
       }
 
       if (mediaMessage.mediatype === 'video') {
