@@ -32,7 +32,7 @@ RUN npm prune --omit=dev --legacy-peer-deps
 # generated on macOS plus `npm install --force` can leave the linux binary out,
 # so the app crashes at boot with "Could not load the sharp module". Reinstall it
 # for the image's own architecture (works for both arm64 and amd64 builds).
-RUN npm install --include=optional --no-save sharp
+RUN npm install --include=optional --no-save --legacy-peer-deps sharp
 
 FROM node:24-bookworm-slim AS production
 
