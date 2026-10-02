@@ -64,6 +64,20 @@ function rpc(instance: string, request: HostRequest): Promise<any> {
   });
 }
 
+/** An H.264 Annex-B access unit a decoder can start from: it carries an IDR slice or an SPS. */
+function isKeyFrame(data: Uint8Array): boolean {
+  for (let i = 0; i + 3 < data.length; i++) {
+    if (data[i] !== 0 || data[i + 1] !== 0) continue;
+    const start =
+      data[i + 2] === 1 ? i + 3 : data[i + 2] === 0 && data[i + 3] === 1 ? i + 4 : -1;
+    if (start < 0 || start >= data.length) continue;
+    const type = data[start] & 0x1f;
+    if (type === 5 || type === 7) return true;
+    i = start;
+  }
+  return false;
+}
+
 // ── Instances ──────────────────────────────────────────────────────────────────
 
 const hosts = new Map<string, InstanceHost>();
@@ -159,15 +173,18 @@ function wireHost(host: InstanceHost) {
       if (!bridge) return;
       bridge.lastInbound = Date.now();
       if (bridge.ws.readyState !== bridge.ws.OPEN) return;
+      // The engine's own flag misses most key frames (it marked 1 of 9 in a test call, so a
+      // viewer waited ~40 s for video): read the access unit itself.
+      const keyFrame = isKeyFrame(frame.data);
       if (bridge.ws.bufferedAmount > VIDEO_BACKLOG) {
         bridge.needKeyFrame = true;
         return;
       }
-      if (bridge.needKeyFrame && !frame.keyFrame) return;
+      if (bridge.needKeyFrame && !keyFrame) return;
       bridge.needKeyFrame = false;
       const out = Buffer.allocUnsafe(10 + frame.data.byteLength);
       out[0] = FRAME_VIDEO;
-      out[1] = frame.keyFrame ? 1 : 0;
+      out[1] = keyFrame ? 1 : 0;
       out.writeDoubleLE(frame.timestamp, 2);
       Buffer.from(frame.data.buffer, frame.data.byteOffset, frame.data.byteLength).copy(
         out,
