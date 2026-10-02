@@ -3330,7 +3330,9 @@ export class WAStartupService {
         }
       }
 
-      const isAccOrOgg = /aac|ogg/.test(mediaMessage?.mimetype || mimetype);
+      // Uploads (sendMediaFile) arrive without a mimetype: go by the extension too, or an OGG voice
+      // note is sent as a plain audio file, which WhatsApp accepts but never delivers.
+      const isAccOrOgg = /aac|ogg|oga|opus/.test(mediaMessage?.mimetype || mimetype || ext || '');
       if (mediaMessage.convert && isAccOrOgg) {
         if (['ogg', 'oga'].includes(ext)) {
           media = readFileSync(fileName);
