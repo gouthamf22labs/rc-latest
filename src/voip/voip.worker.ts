@@ -130,6 +130,8 @@ type Bridge = {
   /** Placed from the CRM (rings on the customer's phone) rather than answered. */
   outgoing: boolean;
   startedAt: number;
+  /** Video from the customer over the last 10 s, to see where frames are lost. */
+  video?: { frames: number; keys: number; sent: number; backlog: number; waiting: number; bytes: number; since: number };
 };
 const bridges = new Map<string, Bridge>();
 
@@ -199,12 +201,35 @@ function wireHost(host: InstanceHost) {
       // The engine's own flag misses most key frames (it marked 1 of 9 in a test call, so a
       // viewer waited ~40 s for video): read the access unit itself.
       const keyFrame = isKeyFrame(frame.data);
+      const v = (bridge.video ??= { frames: 0, keys: 0, sent: 0, backlog: 0, waiting: 0, bytes: 0, since: Date.now() });
+      v.frames++;
+      v.bytes += frame.data.byteLength;
+      if (keyFrame) v.keys++;
+      if (Date.now() - v.since >= 10_000) {
+        const secs = (Date.now() - v.since) / 1000;
+        log('video from customer', {
+          callId: call.callId,
+          fpsIn: +(v.frames / secs).toFixed(1),
+          fpsSent: +(v.sent / secs).toFixed(1),
+          keyFrames: v.keys,
+          droppedBacklog: v.backlog,
+          droppedWaitingKey: v.waiting,
+          kbps: Math.round((v.bytes * 8) / secs / 1000),
+          wsBuffered: bridge.ws.bufferedAmount,
+        });
+        bridge.video = { frames: 0, keys: 0, sent: 0, backlog: 0, waiting: 0, bytes: 0, since: Date.now() };
+      }
       if (bridge.ws.bufferedAmount > VIDEO_BACKLOG) {
         bridge.needKeyFrame = true;
+        v.backlog++;
         return;
       }
-      if (bridge.needKeyFrame && !keyFrame) return;
+      if (bridge.needKeyFrame && !keyFrame) {
+        v.waiting++;
+        return;
+      }
       bridge.needKeyFrame = false;
+      v.sent++;
       const out = Buffer.allocUnsafe(10 + frame.data.byteLength);
       out[0] = FRAME_VIDEO;
       out[1] = keyFrame ? 1 : 0;
