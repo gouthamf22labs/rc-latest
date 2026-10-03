@@ -688,7 +688,8 @@ export const deleteMessageSchema: JSONSchema7 = {
   $id: ulid(),
   type: 'object',
   properties: {
-    id: { type: 'string', pattern: '\\d+', minLength: 1 },
+    // CodeChat's row id, or WhatsApp's message key id.
+    id: { type: 'string', minLength: 1 },
   },
   required: ['id'],
   ...isNotEmpty('id'),

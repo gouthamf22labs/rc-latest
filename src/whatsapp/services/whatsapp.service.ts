@@ -4358,10 +4358,18 @@ export class WAStartupService {
 
   public async deleteMessage(del: DeleteMessage) {
     try {
-      const id = Number.parseInt(del.id);
       const everyOne = del?.everyOne === 'true';
+      // Either CodeChat's own row id or WhatsApp's message key id (what callers that only know
+      // the WhatsApp message have), the same way editMessage looks messages up.
+      const raw = String(del.id);
       const message = await this.repository.message.findFirst({
-        where: { id, instanceId: this.instance.id },
+        where: {
+          instanceId: this.instance.id,
+          ...(/^\d+$/.test(raw)
+            ? { OR: [{ id: Number.parseInt(raw) }, { keyId: raw }] }
+            : { keyId: raw }),
+        },
+        orderBy: { id: 'desc' },
       });
       if (!message) {
         throw new Error('Message not found');
