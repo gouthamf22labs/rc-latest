@@ -44,6 +44,7 @@ import {
   ReadMessageIdDto,
   RejectCallDto,
   EditMessage,
+  PinMessage,
   FetchPresenceDto,
   WatchPresenceDto,
   UnwatchPresenceDto,
@@ -171,6 +172,10 @@ export class ChatController {
     return await this.waMonitor.waInstances
       .get(instanceName)
       .assertSessions(data.numbers);
+  }
+
+  public async pinMessage({ instanceName }: InstanceDto, data: PinMessage) {
+    return await this.waMonitor.waInstances.get(instanceName).pinMessage(data);
   }
 
   public async editMessage({ instanceName }: InstanceDto, data: EditMessage) {

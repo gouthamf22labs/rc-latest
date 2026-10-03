@@ -125,3 +125,9 @@ export class RejectCallDto {
 export class EditMessage extends MessageId {
   text: string;
 }
+
+/** Pins (or unpins) a message in the chat for both sides, as WhatsApp does: for 24 h, 7 or 30 days. */
+export class PinMessage extends MessageId {
+  pin: boolean;
+  time?: 86400 | 604800 | 2592000;
+}

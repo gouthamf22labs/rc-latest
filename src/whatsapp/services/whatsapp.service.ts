@@ -120,6 +120,7 @@ import {
   ArchiveChatDto,
   DeleteMessage,
   EditMessage,
+  PinMessage,
   OnWhatsAppDto,
   ReadMessageDto,
   ReadMessageIdDto,
@@ -4065,6 +4066,37 @@ export class WAStartupService {
       { ...generate.message },
       data?.options,
     );
+  }
+
+  /** A pin both sides see, as in WhatsApp: for 24 hours, 7 days (its default) or 30 days. */
+  public async pinMessage(data: PinMessage) {
+    try {
+      const raw = String(data.id);
+      const message = await this.repository.message.findFirst({
+        where: {
+          instanceId: this.instance.id,
+          ...(/^\d+$/.test(raw) ? { OR: [{ id: Number.parseInt(raw) }, { keyId: raw }] } : { keyId: raw }),
+        },
+        orderBy: { id: 'desc' },
+      });
+      if (!message) {
+        throw new Error('Message not found');
+      }
+      const key: proto.IMessageKey = {
+        id: message.keyId,
+        fromMe: message.keyFromMe,
+        remoteJid: message.keyRemoteJid,
+        participant: message?.keyParticipant,
+      };
+      return await this.client.sendMessage(message.keyRemoteJid, {
+        pin: key,
+        type: data.pin ? proto.PinInChat.Type.PIN_FOR_ALL : proto.PinInChat.Type.UNPIN_FOR_ALL,
+        ...(data.pin ? { time: data.time ?? 604800 } : {}),
+      } as AnyMessageContent);
+    } catch (error) {
+      this.logger.error(error);
+      throw new BadRequestException(error.toString());
+    }
   }
 
   public async editMessage(data: EditMessage) {

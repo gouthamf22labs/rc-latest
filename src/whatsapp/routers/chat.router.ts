@@ -40,6 +40,7 @@ import {
   contactValidateSchema,
   deleteMessageSchema,
   editMessageSchema,
+  pinMessageSchema,
   messageValidateSchema,
   profilePictureSchema,
   readMessageForIdSchema,
@@ -55,6 +56,7 @@ import {
   ArchiveChatDto,
   DeleteMessage,
   EditMessage,
+  PinMessage,
   NumberDto,
   ReadMessageDto,
   ReadMessageIdDto,
@@ -366,6 +368,15 @@ export function ChatRouter(chatController: ChatController, ...guards: RequestHan
         request: req,
         schema: whatsappNumberSchema,
         execute: (instance, data) => chatController.assertSessions(instance, data),
+      });
+
+      res.status(HttpStatus.OK).json(response);
+    })
+    .post(routerPath('pinMessage'), ...guards, async (req, res) => {
+      const response = await dataValidate<PinMessage>({
+        request: req,
+        schema: pinMessageSchema,
+        execute: (instance, data) => chatController.pinMessage(instance, data),
       });
 
       res.status(HttpStatus.OK).json(response);

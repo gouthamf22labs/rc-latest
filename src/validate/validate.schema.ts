@@ -772,6 +772,17 @@ export const mediaUrlSchema: JSONSchema7 = {
   ...isNotEmpty('id'),
 };
 
+export const pinMessageSchema: JSONSchema7 = {
+  $id: ulid(),
+  type: 'object',
+  properties: {
+    id: { type: 'string', minLength: 1 },
+    pin: { type: 'boolean' },
+    time: { type: 'integer', enum: [86400, 604800, 2592000] },
+  },
+  required: ['id', 'pin'],
+};
+
 export const editMessageSchema: JSONSchema7 = {
   $id: ulid(),
   type: 'object',
