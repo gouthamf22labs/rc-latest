@@ -118,7 +118,7 @@ index 471a964..0e85b81 100644
  }
  exports.WaCallManager = WaCallManager;
 diff --git a/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js b/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
-index c48c448..acdbaa8 100644
+index c48c448..58888a8 100644
 --- a/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
 +++ b/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
 @@ -146,10 +146,8 @@ class WaCallMediaSession {
@@ -171,6 +171,15 @@ index c48c448..acdbaa8 100644
          const nodeInfo = (0, signaling_js_1.extractNodeInfo)(node);
          if (!nodeInfo)
              return;
+@@ -393,7 +407,7 @@ class WaCallMediaSession {
+                                 const sendKeying = (0, encryption_js_1.derivePerJidSrtpKey)(ourCallKey, this.ensureDeviceJid(ourDeviceJid));
+                                 const recvKeying = (0, encryption_js_1.derivePerJidSrtpKey)(peerCallKey, this.ensureDeviceJid(peerJid));
+                                 this.srtpSession = new srtp_js_1.SrtpSession(sendKeying, recvKeying, types_js_1.SRTP_SEND_AUTH_TAG_LEN, types_js_1.SRTP_RECV_AUTH_TAG_LEN);
+-                                this.srtcpContext = new srtp_js_1.SrtcpContext(sendKeying, types_js_1.SRTP_SEND_AUTH_TAG_LEN);
++                                this.srtcpContext = new srtp_js_1.SrtcpContext(sendKeying, types_js_1.SRTP_SEND_AUTH_TAG_LEN); this.peerSrtcp = new srtp_js_1.SrtcpContext(recvKeying, types_js_1.SRTP_RECV_AUTH_TAG_LEN);
+                                 srtpFromPeerKey = true;
+                                 this.logger.debug('srtp re-initialized with peer call_key', {
+                                     callId: this.info.callId
 @@ -697,7 +711,24 @@ class WaCallMediaSession {
          const inner = nodeInfo.innerNode;
          const callId = inner.attrs?.['call-id'] || this.info.callId;
@@ -219,6 +228,15 @@ index c48c448..acdbaa8 100644
              });
          }
          catch (err) {
+@@ -974,7 +1013,7 @@ class WaCallMediaSession {
+             const sendKeying = (0, encryption_js_1.derivePerJidSrtpKey)(callKey, ourDeviceJid);
+             const recvKeying = (0, encryption_js_1.derivePerJidSrtpKey)(callKey, peerDeviceJid);
+             this.srtpSession = new srtp_js_1.SrtpSession(sendKeying, recvKeying, types_js_1.SRTP_SEND_AUTH_TAG_LEN, types_js_1.SRTP_RECV_AUTH_TAG_LEN);
+-            this.srtcpContext = new srtp_js_1.SrtcpContext(sendKeying, types_js_1.SRTP_SEND_AUTH_TAG_LEN);
++            this.srtcpContext = new srtp_js_1.SrtcpContext(sendKeying, types_js_1.SRTP_SEND_AUTH_TAG_LEN); this.peerSrtcp = new srtp_js_1.SrtcpContext(recvKeying, types_js_1.SRTP_RECV_AUTH_TAG_LEN);
+             this.logger.debug('srtp per-jid keys initialized', {
+                 callId: this.info.callId,
+                 sendJid: ourDeviceJid,
 @@ -1018,6 +1057,43 @@ class WaCallMediaSession {
                  packetType: data[1],
                  bytes: data.length
