@@ -216,19 +216,16 @@ function wireHost(host: InstanceHost) {
       bridge.ws.send(out);
     },
   );
-  // Phones send what their camera sensor sees and say separately how to turn it. Until we know
-  // where WhatsApp puts that, log each call's RTP header extensions when they change (capped),
-  // so a test call where the phone is turned shows which field carries the rotation.
-  const seenExt = new Map<string, { last: string; count: number }>();
+  // Phones send what their camera sensor sees and say separately how to turn it. To find where,
+  // log the video frame-info byte's low bits and field 5 when they change, and a sample every
+  // 5 s (field 6 and 13 change every packet, so they're left out).
+  const seenExt = new Map<string, { last: string; at: number; count: number }>();
   host.on(
     'voip_call_inbound_video_rtp',
     ({ call, packet }: { call: any; packet: { extensionProfile?: number | null; extension?: Uint8Array | null } }) => {
       if (!packet?.extension) return;
       const ext = Buffer.from(packet.extension);
-      const hex = ext.toString('hex');
-      // One-byte header elements: id in the high nibble, length - 1 in the low. Leave out the frame
-      // info (3) and transport sequence (9), which change every packet; the rest is what's logged.
-      const fields: string[] = [];
+      const fields: Record<number, string> = {};
       for (let i = 0; i < ext.length; ) {
         const b = ext[i];
         if (b === 0) {
@@ -237,14 +234,16 @@ function wireHost(host: InstanceHost) {
         }
         const id = b >> 4;
         const len = (b & 0x0f) + 1;
-        if (id !== 3 && id !== 9) fields.push(`${id}=${ext.subarray(i + 1, i + 1 + len).toString('hex')}`);
+        fields[id] = ext.subarray(i + 1, i + 1 + len).toString('hex');
         i += 1 + len;
       }
-      const key = fields.join(' ');
-      const seen = seenExt.get(call.callId) ?? { last: '', count: 0 };
-      if (key === seen.last || seen.count >= 40) return;
-      seenExt.set(call.callId, { last: key, count: seen.count + 1 });
-      log('video rtp extension', { callId: call.callId, profile: (packet.extensionProfile ?? 0).toString(16), fields: key, data: hex });
+      const info = fields[3] ? parseInt(fields[3].slice(0, 2), 16) : -1;
+      const key = `low=${info < 0 ? '-' : (info & 0x07).toString(2).padStart(3, '0')} f5=${fields[5] ?? '-'}`;
+      const seen = seenExt.get(call.callId) ?? { last: '', at: 0, count: 0 };
+      const now = Date.now();
+      if ((key === seen.last && now - seen.at < 5000) || seen.count >= 120) return;
+      seenExt.set(call.callId, { last: key, at: now, count: seen.count + 1 });
+      log('video rtp extension', { callId: call.callId, key, frameInfo: info.toString(16), data: ext.toString('hex') });
     },
   );
   host.on('voip_call_ended', (call: any) => seenExt.delete(call?.callId));
@@ -276,7 +275,13 @@ function attachBridge(
     try {
       if (!isBinary) {
         const msg = JSON.parse(data.toString());
-        if (msg.t === 'hangup') void host.engine.endCall(callId).catch(() => undefined);
+        if (msg.t === 'hangup') {
+          log('hangup from browser', { callId, state: host.engine.getCall(callId)?.stateData?.state });
+          void host.engine
+            .endCall(callId)
+            .then(() => log('call ended from browser', { callId }))
+            .catch((error: Error) => log('end call failed', { callId, error: error?.message }));
+        }
         else if (msg.t === 'mute') host.engine.setMute(callId, Boolean(msg.muted));
         return;
       }
