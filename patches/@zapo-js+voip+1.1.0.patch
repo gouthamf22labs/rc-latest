@@ -118,7 +118,7 @@ index 471a964..0e85b81 100644
  }
  exports.WaCallManager = WaCallManager;
 diff --git a/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js b/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
-index c48c448..6f0c312 100644
+index c48c448..244f085 100644
 --- a/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
 +++ b/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
 @@ -146,10 +146,8 @@ class WaCallMediaSession {
@@ -254,7 +254,7 @@ index c48c448..6f0c312 100644
              this.logger.debug('srtp per-jid keys initialized', {
                  callId: this.info.callId,
                  sendJid: ourDeviceJid,
-@@ -1018,6 +1067,43 @@ class WaCallMediaSession {
+@@ -1018,6 +1067,44 @@ class WaCallMediaSession {
                  packetType: data[1],
                  bytes: data.length
              });
@@ -262,9 +262,10 @@ index c48c448..6f0c312 100644
 +            // every 10 s: what WhatsApp expects back to raise its video quality.
 +            // REMB from the phone: how much of our video it can take. Ignoring it, we sent far more
 +            // than the relay carried, so our video queued up on the phone (old video, slow hang-up).
-+            if (data[1] === 206 && (data[0] & 0x1f) === 15 && this.peerSrtcp && data.length > 8 + 4 + types_js_1.SRTP_RECV_AUTH_TAG_LEN) {
++            if (data[1] === 206 && (data[0] & 0x1f) === 15 && this.peerSrtcp && data.length >= ((data[2] << 8) | data[3]) * 4 + 4 + 4) {
 +                try {
-+                    const end = data.length - types_js_1.SRTP_RECV_AUTH_TAG_LEN - 4;
++                    // The phone's auth tag is 10 bytes (ours is 4): find the index word from the RTCP length.
++                    const end = (((data[2] << 8) | data[3]) + 1) * 4;
 +                    const word = (0, bytes_js_1.readUInt32BE)(data, end);
 +                    let body = data.subarray(8, end);
 +                    if (word & 0x80000000) {
@@ -298,7 +299,7 @@ index c48c448..6f0c312 100644
              return;
          }
          if (!(0, stun_js_1.isRtpPacket)(data))
-@@ -1084,7 +1170,9 @@ class WaCallMediaSession {
+@@ -1084,7 +1171,9 @@ class WaCallMediaSession {
                          timestamp: rtpPacket.header.timestamp,
                          ssrc: rtpPacket.header.ssrc,
                          marker: rtpPacket.header.marker,
@@ -336,7 +337,7 @@ index b5c8bc9..21db5d3 100644
              }
          });
 diff --git a/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js b/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
-index 5526c6a..64ba084 100644
+index 5526c6a..9768412 100644
 --- a/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
 +++ b/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
 @@ -3,7 +3,7 @@ import { getFirstNodeChild, getNodeChildrenByTag } from 'zapo-js/transport';
@@ -396,7 +397,7 @@ index 5526c6a..64ba084 100644
              this.logger.debug('srtp per-jid keys initialized', {
                  callId: this.info.callId,
                  sendJid: ourDeviceJid,
-@@ -1015,6 +1031,43 @@ export class WaCallMediaSession {
+@@ -1015,6 +1031,44 @@ export class WaCallMediaSession {
                  packetType: data[1],
                  bytes: data.length
              });
@@ -404,9 +405,10 @@ index 5526c6a..64ba084 100644
 +            // every 10 s: what WhatsApp expects back to raise its video quality.
 +            // REMB from the phone: how much of our video it can take. Ignoring it, we sent far more
 +            // than the relay carried, so our video queued up on the phone (old video, slow hang-up).
-+            if (data[1] === 206 && (data[0] & 0x1f) === 15 && this.peerSrtcp && data.length > 8 + 4 + SRTP_RECV_AUTH_TAG_LEN) {
++            if (data[1] === 206 && (data[0] & 0x1f) === 15 && this.peerSrtcp && data.length >= ((data[2] << 8) | data[3]) * 4 + 4 + 4) {
 +                try {
-+                    const end = data.length - SRTP_RECV_AUTH_TAG_LEN - 4;
++                    // The phone's auth tag is 10 bytes (ours is 4): find the index word from the RTCP length.
++                    const end = (((data[2] << 8) | data[3]) + 1) * 4;
 +                    const word = readUInt32BE(data, end);
 +                    let body = data.subarray(8, end);
 +                    if (word & 0x80000000) {
@@ -440,7 +442,7 @@ index 5526c6a..64ba084 100644
              return;
          }
          if (!isRtpPacket(data))
-@@ -1081,7 +1134,9 @@ export class WaCallMediaSession {
+@@ -1081,7 +1135,9 @@ export class WaCallMediaSession {
                          timestamp: rtpPacket.header.timestamp,
                          ssrc: rtpPacket.header.ssrc,
                          marker: rtpPacket.header.marker,
