@@ -165,6 +165,11 @@ function wireHost(host: InstanceHost) {
     bridge.lastInbound = Date.now();
     control(bridge.ws, { t: 'peerMute', muted: Boolean(muted) });
   });
+  // The phone's REMB: how much of our video it can take. The browser sizes its encoder to it.
+  host.on('voip_call_peer_bitrate', ({ call, bps }: { call: any; bps: number }) => {
+    const bridge = bridges.get(call?.callId);
+    if (bridge) control(bridge.ws, { t: 'bitrate', bps });
+  });
   host.on('voip_call_ended', (call: any) => {
     closeBridge(call.callId, call.stateData?.reason || 'ended');
   });

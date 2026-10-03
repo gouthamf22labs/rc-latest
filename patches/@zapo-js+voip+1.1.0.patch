@@ -1,5 +1,19 @@
+diff --git a/node_modules/@zapo-js/voip/dist/WaVoipCoordinator.js b/node_modules/@zapo-js/voip/dist/WaVoipCoordinator.js
+index 4668154..1a082b9 100644
+--- a/node_modules/@zapo-js/voip/dist/WaVoipCoordinator.js
++++ b/node_modules/@zapo-js/voip/dist/WaVoipCoordinator.js
+@@ -194,6 +194,9 @@ class WaVoipCoordinator {
+         this.manager.on('call_inbound_video_rtp', (call, packet) => {
+             ctx.emit('voip_call_inbound_video_rtp', { call, packet });
+         });
++        this.manager.on('call_peer_bitrate', (call, bps) => {
++            ctx.emit('voip_call_peer_bitrate', { call, bps });
++        });
+         this.manager.on('call_inbound_video', (call, frame) => {
+             ctx.emit('voip_call_inbound_video', { call, frame });
+         });
 diff --git a/node_modules/@zapo-js/voip/dist/call/WaCallManager.js b/node_modules/@zapo-js/voip/dist/call/WaCallManager.js
-index 471a964..c90520f 100644
+index 471a964..0e85b81 100644
 --- a/node_modules/@zapo-js/voip/dist/call/WaCallManager.js
 +++ b/node_modules/@zapo-js/voip/dist/call/WaCallManager.js
 @@ -152,6 +152,8 @@ class WaCallManager extends node_events_1.EventEmitter {
@@ -58,7 +72,15 @@ index 471a964..c90520f 100644
          this.calls.delete(session.callId);
          await this.maybeUnblockWaitingCalls();
      }
-@@ -420,6 +435,8 @@ class WaCallManager extends node_events_1.EventEmitter {
+@@ -314,6 +329,7 @@ class WaCallManager extends node_events_1.EventEmitter {
+                 emitInboundAudio: (call, pcm) => this.emit('call_inbound_audio', call, pcm),
+                 emitInboundVideoRtp: (call, packet) => this.emit('call_inbound_video_rtp', call, packet),
+                 emitInboundVideo: (call, frame) => this.emit('call_inbound_video', call, frame),
++                emitPeerBitrate: (call, bps) => this.emit('call_peer_bitrate', call, bps),
+                 emitOutboundAudioFinished: (call) => this.emit('call_outbound_audio_finished', call)
+             }
+         });
+@@ -420,6 +436,8 @@ class WaCallManager extends node_events_1.EventEmitter {
          const creds = this.deps.authClient.getCurrentCredentials();
          const selfLid = creds?.meLid || creds?.meJid || '';
          const peerDeviceJids = await this.resolvePeerDeviceJids(session.info.peerJid);
@@ -67,7 +89,7 @@ index 471a964..c90520f 100644
          if (session.info.relayData) {
              session.info.relayData.participantJids = [
                  ...peerDeviceJids,
-@@ -430,10 +447,27 @@ class WaCallManager extends node_events_1.EventEmitter {
+@@ -430,10 +448,27 @@ class WaCallManager extends node_events_1.EventEmitter {
              ? peerDeviceJids.find((jid) => /:[1-9]\d*@/.test(jid)) || session.info.peerJid
              : session.info.peerJid;
          await session.initMedia(selfLid, mediaPeerJid);
@@ -96,7 +118,7 @@ index 471a964..c90520f 100644
  }
  exports.WaCallManager = WaCallManager;
 diff --git a/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js b/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
-index c48c448..df02927 100644
+index c48c448..acdbaa8 100644
 --- a/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
 +++ b/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
 @@ -146,10 +146,8 @@ class WaCallMediaSession {
@@ -197,23 +219,51 @@ index c48c448..df02927 100644
              });
          }
          catch (err) {
-@@ -1018,6 +1057,15 @@ class WaCallMediaSession {
+@@ -1018,6 +1057,43 @@ class WaCallMediaSession {
                  packetType: data[1],
                  bytes: data.length
              });
 +            // Which feedback the other side sends (the RTCP header stays readable in SRTCP), summed
 +            // every 10 s: what WhatsApp expects back to raise its video quality.
++            // REMB from the phone: how much of our video it can take. Ignoring it, we sent far more
++            // than the relay carried, so our video queued up on the phone (old video, slow hang-up).
++            if (data[1] === 206 && (data[0] & 0x1f) === 15 && this.peerSrtcp && data.length > 8 + 4 + types_js_1.SRTP_RECV_AUTH_TAG_LEN) {
++                try {
++                    const end = data.length - types_js_1.SRTP_RECV_AUTH_TAG_LEN - 4;
++                    const word = (0, bytes_js_1.readUInt32BE)(data, end);
++                    let body = data.subarray(8, end);
++                    if (word & 0x80000000) {
++                        const iv = new Uint8Array(16);
++                        iv.set(this.peerSrtcp.salt, 0);
++                        for (let i = 0; i < 4; i++)
++                            iv[4 + i] ^= data[4 + i];
++                        const index = word & 0x7fffffff;
++                        for (let i = 0; i < 4; i++)
++                            iv[10 + i] ^= (index >>> (24 - 8 * i)) & 0xff;
++                        body = (0, primitives_js_1.aesCtr128)(this.peerSrtcp.cipherKey, iv, body);
++                    }
++                    // body: media SSRC, "REMB", SSRC count, 6-bit exponent + 18-bit mantissa
++                    if (body.length >= 12 && body[4] === 0x52 && body[5] === 0x45 && body[6] === 0x4d && body[7] === 0x42) {
++                        const bps = (((body[9] & 0x03) << 16) | (body[10] << 8) | body[11]) * 2 ** (body[9] >> 2);
++                        this.peerRembBps = bps;
++                        this.delegate.emitPeerBitrate?.(this.info, bps);
++                    }
++                    else
++                        this.rembMiss = Buffer.from(data).toString('hex');
++                }
++                catch { }
++            }
 +            this.rtcpSeen = this.rtcpSeen || { since: Date.now(), types: {} };
 +            const rtcpKey = `${data[1]}/${data[0] & 0x1f}/${data.length}`;
 +            this.rtcpSeen.types[rtcpKey] = (this.rtcpSeen.types[rtcpKey] || 0) + 1;
 +            if (Date.now() - this.rtcpSeen.since >= 10000) {
-+                this.logger.warn('rtcp from peer', { callId: this.info.callId, types: JSON.stringify(this.rtcpSeen.types) });
++                this.logger.warn('rtcp from peer', { callId: this.info.callId, types: JSON.stringify(this.rtcpSeen.types), rembKbps: this.peerRembBps ? Math.round(this.peerRembBps / 1000) : null, rembMiss: this.peerRembBps ? undefined : this.rembMiss });
 +                this.rtcpSeen = { since: Date.now(), types: {} };
 +            }
              return;
          }
          if (!(0, stun_js_1.isRtpPacket)(data))
-@@ -1084,7 +1132,9 @@ class WaCallMediaSession {
+@@ -1084,7 +1160,9 @@ class WaCallMediaSession {
                          timestamp: rtpPacket.header.timestamp,
                          ssrc: rtpPacket.header.ssrc,
                          marker: rtpPacket.header.marker,
@@ -224,10 +274,45 @@ index c48c448..df02927 100644
                      });
                      if (pt === 97 || pt === 103) {
                          let depacketizer = this.h264Depacketizers.get(rtpPacket.header.ssrc);
+diff --git a/node_modules/@zapo-js/voip/dist/esm/WaVoipCoordinator.js b/node_modules/@zapo-js/voip/dist/esm/WaVoipCoordinator.js
+index 28c9056..aa32d25 100644
+--- a/node_modules/@zapo-js/voip/dist/esm/WaVoipCoordinator.js
++++ b/node_modules/@zapo-js/voip/dist/esm/WaVoipCoordinator.js
+@@ -191,6 +191,9 @@ export class WaVoipCoordinator {
+         this.manager.on('call_inbound_video_rtp', (call, packet) => {
+             ctx.emit('voip_call_inbound_video_rtp', { call, packet });
+         });
++        this.manager.on('call_peer_bitrate', (call, bps) => {
++            ctx.emit('voip_call_peer_bitrate', { call, bps });
++        });
+         this.manager.on('call_inbound_video', (call, frame) => {
+             ctx.emit('voip_call_inbound_video', { call, frame });
+         });
+diff --git a/node_modules/@zapo-js/voip/dist/esm/call/WaCallManager.js b/node_modules/@zapo-js/voip/dist/esm/call/WaCallManager.js
+index b5c8bc9..21db5d3 100644
+--- a/node_modules/@zapo-js/voip/dist/esm/call/WaCallManager.js
++++ b/node_modules/@zapo-js/voip/dist/esm/call/WaCallManager.js
+@@ -311,6 +311,7 @@ export class WaCallManager extends EventEmitter {
+                 emitInboundAudio: (call, pcm) => this.emit('call_inbound_audio', call, pcm),
+                 emitInboundVideoRtp: (call, packet) => this.emit('call_inbound_video_rtp', call, packet),
+                 emitInboundVideo: (call, frame) => this.emit('call_inbound_video', call, frame),
++                emitPeerBitrate: (call, bps) => this.emit('call_peer_bitrate', call, bps),
+                 emitOutboundAudioFinished: (call) => this.emit('call_outbound_audio_finished', call)
+             }
+         });
 diff --git a/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js b/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
-index 5526c6a..0802bda 100644
+index 5526c6a..65b93f4 100644
 --- a/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
 +++ b/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
+@@ -3,7 +3,7 @@ import { getFirstNodeChild, getNodeChildrenByTag } from 'zapo-js/transport';
+ import { toError, uint8TimingSafeEqual } from 'zapo-js/util';
+ import { concatBytes, EMPTY_BYTES, readUInt32BE, toArrayBuffer } from '../bytes.js';
+ import { derivePerJidSrtpKey } from '../crypto/encryption.js';
+-import { randomBytes } from '../crypto/primitives.js';
++import { aesCtr128, randomBytes } from '../crypto/primitives.js';
+ import { SrtcpContext, SrtpSession } from '../crypto/srtp.js';
+ import { generateSecureSsrc } from '../crypto/ssrc.js';
+ import { H264Depacketizer, packetizeWhatsAppH264AccessUnit } from '../media/h264.js';
 @@ -206,6 +206,12 @@ export class WaCallMediaSession {
          this.info.applyTransition({ type: 'terminated', reason });
          const terminateTarget = this.acceptedByJid ?? this.info.peerJid;
@@ -241,23 +326,69 @@ index 5526c6a..0802bda 100644
          this.delegate.emitEnded(this.info);
          this.delegate.emitState(this.info);
          try {
-@@ -1015,6 +1021,15 @@ export class WaCallMediaSession {
+@@ -390,7 +396,7 @@ export class WaCallMediaSession {
+                                 const sendKeying = derivePerJidSrtpKey(ourCallKey, this.ensureDeviceJid(ourDeviceJid));
+                                 const recvKeying = derivePerJidSrtpKey(peerCallKey, this.ensureDeviceJid(peerJid));
+                                 this.srtpSession = new SrtpSession(sendKeying, recvKeying, SRTP_SEND_AUTH_TAG_LEN, SRTP_RECV_AUTH_TAG_LEN);
+-                                this.srtcpContext = new SrtcpContext(sendKeying, SRTP_SEND_AUTH_TAG_LEN);
++                                this.srtcpContext = new SrtcpContext(sendKeying, SRTP_SEND_AUTH_TAG_LEN); this.peerSrtcp = new SrtcpContext(recvKeying, SRTP_RECV_AUTH_TAG_LEN);
+                                 srtpFromPeerKey = true;
+                                 this.logger.debug('srtp re-initialized with peer call_key', {
+                                     callId: this.info.callId
+@@ -971,7 +977,7 @@ export class WaCallMediaSession {
+             const sendKeying = derivePerJidSrtpKey(callKey, ourDeviceJid);
+             const recvKeying = derivePerJidSrtpKey(callKey, peerDeviceJid);
+             this.srtpSession = new SrtpSession(sendKeying, recvKeying, SRTP_SEND_AUTH_TAG_LEN, SRTP_RECV_AUTH_TAG_LEN);
+-            this.srtcpContext = new SrtcpContext(sendKeying, SRTP_SEND_AUTH_TAG_LEN);
++            this.srtcpContext = new SrtcpContext(sendKeying, SRTP_SEND_AUTH_TAG_LEN); this.peerSrtcp = new SrtcpContext(recvKeying, SRTP_RECV_AUTH_TAG_LEN);
+             this.logger.debug('srtp per-jid keys initialized', {
+                 callId: this.info.callId,
+                 sendJid: ourDeviceJid,
+@@ -1015,6 +1021,43 @@ export class WaCallMediaSession {
                  packetType: data[1],
                  bytes: data.length
              });
 +            // Which feedback the other side sends (the RTCP header stays readable in SRTCP), summed
 +            // every 10 s: what WhatsApp expects back to raise its video quality.
++            // REMB from the phone: how much of our video it can take. Ignoring it, we sent far more
++            // than the relay carried, so our video queued up on the phone (old video, slow hang-up).
++            if (data[1] === 206 && (data[0] & 0x1f) === 15 && this.peerSrtcp && data.length > 8 + 4 + SRTP_RECV_AUTH_TAG_LEN) {
++                try {
++                    const end = data.length - SRTP_RECV_AUTH_TAG_LEN - 4;
++                    const word = readUInt32BE(data, end);
++                    let body = data.subarray(8, end);
++                    if (word & 0x80000000) {
++                        const iv = new Uint8Array(16);
++                        iv.set(this.peerSrtcp.salt, 0);
++                        for (let i = 0; i < 4; i++)
++                            iv[4 + i] ^= data[4 + i];
++                        const index = word & 0x7fffffff;
++                        for (let i = 0; i < 4; i++)
++                            iv[10 + i] ^= (index >>> (24 - 8 * i)) & 0xff;
++                        body = aesCtr128(this.peerSrtcp.cipherKey, iv, body);
++                    }
++                    // body: media SSRC, "REMB", SSRC count, 6-bit exponent + 18-bit mantissa
++                    if (body.length >= 12 && body[4] === 0x52 && body[5] === 0x45 && body[6] === 0x4d && body[7] === 0x42) {
++                        const bps = (((body[9] & 0x03) << 16) | (body[10] << 8) | body[11]) * 2 ** (body[9] >> 2);
++                        this.peerRembBps = bps;
++                        this.delegate.emitPeerBitrate?.(this.info, bps);
++                    }
++                    else
++                        this.rembMiss = Buffer.from(data).toString('hex');
++                }
++                catch { }
++            }
 +            this.rtcpSeen = this.rtcpSeen || { since: Date.now(), types: {} };
 +            const rtcpKey = `${data[1]}/${data[0] & 0x1f}/${data.length}`;
 +            this.rtcpSeen.types[rtcpKey] = (this.rtcpSeen.types[rtcpKey] || 0) + 1;
 +            if (Date.now() - this.rtcpSeen.since >= 10000) {
-+                this.logger.warn('rtcp from peer', { callId: this.info.callId, types: JSON.stringify(this.rtcpSeen.types) });
++                this.logger.warn('rtcp from peer', { callId: this.info.callId, types: JSON.stringify(this.rtcpSeen.types), rembKbps: this.peerRembBps ? Math.round(this.peerRembBps / 1000) : null, rembMiss: this.peerRembBps ? undefined : this.rembMiss });
 +                this.rtcpSeen = { since: Date.now(), types: {} };
 +            }
              return;
          }
          if (!isRtpPacket(data))
-@@ -1081,7 +1096,9 @@ export class WaCallMediaSession {
+@@ -1081,7 +1124,9 @@ export class WaCallMediaSession {
                          timestamp: rtpPacket.header.timestamp,
                          ssrc: rtpPacket.header.ssrc,
                          marker: rtpPacket.header.marker,
