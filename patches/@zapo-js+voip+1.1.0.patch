@@ -96,7 +96,7 @@ index 471a964..c90520f 100644
  }
  exports.WaCallManager = WaCallManager;
 diff --git a/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js b/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
-index c48c448..19b2552 100644
+index c48c448..9412178 100644
 --- a/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
 +++ b/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
 @@ -146,10 +146,8 @@ class WaCallMediaSession {
@@ -112,7 +112,20 @@ index c48c448..19b2552 100644
          const resolvedPeerSsrc = (0, ssrc_js_1.generateSecureSsrc)(callId, this.ensureDeviceJid(this.acceptedByJid));
          this.peerSsrcs = [resolvedPeerSsrc];
          this.sctpRelay.setSubscriptionSsrc(resolvedPeerSsrc);
-@@ -342,6 +340,9 @@ class WaCallMediaSession {
+@@ -209,6 +207,12 @@ class WaCallMediaSession {
+         this.info.applyTransition({ type: 'terminated', reason });
+         const terminateTarget = this.acceptedByJid ?? this.info.peerJid;
+         const node = (0, signaling_js_1.buildTerminateStanza)(terminateTarget, this.info.callId, this.info.callCreator, audioDurationMs);
++        // Phones end a video call with duration and video_duration (not audio_duration); a terminate
++        // without it was left ringing on the phone until its media timed out.
++        if (this.info.mediaType === types_js_1.CallMediaType.Video && node.content?.[0]?.attrs?.duration !== undefined) {
++            node.content[0].attrs.video_duration = node.content[0].attrs.duration;
++            delete node.content[0].attrs.audio_duration;
++        }
+         this.delegate.emitEnded(this.info);
+         this.delegate.emitState(this.info);
+         try {
+@@ -342,6 +346,9 @@ class WaCallMediaSession {
          const destinationJids = this.info.relayData.participantJids || [];
          const seenRelayNames = new Set();
          for (const ep of this.info.relayData.endpoints) {
@@ -122,7 +135,7 @@ index c48c448..19b2552 100644
              const name = ep.relayName || '';
              if (!name || seenRelayNames.has(name))
                  continue;
-@@ -366,6 +367,13 @@ class WaCallMediaSession {
+@@ -366,6 +373,13 @@ class WaCallMediaSession {
          }
      }
      async handleCallAccept(node, peerJid) {
@@ -136,7 +149,7 @@ index c48c448..19b2552 100644
          const nodeInfo = (0, signaling_js_1.extractNodeInfo)(node);
          if (!nodeInfo)
              return;
-@@ -697,7 +705,24 @@ class WaCallMediaSession {
+@@ -697,7 +711,24 @@ class WaCallMediaSession {
          const inner = nodeInfo.innerNode;
          const callId = inner.attrs?.['call-id'] || this.info.callId;
          const callCreator = inner.attrs?.['call-creator'] || this.info.callCreator;
@@ -162,7 +175,7 @@ index c48c448..19b2552 100644
          if (teNodes.length === 0)
              return;
          const destinationJids = this.info.relayData?.participantJids || [];
-@@ -760,11 +785,19 @@ class WaCallMediaSession {
+@@ -760,11 +791,19 @@ class WaCallMediaSession {
              });
          }
      }
@@ -184,7 +197,7 @@ index c48c448..19b2552 100644
              });
          }
          catch (err) {
-@@ -1084,7 +1117,9 @@ class WaCallMediaSession {
+@@ -1084,7 +1123,9 @@ class WaCallMediaSession {
                          timestamp: rtpPacket.header.timestamp,
                          ssrc: rtpPacket.header.ssrc,
                          marker: rtpPacket.header.marker,
@@ -196,10 +209,23 @@ index c48c448..19b2552 100644
                      if (pt === 97 || pt === 103) {
                          let depacketizer = this.h264Depacketizers.get(rtpPacket.header.ssrc);
 diff --git a/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js b/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
-index 5526c6a..c27b9b5 100644
+index 5526c6a..28696b3 100644
 --- a/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
 +++ b/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
-@@ -1081,7 +1081,9 @@ export class WaCallMediaSession {
+@@ -206,6 +206,12 @@ export class WaCallMediaSession {
+         this.info.applyTransition({ type: 'terminated', reason });
+         const terminateTarget = this.acceptedByJid ?? this.info.peerJid;
+         const node = buildTerminateStanza(terminateTarget, this.info.callId, this.info.callCreator, audioDurationMs);
++        // Phones end a video call with duration and video_duration (not audio_duration); a terminate
++        // without it was left ringing on the phone until its media timed out.
++        if (this.info.mediaType === CallMediaType.Video && node.content?.[0]?.attrs?.duration !== undefined) {
++            node.content[0].attrs.video_duration = node.content[0].attrs.duration;
++            delete node.content[0].attrs.audio_duration;
++        }
+         this.delegate.emitEnded(this.info);
+         this.delegate.emitState(this.info);
+         try {
+@@ -1081,7 +1087,9 @@ export class WaCallMediaSession {
                          timestamp: rtpPacket.header.timestamp,
                          ssrc: rtpPacket.header.ssrc,
                          marker: rtpPacket.header.marker,
