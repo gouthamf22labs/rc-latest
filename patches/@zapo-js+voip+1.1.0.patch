@@ -118,7 +118,7 @@ index 471a964..0e85b81 100644
  }
  exports.WaCallManager = WaCallManager;
 diff --git a/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js b/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
-index c48c448..58888a8 100644
+index c48c448..6f0c312 100644
 --- a/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
 +++ b/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
 @@ -146,10 +146,8 @@ class WaCallMediaSession {
@@ -147,7 +147,24 @@ index c48c448..58888a8 100644
          this.delegate.emitEnded(this.info);
          this.delegate.emitState(this.info);
          try {
-@@ -342,6 +346,9 @@ class WaCallMediaSession {
+@@ -253,6 +257,16 @@ class WaCallMediaSession {
+             !this.sctpRelay.hasConnection() ||
+             !data.length)
+             return 0;
++        // The relay channel is reliable: what it can't send yet waits, and video sent on top of a
++        // backlog reaches the phone seconds late (and the hang-up with it). Skip frames until it
++        // drains, then start again at a key frame. -1 tells the caller to ask for one.
++        const keyFrameIn = this.isH264KeyFrame(data);
++        if (keyFrameIn)
++            this.videoDropUntilKey = false;
++        if (this.videoDropUntilKey || (!keyFrameIn && this.sctpRelay.bufferedAmount() > 32000) || (keyFrameIn && this.sctpRelay.bufferedAmount() > 96000)) {
++            this.videoDropUntilKey = true;
++            return -1;
++        }
+         const payloads = (0, h264_js_1.packetizeWhatsAppH264AccessUnit)(data);
+         const timestamp = Math.floor((Math.max(0, timestampUs) * 90) / 1000) >>> 0;
+         this.lastVideoRtpTimestamp = timestamp;
+@@ -342,6 +356,9 @@ class WaCallMediaSession {
          const destinationJids = this.info.relayData.participantJids || [];
          const seenRelayNames = new Set();
          for (const ep of this.info.relayData.endpoints) {
@@ -157,7 +174,7 @@ index c48c448..58888a8 100644
              const name = ep.relayName || '';
              if (!name || seenRelayNames.has(name))
                  continue;
-@@ -366,6 +373,13 @@ class WaCallMediaSession {
+@@ -366,6 +383,13 @@ class WaCallMediaSession {
          }
      }
      async handleCallAccept(node, peerJid) {
@@ -171,7 +188,7 @@ index c48c448..58888a8 100644
          const nodeInfo = (0, signaling_js_1.extractNodeInfo)(node);
          if (!nodeInfo)
              return;
-@@ -393,7 +407,7 @@ class WaCallMediaSession {
+@@ -393,7 +417,7 @@ class WaCallMediaSession {
                                  const sendKeying = (0, encryption_js_1.derivePerJidSrtpKey)(ourCallKey, this.ensureDeviceJid(ourDeviceJid));
                                  const recvKeying = (0, encryption_js_1.derivePerJidSrtpKey)(peerCallKey, this.ensureDeviceJid(peerJid));
                                  this.srtpSession = new srtp_js_1.SrtpSession(sendKeying, recvKeying, types_js_1.SRTP_SEND_AUTH_TAG_LEN, types_js_1.SRTP_RECV_AUTH_TAG_LEN);
@@ -180,7 +197,7 @@ index c48c448..58888a8 100644
                                  srtpFromPeerKey = true;
                                  this.logger.debug('srtp re-initialized with peer call_key', {
                                      callId: this.info.callId
-@@ -697,7 +711,24 @@ class WaCallMediaSession {
+@@ -697,7 +721,24 @@ class WaCallMediaSession {
          const inner = nodeInfo.innerNode;
          const callId = inner.attrs?.['call-id'] || this.info.callId;
          const callCreator = inner.attrs?.['call-creator'] || this.info.callCreator;
@@ -206,7 +223,7 @@ index c48c448..58888a8 100644
          if (teNodes.length === 0)
              return;
          const destinationJids = this.info.relayData?.participantJids || [];
-@@ -760,11 +791,19 @@ class WaCallMediaSession {
+@@ -760,11 +801,19 @@ class WaCallMediaSession {
              });
          }
      }
@@ -228,7 +245,7 @@ index c48c448..58888a8 100644
              });
          }
          catch (err) {
-@@ -974,7 +1013,7 @@ class WaCallMediaSession {
+@@ -974,7 +1023,7 @@ class WaCallMediaSession {
              const sendKeying = (0, encryption_js_1.derivePerJidSrtpKey)(callKey, ourDeviceJid);
              const recvKeying = (0, encryption_js_1.derivePerJidSrtpKey)(callKey, peerDeviceJid);
              this.srtpSession = new srtp_js_1.SrtpSession(sendKeying, recvKeying, types_js_1.SRTP_SEND_AUTH_TAG_LEN, types_js_1.SRTP_RECV_AUTH_TAG_LEN);
@@ -237,7 +254,7 @@ index c48c448..58888a8 100644
              this.logger.debug('srtp per-jid keys initialized', {
                  callId: this.info.callId,
                  sendJid: ourDeviceJid,
-@@ -1018,6 +1057,43 @@ class WaCallMediaSession {
+@@ -1018,6 +1067,43 @@ class WaCallMediaSession {
                  packetType: data[1],
                  bytes: data.length
              });
@@ -281,7 +298,7 @@ index c48c448..58888a8 100644
              return;
          }
          if (!(0, stun_js_1.isRtpPacket)(data))
-@@ -1084,7 +1160,9 @@ class WaCallMediaSession {
+@@ -1084,7 +1170,9 @@ class WaCallMediaSession {
                          timestamp: rtpPacket.header.timestamp,
                          ssrc: rtpPacket.header.ssrc,
                          marker: rtpPacket.header.marker,
@@ -319,7 +336,7 @@ index b5c8bc9..21db5d3 100644
              }
          });
 diff --git a/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js b/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
-index 5526c6a..65b93f4 100644
+index 5526c6a..64ba084 100644
 --- a/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
 +++ b/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
 @@ -3,7 +3,7 @@ import { getFirstNodeChild, getNodeChildrenByTag } from 'zapo-js/transport';
@@ -344,7 +361,24 @@ index 5526c6a..65b93f4 100644
          this.delegate.emitEnded(this.info);
          this.delegate.emitState(this.info);
          try {
-@@ -390,7 +396,7 @@ export class WaCallMediaSession {
+@@ -250,6 +256,16 @@ export class WaCallMediaSession {
+             !this.sctpRelay.hasConnection() ||
+             !data.length)
+             return 0;
++        // The relay channel is reliable: what it can't send yet waits, and video sent on top of a
++        // backlog reaches the phone seconds late (and the hang-up with it). Skip frames until it
++        // drains, then start again at a key frame. -1 tells the caller to ask for one.
++        const keyFrameIn = this.isH264KeyFrame(data);
++        if (keyFrameIn)
++            this.videoDropUntilKey = false;
++        if (this.videoDropUntilKey || (!keyFrameIn && this.sctpRelay.bufferedAmount() > 32000) || (keyFrameIn && this.sctpRelay.bufferedAmount() > 96000)) {
++            this.videoDropUntilKey = true;
++            return -1;
++        }
+         const payloads = packetizeWhatsAppH264AccessUnit(data);
+         const timestamp = Math.floor((Math.max(0, timestampUs) * 90) / 1000) >>> 0;
+         this.lastVideoRtpTimestamp = timestamp;
+@@ -390,7 +406,7 @@ export class WaCallMediaSession {
                                  const sendKeying = derivePerJidSrtpKey(ourCallKey, this.ensureDeviceJid(ourDeviceJid));
                                  const recvKeying = derivePerJidSrtpKey(peerCallKey, this.ensureDeviceJid(peerJid));
                                  this.srtpSession = new SrtpSession(sendKeying, recvKeying, SRTP_SEND_AUTH_TAG_LEN, SRTP_RECV_AUTH_TAG_LEN);
@@ -353,7 +387,7 @@ index 5526c6a..65b93f4 100644
                                  srtpFromPeerKey = true;
                                  this.logger.debug('srtp re-initialized with peer call_key', {
                                      callId: this.info.callId
-@@ -971,7 +977,7 @@ export class WaCallMediaSession {
+@@ -971,7 +987,7 @@ export class WaCallMediaSession {
              const sendKeying = derivePerJidSrtpKey(callKey, ourDeviceJid);
              const recvKeying = derivePerJidSrtpKey(callKey, peerDeviceJid);
              this.srtpSession = new SrtpSession(sendKeying, recvKeying, SRTP_SEND_AUTH_TAG_LEN, SRTP_RECV_AUTH_TAG_LEN);
@@ -362,7 +396,7 @@ index 5526c6a..65b93f4 100644
              this.logger.debug('srtp per-jid keys initialized', {
                  callId: this.info.callId,
                  sendJid: ourDeviceJid,
-@@ -1015,6 +1021,43 @@ export class WaCallMediaSession {
+@@ -1015,6 +1031,43 @@ export class WaCallMediaSession {
                  packetType: data[1],
                  bytes: data.length
              });
@@ -406,7 +440,7 @@ index 5526c6a..65b93f4 100644
              return;
          }
          if (!isRtpPacket(data))
-@@ -1081,7 +1124,9 @@ export class WaCallMediaSession {
+@@ -1081,7 +1134,9 @@ export class WaCallMediaSession {
                          timestamp: rtpPacket.header.timestamp,
                          ssrc: rtpPacket.header.ssrc,
                          marker: rtpPacket.header.marker,
@@ -417,3 +451,43 @@ index 5526c6a..65b93f4 100644
                      });
                      if (pt === 97 || pt === 103) {
                          let depacketizer = this.h264Depacketizers.get(rtpPacket.header.ssrc);
+diff --git a/node_modules/@zapo-js/voip/dist/esm/relay/WaSctpRelay.js b/node_modules/@zapo-js/voip/dist/esm/relay/WaSctpRelay.js
+index 3729d56..45ef979 100644
+--- a/node_modules/@zapo-js/voip/dist/esm/relay/WaSctpRelay.js
++++ b/node_modules/@zapo-js/voip/dist/esm/relay/WaSctpRelay.js
+@@ -826,6 +826,15 @@ export class WaSctpRelay extends EventEmitter {
+             }
+         }
+     }
++    /** Bytes waiting to go out on the busiest open channel. */
++    bufferedAmount() {
++        let most = 0;
++        for (const conn of this.connections.values()) {
++            if (this.isConnOpen(conn))
++                most = Math.max(most, conn.channel?.bufferedAmount ?? 0);
++        }
++        return most;
++    }
+     hasConnection() {
+         for (const conn of this.connections.values()) {
+             if (conn.state === ConnectionState.Open)
+diff --git a/node_modules/@zapo-js/voip/dist/relay/WaSctpRelay.js b/node_modules/@zapo-js/voip/dist/relay/WaSctpRelay.js
+index 199bfc0..63c2e4a 100644
+--- a/node_modules/@zapo-js/voip/dist/relay/WaSctpRelay.js
++++ b/node_modules/@zapo-js/voip/dist/relay/WaSctpRelay.js
+@@ -832,6 +832,15 @@ class WaSctpRelay extends node_events_1.EventEmitter {
+             }
+         }
+     }
++    /** Bytes waiting to go out on the busiest open channel. */
++    bufferedAmount() {
++        let most = 0;
++        for (const conn of this.connections.values()) {
++            if (this.isConnOpen(conn))
++                most = Math.max(most, conn.channel?.bufferedAmount ?? 0);
++        }
++        return most;
++    }
+     hasConnection() {
+         for (const conn of this.connections.values()) {
+             if (conn.state === ConnectionState.Open)

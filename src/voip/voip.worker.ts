@@ -132,6 +132,8 @@ type Bridge = {
   startedAt: number;
   /** Video from the customer over the last 10 s, to see where frames are lost. */
   video?: { frames: number; keys: number; sent: number; backlog: number; waiting: number; bytes: number; since: number };
+  /** Our video to the customer, for the 10 s log: how late it reaches us, and what we skipped. */
+  outVideo?: { frames: number; dropped: number; bytes: number; minLag: number; maxLate: number; since: number; keyAskedAt: number };
 };
 const bridges = new Map<string, Bridge>();
 
@@ -290,11 +292,39 @@ function attachBridge(
         bytes.set(data.subarray(1));
         host.engine.feedLiveAudio(callId, new Float32Array(bytes.buffer));
       } else if (data[0] === FRAME_VIDEO && data.length > 9) {
-        host.engine.feedLiveVideo(
-          callId,
-          new Uint8Array(data.subarray(9)),
-          data.readDoubleLE(1),
-        );
+        const timestampUs = data.readDoubleLE(1);
+        const sent = host.engine.feedLiveVideo(callId, new Uint8Array(data.subarray(9)), timestampUs);
+        const bridge = bridges.get(callId);
+        if (bridge) {
+          const now = Date.now();
+          const o = (bridge.outVideo ??= { frames: 0, dropped: 0, bytes: 0, minLag: Infinity, maxLate: 0, since: now, keyAskedAt: 0 });
+          o.frames++;
+          o.bytes += data.length;
+          // The browser stamps frames with its own clock, so only the change in the gap means
+          // anything: above the smallest seen is time a frame spent queued on the way here.
+          const lag = now - timestampUs / 1000;
+          o.minLag = Math.min(o.minLag, lag);
+          o.maxLate = Math.max(o.maxLate, lag - o.minLag);
+          if (sent === -1) {
+            o.dropped++;
+            // The relay is backed up and the engine waits for a key frame: ask for one (at most 2/s).
+            if (now - o.keyAskedAt > 500) {
+              o.keyAskedAt = now;
+              control(ws, { t: 'keyFrame' });
+            }
+          }
+          if (now - o.since >= 10_000) {
+            const secs = (now - o.since) / 1000;
+            log('video to customer', {
+              callId,
+              fps: +(o.frames / secs).toFixed(1),
+              kbps: Math.round((o.bytes * 8) / secs / 1000),
+              droppedRelayBacklog: o.dropped,
+              maxLateMs: Math.round(o.maxLate),
+            });
+            Object.assign(o, { frames: 0, dropped: 0, bytes: 0, maxLate: 0, since: now });
+          }
+        }
       }
     } catch (error) {
       log('bad frame from browser', { callId, error: (error as Error).message });
