@@ -41,6 +41,7 @@ import {
   deleteMessageSchema,
   editMessageSchema,
   pinMessageSchema,
+  forwardMessageSchema,
   messageValidateSchema,
   profilePictureSchema,
   readMessageForIdSchema,
@@ -57,6 +58,7 @@ import {
   DeleteMessage,
   EditMessage,
   PinMessage,
+  ForwardMessage,
   NumberDto,
   ReadMessageDto,
   ReadMessageIdDto,
@@ -371,6 +373,15 @@ export function ChatRouter(chatController: ChatController, ...guards: RequestHan
       });
 
       res.status(HttpStatus.OK).json(response);
+    })
+    .post(routerPath('forwardMessage'), ...guards, async (req, res) => {
+      const response = await dataValidate<ForwardMessage>({
+        request: req,
+        schema: forwardMessageSchema,
+        execute: (instance, data) => chatController.forwardMessage(instance, data),
+      });
+
+      res.status(HttpStatus.CREATED).json(response);
     })
     .post(routerPath('pinMessage'), ...guards, async (req, res) => {
       const response = await dataValidate<PinMessage>({

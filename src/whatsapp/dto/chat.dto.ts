@@ -126,6 +126,11 @@ export class EditMessage extends MessageId {
   text: string;
 }
 
+/** Forwards a stored message to other chats on this number, as WhatsApp does (up to 5). */
+export class ForwardMessage extends MessageId {
+  to: string[];
+}
+
 /** Pins (or unpins) a message in the chat for both sides, as WhatsApp does: for 24 h, 7 or 30 days. */
 export class PinMessage extends MessageId {
   pin: boolean;

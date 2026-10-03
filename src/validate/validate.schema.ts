@@ -772,6 +772,16 @@ export const mediaUrlSchema: JSONSchema7 = {
   ...isNotEmpty('id'),
 };
 
+export const forwardMessageSchema: JSONSchema7 = {
+  $id: ulid(),
+  type: 'object',
+  properties: {
+    id: { type: 'string', minLength: 1 },
+    to: { type: 'array', minItems: 1, maxItems: 5, uniqueItems: true, items: { type: 'string', minLength: 1 } },
+  },
+  required: ['id', 'to'],
+};
+
 export const pinMessageSchema: JSONSchema7 = {
   $id: ulid(),
   type: 'object',

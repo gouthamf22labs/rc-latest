@@ -121,6 +121,7 @@ import {
   DeleteMessage,
   EditMessage,
   PinMessage,
+  ForwardMessage,
   OnWhatsAppDto,
   ReadMessageDto,
   ReadMessageIdDto,
@@ -3013,7 +3014,7 @@ export class WAStartupService {
           message?.['pollCreationMessageV2'] ||
           message?.['pollCreationMessageV3'];
 
-        if (!isPollProto && (message?.['react'] || message?.['edit'] || message?.['text'] || message?.['poll'] || isJidNewsletter(recipient))) {
+        if (!isPollProto && (message?.['react'] || message?.['edit'] || message?.['text'] || message?.['poll'] || message?.['forward'] || isJidNewsletter(recipient))) {
           // Newsletters: client.sendMessage internally calls prepareWAMessageMedia with the
           // newsletter JID, which uses the correct unencrypted upload path for newsletters.
           // relayMessage() skips this and sends the pre-built proto which WhatsApp rejects for media.
@@ -4066,6 +4067,38 @@ export class WAStartupService {
       { ...generate.message },
       data?.options,
     );
+  }
+
+  /**
+   * Forwards a stored message, as WhatsApp's Forward does: the same message (files included, no
+   * re-upload) marked "Forwarded", to each chat. Saved and announced like any other send.
+   */
+  public async forwardMessage(data: ForwardMessage) {
+    const raw = String(data.id);
+    const message = await this.repository.message.findFirst({
+      where: {
+        instanceId: this.instance.id,
+        ...(/^\d+$/.test(raw) ? { OR: [{ id: Number.parseInt(raw) }, { keyId: raw }] } : { keyId: raw }),
+      },
+      orderBy: { id: 'desc' },
+    });
+    if (!message) {
+      throw { status: 404, error: 'Not Found', message: ['Message not found'] };
+    }
+    const original = {
+      key: {
+        id: message.keyId,
+        fromMe: message.keyFromMe,
+        remoteJid: message.keyRemoteJid,
+        participant: message.keyParticipant ?? undefined,
+      },
+      message: { [message.messageType]: message.content as any },
+    } as WAMessage;
+    const sent = [];
+    for (const to of data.to) {
+      sent.push(await this.sendMessageWithTyping(to, { forward: original } as AnyMessageContent));
+    }
+    return sent;
   }
 
   /** A pin both sides see, as in WhatsApp: for 24 hours, 7 days (its default) or 30 days. */

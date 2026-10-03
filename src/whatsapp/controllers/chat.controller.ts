@@ -45,6 +45,7 @@ import {
   RejectCallDto,
   EditMessage,
   PinMessage,
+  ForwardMessage,
   FetchPresenceDto,
   WatchPresenceDto,
   UnwatchPresenceDto,
@@ -172,6 +173,10 @@ export class ChatController {
     return await this.waMonitor.waInstances
       .get(instanceName)
       .assertSessions(data.numbers);
+  }
+
+  public async forwardMessage({ instanceName }: InstanceDto, data: ForwardMessage) {
+    return await this.waMonitor.waInstances.get(instanceName).forwardMessage(data);
   }
 
   public async pinMessage({ instanceName }: InstanceDto, data: PinMessage) {
