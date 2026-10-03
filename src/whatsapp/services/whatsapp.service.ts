@@ -4404,7 +4404,8 @@ export class WAStartupService {
         orderBy: { id: 'desc' },
       });
       if (!message) {
-        throw new Error('Message not found');
+        // Not something this number has: a 404, not a server error.
+        throw { status: 404, error: 'Not Found', message: ['Message not found'] };
       }
 
       // "Delete for me" must stop here. It used to fall through to the revoke below, so a
@@ -4441,6 +4442,7 @@ export class WAStartupService {
 
       return { deletedAt: new Date(), message };
     } catch (error) {
+      if (error?.status === 404) throw error;
       throw new InternalServerErrorException(
         'Error while deleting message for everyone',
         error?.toString(),
