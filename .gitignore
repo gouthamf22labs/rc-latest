@@ -30,3 +30,5 @@ lerna-debug.log*
 .env
 /uploads
 /logs
+# Stage env kept locally for reference — holds real credentials, never commit
+.env.stage

@@ -96,7 +96,7 @@ index 471a964..c90520f 100644
  }
  exports.WaCallManager = WaCallManager;
 diff --git a/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js b/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
-index c48c448..df02927 100644
+index c48c448..314b799 100644
 --- a/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
 +++ b/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
 @@ -146,10 +146,8 @@ class WaCallMediaSession {
@@ -213,7 +213,15 @@ index c48c448..df02927 100644
              return;
          }
          if (!(0, stun_js_1.isRtpPacket)(data))
-@@ -1084,7 +1132,9 @@ class WaCallMediaSession {
+@@ -1047,6 +1095,7 @@ class WaCallMediaSession {
+             if (pt !== 120) {
+                 if (pt === 97 || pt === 103) {
+                     this.videoRecvPackets++;
++                    if (pt === 97) this.peerVideoSsrc = rtpPacket.header.ssrc; // 103 is the resend stream (own SSRC)
+                     if (this.videoRecvPackets === 1 || this.videoRecvPackets % 100 === 0) {
+                         this.logger.debug('video packet received', {
+                             callId: this.info.callId,
+@@ -1084,7 +1133,9 @@ class WaCallMediaSession {
                          timestamp: rtpPacket.header.timestamp,
                          ssrc: rtpPacket.header.ssrc,
                          marker: rtpPacket.header.marker,
@@ -224,8 +232,40 @@ index c48c448..df02927 100644
                      });
                      if (pt === 97 || pt === 103) {
                          let depacketizer = this.h264Depacketizers.get(rtpPacket.header.ssrc);
+@@ -1260,6 +1311,31 @@ class WaCallMediaSession {
+             this.rtcpInterval = setInterval(() => {
+                 if (!this.srtcpContext || !this.videoRtpSession)
+                     return;
++                // WhatsApp sets its video bitrate from the receiver's REMB (RTCP PSFB FMT 15), and
++                // phones send us one about every 5 s. Without one from us the phone stays at its
++                // floor (~5 fps, ~26 kbps). Tell it we can take up to 1.2 Mbps.
++                if (this.peerVideoSsrc != null) {
++                    const remb = new Uint8Array(24);
++                    const view = new DataView(remb.buffer);
++                    remb[0] = 0x8f; // V=2, FMT=15 (application layer feedback)
++                    remb[1] = 206; // payload-specific feedback
++                    view.setUint16(2, 5); // length in words - 1
++                    view.setUint32(4, this.videoRtpSession.getSsrc() >>> 0);
++                    view.setUint32(8, 0);
++                    remb.set([0x52, 0x45, 0x4d, 0x42], 12); // "REMB"
++                    let mantissa = 1200000;
++                    let exponent = 0;
++                    while (mantissa > 0x3ffff) {
++                        mantissa >>>= 1;
++                        exponent++;
++                    }
++                    remb[16] = 1; // one SSRC
++                    remb[17] = (exponent << 2) | ((mantissa >>> 16) & 0x03);
++                    remb[18] = (mantissa >>> 8) & 0xff;
++                    remb[19] = mantissa & 0xff;
++                    view.setUint32(20, this.peerVideoSsrc >>> 0);
++                    this.sctpRelay.broadcast((0, bytes_js_1.toArrayBuffer)(this.srtcpContext.protect(remb, this.videoRtpSession.getSsrc())));
++                }
+                 if (this.lastVideoRtpTimestamp === null)
+                     return;
+                 const elapsed = Math.max(0, Date.now() - this.lastVideoSentAt);
 diff --git a/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js b/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
-index 5526c6a..0802bda 100644
+index 5526c6a..77b45a8 100644
 --- a/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
 +++ b/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
 @@ -206,6 +206,12 @@ export class WaCallMediaSession {
@@ -257,7 +297,15 @@ index 5526c6a..0802bda 100644
              return;
          }
          if (!isRtpPacket(data))
-@@ -1081,7 +1096,9 @@ export class WaCallMediaSession {
+@@ -1044,6 +1059,7 @@ export class WaCallMediaSession {
+             if (pt !== 120) {
+                 if (pt === 97 || pt === 103) {
+                     this.videoRecvPackets++;
++                    if (pt === 97) this.peerVideoSsrc = rtpPacket.header.ssrc; // 103 is the resend stream (own SSRC)
+                     if (this.videoRecvPackets === 1 || this.videoRecvPackets % 100 === 0) {
+                         this.logger.debug('video packet received', {
+                             callId: this.info.callId,
+@@ -1081,7 +1097,9 @@ export class WaCallMediaSession {
                          timestamp: rtpPacket.header.timestamp,
                          ssrc: rtpPacket.header.ssrc,
                          marker: rtpPacket.header.marker,
@@ -268,3 +316,35 @@ index 5526c6a..0802bda 100644
                      });
                      if (pt === 97 || pt === 103) {
                          let depacketizer = this.h264Depacketizers.get(rtpPacket.header.ssrc);
+@@ -1257,6 +1275,31 @@ export class WaCallMediaSession {
+             this.rtcpInterval = setInterval(() => {
+                 if (!this.srtcpContext || !this.videoRtpSession)
+                     return;
++                // WhatsApp sets its video bitrate from the receiver's REMB (RTCP PSFB FMT 15), and
++                // phones send us one about every 5 s. Without one from us the phone stays at its
++                // floor (~5 fps, ~26 kbps). Tell it we can take up to 1.2 Mbps.
++                if (this.peerVideoSsrc != null) {
++                    const remb = new Uint8Array(24);
++                    const view = new DataView(remb.buffer);
++                    remb[0] = 0x8f; // V=2, FMT=15 (application layer feedback)
++                    remb[1] = 206; // payload-specific feedback
++                    view.setUint16(2, 5); // length in words - 1
++                    view.setUint32(4, this.videoRtpSession.getSsrc() >>> 0);
++                    view.setUint32(8, 0);
++                    remb.set([0x52, 0x45, 0x4d, 0x42], 12); // "REMB"
++                    let mantissa = 1200000;
++                    let exponent = 0;
++                    while (mantissa > 0x3ffff) {
++                        mantissa >>>= 1;
++                        exponent++;
++                    }
++                    remb[16] = 1; // one SSRC
++                    remb[17] = (exponent << 2) | ((mantissa >>> 16) & 0x03);
++                    remb[18] = (mantissa >>> 8) & 0xff;
++                    remb[19] = mantissa & 0xff;
++                    view.setUint32(20, this.peerVideoSsrc >>> 0);
++                    this.sctpRelay.broadcast(toArrayBuffer(this.srtcpContext.protect(remb, this.videoRtpSession.getSsrc())));
++                }
+                 if (this.lastVideoRtpTimestamp === null)
+                     return;
+                 const elapsed = Math.max(0, Date.now() - this.lastVideoSentAt);
