@@ -3,15 +3,24 @@ FROM public.ecr.aws/docker/library/node:24-bookworm-slim AS base
 # bookworm, not bullseye: bullseye-security stopped publishing and its package pool was
 # withdrawn from deb.debian.org, so apt 404s on ffmpeg's dependencies. Ignoring the
 # expired Release file is not enough - the .debs are simply gone.
-RUN apt-get update && apt-get install -y --no-install-recommends git ffmpeg \
- && rm -rf /var/lib/apt/lists/*
+# Building needs only git (for git dependencies); ffmpeg is a runtime need, installed in the
+# production stage. The apt and npm caches persist between builds (BuildKit cache mounts), so a
+# rebuild downloads only what changed.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean \
+ && apt-get update && apt-get install -y --no-install-recommends git
 
 WORKDIR /codechat
 
 COPY package*.json .npmrc ./
-COPY ./patches ./patches
 
-RUN npm install --force
+# postinstall runs patch-package; with no patches/ yet it does nothing. The patches are applied
+# below, so editing one doesn't redo the whole install.
+RUN --mount=type=cache,target=/root/.npm npm install --force
+
+COPY ./patches ./patches
+RUN npx patch-package
 
 COPY tsconfig.json .
 COPY ./src ./src
@@ -32,13 +41,15 @@ RUN npm prune --omit=dev --legacy-peer-deps
 # generated on macOS plus `npm install --force` can leave the linux binary out,
 # so the app crashes at boot with "Could not load the sharp module". Reinstall it
 # for the image's own architecture (works for both arm64 and amd64 builds).
-RUN npm install --include=optional --no-save --legacy-peer-deps sharp
+RUN --mount=type=cache,target=/root/.npm npm install --include=optional --no-save --legacy-peer-deps sharp
 
 FROM public.ecr.aws/docker/library/node:24-bookworm-slim AS production
 
 # See the note in the base stage.
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
- && rm -rf /var/lib/apt/lists/*
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean \
+ && apt-get update && apt-get install -y --no-install-recommends ffmpeg
 
 WORKDIR /codechat
 

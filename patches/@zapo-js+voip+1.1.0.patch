@@ -96,7 +96,7 @@ index 471a964..c90520f 100644
  }
  exports.WaCallManager = WaCallManager;
 diff --git a/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js b/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
-index c48c448..9412178 100644
+index c48c448..df02927 100644
 --- a/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
 +++ b/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
 @@ -146,10 +146,8 @@ class WaCallMediaSession {
@@ -197,7 +197,23 @@ index c48c448..9412178 100644
              });
          }
          catch (err) {
-@@ -1084,7 +1123,9 @@ class WaCallMediaSession {
+@@ -1018,6 +1057,15 @@ class WaCallMediaSession {
+                 packetType: data[1],
+                 bytes: data.length
+             });
++            // Which feedback the other side sends (the RTCP header stays readable in SRTCP), summed
++            // every 10 s: what WhatsApp expects back to raise its video quality.
++            this.rtcpSeen = this.rtcpSeen || { since: Date.now(), types: {} };
++            const rtcpKey = `${data[1]}/${data[0] & 0x1f}/${data.length}`;
++            this.rtcpSeen.types[rtcpKey] = (this.rtcpSeen.types[rtcpKey] || 0) + 1;
++            if (Date.now() - this.rtcpSeen.since >= 10000) {
++                this.logger.warn('rtcp from peer', { callId: this.info.callId, types: JSON.stringify(this.rtcpSeen.types) });
++                this.rtcpSeen = { since: Date.now(), types: {} };
++            }
+             return;
+         }
+         if (!(0, stun_js_1.isRtpPacket)(data))
+@@ -1084,7 +1132,9 @@ class WaCallMediaSession {
                          timestamp: rtpPacket.header.timestamp,
                          ssrc: rtpPacket.header.ssrc,
                          marker: rtpPacket.header.marker,
@@ -209,7 +225,7 @@ index c48c448..9412178 100644
                      if (pt === 97 || pt === 103) {
                          let depacketizer = this.h264Depacketizers.get(rtpPacket.header.ssrc);
 diff --git a/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js b/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
-index 5526c6a..28696b3 100644
+index 5526c6a..0802bda 100644
 --- a/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
 +++ b/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
 @@ -206,6 +206,12 @@ export class WaCallMediaSession {
@@ -225,7 +241,23 @@ index 5526c6a..28696b3 100644
          this.delegate.emitEnded(this.info);
          this.delegate.emitState(this.info);
          try {
-@@ -1081,7 +1087,9 @@ export class WaCallMediaSession {
+@@ -1015,6 +1021,15 @@ export class WaCallMediaSession {
+                 packetType: data[1],
+                 bytes: data.length
+             });
++            // Which feedback the other side sends (the RTCP header stays readable in SRTCP), summed
++            // every 10 s: what WhatsApp expects back to raise its video quality.
++            this.rtcpSeen = this.rtcpSeen || { since: Date.now(), types: {} };
++            const rtcpKey = `${data[1]}/${data[0] & 0x1f}/${data.length}`;
++            this.rtcpSeen.types[rtcpKey] = (this.rtcpSeen.types[rtcpKey] || 0) + 1;
++            if (Date.now() - this.rtcpSeen.since >= 10000) {
++                this.logger.warn('rtcp from peer', { callId: this.info.callId, types: JSON.stringify(this.rtcpSeen.types) });
++                this.rtcpSeen = { since: Date.now(), types: {} };
++            }
+             return;
+         }
+         if (!isRtpPacket(data))
+@@ -1081,7 +1096,9 @@ export class WaCallMediaSession {
                          timestamp: rtpPacket.header.timestamp,
                          ssrc: rtpPacket.header.ssrc,
                          marker: rtpPacket.header.marker,
