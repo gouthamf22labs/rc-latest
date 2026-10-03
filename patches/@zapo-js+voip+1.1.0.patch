@@ -96,7 +96,7 @@ index 471a964..c90520f 100644
  }
  exports.WaCallManager = WaCallManager;
 diff --git a/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js b/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
-index c48c448..492a57f 100644
+index c48c448..19b2552 100644
 --- a/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
 +++ b/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
 @@ -146,10 +146,8 @@ class WaCallMediaSession {
@@ -184,3 +184,29 @@ index c48c448..492a57f 100644
              });
          }
          catch (err) {
+@@ -1084,7 +1117,9 @@ class WaCallMediaSession {
+                         timestamp: rtpPacket.header.timestamp,
+                         ssrc: rtpPacket.header.ssrc,
+                         marker: rtpPacket.header.marker,
+-                        payload: videoPayload
++                        payload: videoPayload,
++                        extensionProfile: rtpPacket.header.extension ? rtpPacket.header.extensionProfile : null,
++                        extension: rtpPacket.header.extension ? rtpPacket.header.extensionData : null
+                     });
+                     if (pt === 97 || pt === 103) {
+                         let depacketizer = this.h264Depacketizers.get(rtpPacket.header.ssrc);
+diff --git a/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js b/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
+index 5526c6a..c27b9b5 100644
+--- a/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
++++ b/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
+@@ -1081,7 +1081,9 @@ export class WaCallMediaSession {
+                         timestamp: rtpPacket.header.timestamp,
+                         ssrc: rtpPacket.header.ssrc,
+                         marker: rtpPacket.header.marker,
+-                        payload: videoPayload
++                        payload: videoPayload,
++                        extensionProfile: rtpPacket.header.extension ? rtpPacket.header.extensionProfile : null,
++                        extension: rtpPacket.header.extension ? rtpPacket.header.extensionData : null
+                     });
+                     if (pt === 97 || pt === 103) {
+                         let depacketizer = this.h264Depacketizers.get(rtpPacket.header.ssrc);

@@ -222,14 +222,29 @@ function wireHost(host: InstanceHost) {
   const seenExt = new Map<string, { last: string; count: number }>();
   host.on(
     'voip_call_inbound_video_rtp',
-    ({ call, packet }: { call: any; packet: { header: { extension: boolean; extensionProfile: number; extensionData: Uint8Array; marker?: boolean } } }) => {
-      const h = packet?.header;
-      if (!h?.extension) return;
-      const hex = Buffer.from(h.extensionData).toString('hex');
+    ({ call, packet }: { call: any; packet: { extensionProfile?: number | null; extension?: Uint8Array | null } }) => {
+      if (!packet?.extension) return;
+      const ext = Buffer.from(packet.extension);
+      const hex = ext.toString('hex');
+      // One-byte header elements: id in the high nibble, length - 1 in the low. Leave out the frame
+      // info (3) and transport sequence (9), which change every packet; the rest is what's logged.
+      const fields: string[] = [];
+      for (let i = 0; i < ext.length; ) {
+        const b = ext[i];
+        if (b === 0) {
+          i++;
+          continue;
+        }
+        const id = b >> 4;
+        const len = (b & 0x0f) + 1;
+        if (id !== 3 && id !== 9) fields.push(`${id}=${ext.subarray(i + 1, i + 1 + len).toString('hex')}`);
+        i += 1 + len;
+      }
+      const key = fields.join(' ');
       const seen = seenExt.get(call.callId) ?? { last: '', count: 0 };
-      if (hex === seen.last || seen.count >= 40) return;
-      seenExt.set(call.callId, { last: hex, count: seen.count + 1 });
-      log('video rtp extension', { callId: call.callId, profile: h.extensionProfile.toString(16), data: hex });
+      if (key === seen.last || seen.count >= 40) return;
+      seenExt.set(call.callId, { last: key, count: seen.count + 1 });
+      log('video rtp extension', { callId: call.callId, profile: (packet.extensionProfile ?? 0).toString(16), fields: key, data: hex });
     },
   );
   host.on('voip_call_ended', (call: any) => seenExt.delete(call?.callId));
