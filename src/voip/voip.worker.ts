@@ -246,7 +246,48 @@ function wireHost(host: InstanceHost) {
       log('video rtp extension', { callId: call.callId, key, frameInfo: info.toString(16), data: ext.toString('hex') });
     },
   );
-  host.on('voip_call_ended', (call: any) => seenExt.delete(call?.callId));
+  // Not in the RTP extension (a test call kept it constant while the phone turned): look inside
+  // the H.264 stream for SEI messages (display orientation is SEI type 47; apps put their own
+  // data in type 5), logging each frame's NAL types and SEI payloads when they change.
+  const seenSei = new Map<string, { last: string; at: number; count: number }>();
+  host.on(
+    'voip_call_inbound_video',
+    ({ call, frame }: { call: any; frame: { data: Uint8Array } }) => {
+      const d = frame?.data;
+      if (!d) return;
+      const nals: number[] = [];
+      const seis: string[] = [];
+      for (let i = 0; i + 3 < d.length; i++) {
+        if (d[i] !== 0 || d[i + 1] !== 0) continue;
+        const start = d[i + 2] === 1 ? i + 3 : d[i + 2] === 0 && d[i + 3] === 1 ? i + 4 : -1;
+        if (start < 0 || start >= d.length) continue;
+        const type = d[start] & 0x1f;
+        nals.push(type);
+        if (type === 6) {
+          // SEI: payload type and size are each a run of 0xff bytes plus a last byte.
+          let p = start + 1;
+          let pt = 0;
+          while (d[p] === 0xff) pt += d[p++];
+          pt += d[p++];
+          let size = 0;
+          while (d[p] === 0xff) size += d[p++];
+          size += d[p++];
+          seis.push(`${pt}:${Buffer.from(d.subarray(p, p + Math.min(size, 24))).toString('hex')}`);
+        }
+        i = start;
+      }
+      const key = `nals=${[...new Set(nals)].join(',')} sei=${seis.join(' ') || '-'}`;
+      const seen = seenSei.get(call.callId) ?? { last: '', at: 0, count: 0 };
+      const now = Date.now();
+      if ((key === seen.last && now - seen.at < 5000) || seen.count >= 120) return;
+      seenSei.set(call.callId, { last: key, at: now, count: seen.count + 1 });
+      log('video frame sei', { callId: call.callId, key, bytes: d.length });
+    },
+  );
+  host.on('voip_call_ended', (call: any) => {
+    seenExt.delete(call?.callId);
+    seenSei.delete(call?.callId);
+  });
   host.on('voip_call_error', (error: Error) => {
     log('call engine error', { instance: host.instance, error: error?.message });
   });
