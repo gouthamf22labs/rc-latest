@@ -1,5 +1,5 @@
 ### BASE IMAGE
-FROM node:24-bullseye-slim AS base
+FROM public.ecr.aws/docker/library/node:24-bullseye-slim AS base
 
 ### BUILD IMAGE
 FROM base AS builder
