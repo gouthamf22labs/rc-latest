@@ -216,6 +216,23 @@ function wireHost(host: InstanceHost) {
       bridge.ws.send(out);
     },
   );
+  // Phones send what their camera sensor sees and say separately how to turn it. Until we know
+  // where WhatsApp puts that, log each call's RTP header extensions when they change (capped),
+  // so a test call where the phone is turned shows which field carries the rotation.
+  const seenExt = new Map<string, { last: string; count: number }>();
+  host.on(
+    'voip_call_inbound_video_rtp',
+    ({ call, packet }: { call: any; packet: { header: { extension: boolean; extensionProfile: number; extensionData: Uint8Array; marker?: boolean } } }) => {
+      const h = packet?.header;
+      if (!h?.extension) return;
+      const hex = Buffer.from(h.extensionData).toString('hex');
+      const seen = seenExt.get(call.callId) ?? { last: '', count: 0 };
+      if (hex === seen.last || seen.count >= 40) return;
+      seenExt.set(call.callId, { last: hex, count: seen.count + 1 });
+      log('video rtp extension', { callId: call.callId, profile: h.extensionProfile.toString(16), data: hex });
+    },
+  );
+  host.on('voip_call_ended', (call: any) => seenExt.delete(call?.callId));
   host.on('voip_call_error', (error: Error) => {
     log('call engine error', { instance: host.instance, error: error?.message });
   });
