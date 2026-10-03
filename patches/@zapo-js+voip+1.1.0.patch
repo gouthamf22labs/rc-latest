@@ -118,7 +118,7 @@ index 471a964..0e85b81 100644
  }
  exports.WaCallManager = WaCallManager;
 diff --git a/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js b/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
-index c48c448..244f085 100644
+index c48c448..78a2a06 100644
 --- a/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
 +++ b/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
 @@ -146,10 +146,8 @@ class WaCallMediaSession {
@@ -254,7 +254,7 @@ index c48c448..244f085 100644
              this.logger.debug('srtp per-jid keys initialized', {
                  callId: this.info.callId,
                  sendJid: ourDeviceJid,
-@@ -1018,6 +1067,44 @@ class WaCallMediaSession {
+@@ -1018,6 +1067,48 @@ class WaCallMediaSession {
                  packetType: data[1],
                  bytes: data.length
              });
@@ -285,7 +285,11 @@ index c48c448..244f085 100644
 +                        this.delegate.emitPeerBitrate?.(this.info, bps);
 +                    }
 +                    else
-+                        this.rembMiss = Buffer.from(data).toString('hex');
++                        // Not readable: say whether our key even authenticates it, and what it decrypted to.
++                        this.rembMiss = {
++                            auth: Buffer.from((0, primitives_js_1.hmacSha1)(this.peerSrtcp.authKey, data.subarray(0, end + 4)).subarray(0, data.length - end - 4)).equals(Buffer.from(data.subarray(end + 4))),
++                            plain: Buffer.from(body).toString('hex')
++                        };
 +                }
 +                catch { }
 +            }
@@ -299,7 +303,7 @@ index c48c448..244f085 100644
              return;
          }
          if (!(0, stun_js_1.isRtpPacket)(data))
-@@ -1084,7 +1171,9 @@ class WaCallMediaSession {
+@@ -1084,7 +1175,9 @@ class WaCallMediaSession {
                          timestamp: rtpPacket.header.timestamp,
                          ssrc: rtpPacket.header.ssrc,
                          marker: rtpPacket.header.marker,
@@ -337,7 +341,7 @@ index b5c8bc9..21db5d3 100644
              }
          });
 diff --git a/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js b/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
-index 5526c6a..9768412 100644
+index 5526c6a..5e2e02c 100644
 --- a/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
 +++ b/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
 @@ -3,7 +3,7 @@ import { getFirstNodeChild, getNodeChildrenByTag } from 'zapo-js/transport';
@@ -345,7 +349,7 @@ index 5526c6a..9768412 100644
  import { concatBytes, EMPTY_BYTES, readUInt32BE, toArrayBuffer } from '../bytes.js';
  import { derivePerJidSrtpKey } from '../crypto/encryption.js';
 -import { randomBytes } from '../crypto/primitives.js';
-+import { aesCtr128, randomBytes } from '../crypto/primitives.js';
++import { aesCtr128, hmacSha1, randomBytes } from '../crypto/primitives.js';
  import { SrtcpContext, SrtpSession } from '../crypto/srtp.js';
  import { generateSecureSsrc } from '../crypto/ssrc.js';
  import { H264Depacketizer, packetizeWhatsAppH264AccessUnit } from '../media/h264.js';
@@ -397,7 +401,7 @@ index 5526c6a..9768412 100644
              this.logger.debug('srtp per-jid keys initialized', {
                  callId: this.info.callId,
                  sendJid: ourDeviceJid,
-@@ -1015,6 +1031,44 @@ export class WaCallMediaSession {
+@@ -1015,6 +1031,48 @@ export class WaCallMediaSession {
                  packetType: data[1],
                  bytes: data.length
              });
@@ -428,7 +432,11 @@ index 5526c6a..9768412 100644
 +                        this.delegate.emitPeerBitrate?.(this.info, bps);
 +                    }
 +                    else
-+                        this.rembMiss = Buffer.from(data).toString('hex');
++                        // Not readable: say whether our key even authenticates it, and what it decrypted to.
++                        this.rembMiss = {
++                            auth: Buffer.from(hmacSha1(this.peerSrtcp.authKey, data.subarray(0, end + 4)).subarray(0, data.length - end - 4)).equals(Buffer.from(data.subarray(end + 4))),
++                            plain: Buffer.from(body).toString('hex')
++                        };
 +                }
 +                catch { }
 +            }
@@ -442,7 +450,7 @@ index 5526c6a..9768412 100644
              return;
          }
          if (!isRtpPacket(data))
-@@ -1081,7 +1135,9 @@ export class WaCallMediaSession {
+@@ -1081,7 +1139,9 @@ export class WaCallMediaSession {
                          timestamp: rtpPacket.header.timestamp,
                          ssrc: rtpPacket.header.ssrc,
                          marker: rtpPacket.header.marker,
