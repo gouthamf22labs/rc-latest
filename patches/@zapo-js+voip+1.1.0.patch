@@ -118,7 +118,7 @@ index 471a964..0e85b81 100644
  }
  exports.WaCallManager = WaCallManager;
 diff --git a/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js b/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
-index c48c448..78a2a06 100644
+index c48c448..037584c 100644
 --- a/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
 +++ b/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
 @@ -146,10 +146,8 @@ class WaCallMediaSession {
@@ -314,6 +314,27 @@ index c48c448..78a2a06 100644
                      });
                      if (pt === 97 || pt === 103) {
                          let depacketizer = this.h264Depacketizers.get(rtpPacket.header.ssrc);
+@@ -1260,6 +1353,20 @@ class WaCallMediaSession {
+             this.rtcpInterval = setInterval(() => {
+                 if (!this.srtcpContext || !this.videoRtpSession)
+                     return;
++                // Experiment: phones send a WhatsApp "PRST" feedback (RTCP PSFB FMT 15) every ~5 s
++                // carrying one number, 35000, close to the ~30 kbps their video to us stays at. Send
++                // our own asking for 500 kbps, every 2 s, to see whether the phone raises its video.
++                this.prstTick = (this.prstTick || 0) + 1;
++                if (this.prstTick % 2 === 0) {
++                    const prst = new Uint8Array([
++                        0x8f, 206, 0x00, 0x06, 0, 0, 0, 0, // V=2 FMT=15, length 6; sender SSRC below
++                        0, 0, 0, 0, 0x50, 0x52, 0x53, 0x54, // media SSRC 0, "PRST"
++                        0x00, 0x08, 0x0a, 0x04, 0x08, 0xa0, 0xc2, 0x1e, // 8 bytes: {1: {1: 500000}, 4: 0}
++                        0x20, 0x00, 0x00, 0x00
++                    ]);
++                    new DataView(prst.buffer).setUint32(4, this.videoRtpSession.getSsrc() >>> 0);
++                    this.sctpRelay.broadcast((0, bytes_js_1.toArrayBuffer)(this.srtcpContext.protect(prst, this.videoRtpSession.getSsrc())));
++                }
+                 if (this.lastVideoRtpTimestamp === null)
+                     return;
+                 const elapsed = Math.max(0, Date.now() - this.lastVideoSentAt);
 diff --git a/node_modules/@zapo-js/voip/dist/esm/WaVoipCoordinator.js b/node_modules/@zapo-js/voip/dist/esm/WaVoipCoordinator.js
 index 28c9056..aa32d25 100644
 --- a/node_modules/@zapo-js/voip/dist/esm/WaVoipCoordinator.js
@@ -341,7 +362,7 @@ index b5c8bc9..21db5d3 100644
              }
          });
 diff --git a/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js b/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
-index 5526c6a..5e2e02c 100644
+index 5526c6a..34116b9 100644
 --- a/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
 +++ b/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
 @@ -3,7 +3,7 @@ import { getFirstNodeChild, getNodeChildrenByTag } from 'zapo-js/transport';
@@ -461,6 +482,27 @@ index 5526c6a..5e2e02c 100644
                      });
                      if (pt === 97 || pt === 103) {
                          let depacketizer = this.h264Depacketizers.get(rtpPacket.header.ssrc);
+@@ -1257,6 +1317,20 @@ export class WaCallMediaSession {
+             this.rtcpInterval = setInterval(() => {
+                 if (!this.srtcpContext || !this.videoRtpSession)
+                     return;
++                // Experiment: phones send a WhatsApp "PRST" feedback (RTCP PSFB FMT 15) every ~5 s
++                // carrying one number, 35000, close to the ~30 kbps their video to us stays at. Send
++                // our own asking for 500 kbps, every 2 s, to see whether the phone raises its video.
++                this.prstTick = (this.prstTick || 0) + 1;
++                if (this.prstTick % 2 === 0) {
++                    const prst = new Uint8Array([
++                        0x8f, 206, 0x00, 0x06, 0, 0, 0, 0, // V=2 FMT=15, length 6; sender SSRC below
++                        0, 0, 0, 0, 0x50, 0x52, 0x53, 0x54, // media SSRC 0, "PRST"
++                        0x00, 0x08, 0x0a, 0x04, 0x08, 0xa0, 0xc2, 0x1e, // 8 bytes: {1: {1: 500000}, 4: 0}
++                        0x20, 0x00, 0x00, 0x00
++                    ]);
++                    new DataView(prst.buffer).setUint32(4, this.videoRtpSession.getSsrc() >>> 0);
++                    this.sctpRelay.broadcast(toArrayBuffer(this.srtcpContext.protect(prst, this.videoRtpSession.getSsrc())));
++                }
+                 if (this.lastVideoRtpTimestamp === null)
+                     return;
+                 const elapsed = Math.max(0, Date.now() - this.lastVideoSentAt);
 diff --git a/node_modules/@zapo-js/voip/dist/esm/relay/WaSctpRelay.js b/node_modules/@zapo-js/voip/dist/esm/relay/WaSctpRelay.js
 index 3729d56..45ef979 100644
 --- a/node_modules/@zapo-js/voip/dist/esm/relay/WaSctpRelay.js
