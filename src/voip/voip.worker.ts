@@ -55,7 +55,22 @@ const pending = new Map<
   { resolve: (v: any) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }
 >();
 
+/** One line per call signal, in or out: which number sent or got which step of which call. */
+function logSignal(dir: 'in' | 'out', instance: string, node: VoipNode | undefined) {
+  if (!node || (node.tag !== 'call' && node.tag !== 'receipt')) return;
+  const child = Array.isArray(node.content) ? node.content[0] : undefined;
+  if (!child?.tag || child.tag === 'relaylatency') return;
+  log('call signal', {
+    dir,
+    instance,
+    tag: `${node.tag}/${child.tag}`,
+    callId: child.attrs?.['call-id'],
+    peer: dir === 'in' ? node.attrs?.from : node.attrs?.to,
+  });
+}
+
 function rpc(instance: string, request: HostRequest): Promise<any> {
+  if (request.op === 'sendNode') logSignal('out', instance, (request as { node?: VoipNode }).node);
   const id = nextId++;
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -491,6 +506,7 @@ process.on('message', (message: ToWorker) => {
       // One instance's stanzas in arrival order: a terminate handled while its offer is still
       // being set up would be lost and leave the call ringing here.
       const node = message.node;
+      logSignal('in', message.instance, node);
       const previous = queues.get(message.instance) ?? Promise.resolve();
       const next = previous
         .then(() => host.dispatch(node))
