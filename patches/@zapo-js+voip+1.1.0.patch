@@ -118,7 +118,7 @@ index 471a964..0e85b81 100644
  }
  exports.WaCallManager = WaCallManager;
 diff --git a/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js b/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
-index c48c448..244f085 100644
+index c48c448..45def3c 100644
 --- a/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
 +++ b/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
 @@ -146,10 +146,8 @@ class WaCallMediaSession {
@@ -223,7 +223,19 @@ index c48c448..244f085 100644
          if (teNodes.length === 0)
              return;
          const destinationJids = this.info.relayData?.participantJids || [];
-@@ -760,11 +801,19 @@ class WaCallMediaSession {
+@@ -750,6 +791,11 @@ class WaCallMediaSession {
+         const meId = this.deps.authClient.getCurrentCredentials()?.meJid ?? '';
+         const callId = this.info.callId;
+         const callCreator = this.info.callCreator;
++        // Local patch: answer at most every 5 s. Two copies of this engine (two CRM numbers on one
++        // server) otherwise answer each other's answer forever.
++        if (Date.now() - (this.muteV2RepliedAt || 0) < 5000)
++            return;
++        this.muteV2RepliedAt = Date.now();
+         try {
+             const muteNode = (0, signaling_js_1.buildMuteV2Stanza)(peerJid, callId, callCreator, 0, meId);
+             await this.deps.lowLevelCoordinator.sendNode(muteNode);
+@@ -760,11 +806,19 @@ class WaCallMediaSession {
              });
          }
      }
@@ -245,7 +257,7 @@ index c48c448..244f085 100644
              });
          }
          catch (err) {
-@@ -974,7 +1023,7 @@ class WaCallMediaSession {
+@@ -974,7 +1028,7 @@ class WaCallMediaSession {
              const sendKeying = (0, encryption_js_1.derivePerJidSrtpKey)(callKey, ourDeviceJid);
              const recvKeying = (0, encryption_js_1.derivePerJidSrtpKey)(callKey, peerDeviceJid);
              this.srtpSession = new srtp_js_1.SrtpSession(sendKeying, recvKeying, types_js_1.SRTP_SEND_AUTH_TAG_LEN, types_js_1.SRTP_RECV_AUTH_TAG_LEN);
@@ -254,7 +266,7 @@ index c48c448..244f085 100644
              this.logger.debug('srtp per-jid keys initialized', {
                  callId: this.info.callId,
                  sendJid: ourDeviceJid,
-@@ -1018,6 +1067,44 @@ class WaCallMediaSession {
+@@ -1018,6 +1072,44 @@ class WaCallMediaSession {
                  packetType: data[1],
                  bytes: data.length
              });
@@ -299,7 +311,7 @@ index c48c448..244f085 100644
              return;
          }
          if (!(0, stun_js_1.isRtpPacket)(data))
-@@ -1084,7 +1171,9 @@ class WaCallMediaSession {
+@@ -1084,7 +1176,9 @@ class WaCallMediaSession {
                          timestamp: rtpPacket.header.timestamp,
                          ssrc: rtpPacket.header.ssrc,
                          marker: rtpPacket.header.marker,
@@ -337,7 +349,7 @@ index b5c8bc9..21db5d3 100644
              }
          });
 diff --git a/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js b/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
-index 5526c6a..9768412 100644
+index 5526c6a..8de5e69 100644
 --- a/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
 +++ b/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
 @@ -3,7 +3,7 @@ import { getFirstNodeChild, getNodeChildrenByTag } from 'zapo-js/transport';
@@ -388,7 +400,19 @@ index 5526c6a..9768412 100644
                                  srtpFromPeerKey = true;
                                  this.logger.debug('srtp re-initialized with peer call_key', {
                                      callId: this.info.callId
-@@ -971,7 +987,7 @@ export class WaCallMediaSession {
+@@ -747,6 +763,11 @@ export class WaCallMediaSession {
+         const meId = this.deps.authClient.getCurrentCredentials()?.meJid ?? '';
+         const callId = this.info.callId;
+         const callCreator = this.info.callCreator;
++        // Local patch: answer at most every 5 s. Two copies of this engine (two CRM numbers on one
++        // server) otherwise answer each other's answer forever.
++        if (Date.now() - (this.muteV2RepliedAt || 0) < 5000)
++            return;
++        this.muteV2RepliedAt = Date.now();
+         try {
+             const muteNode = buildMuteV2Stanza(peerJid, callId, callCreator, 0, meId);
+             await this.deps.lowLevelCoordinator.sendNode(muteNode);
+@@ -971,7 +992,7 @@ export class WaCallMediaSession {
              const sendKeying = derivePerJidSrtpKey(callKey, ourDeviceJid);
              const recvKeying = derivePerJidSrtpKey(callKey, peerDeviceJid);
              this.srtpSession = new SrtpSession(sendKeying, recvKeying, SRTP_SEND_AUTH_TAG_LEN, SRTP_RECV_AUTH_TAG_LEN);
@@ -397,7 +421,7 @@ index 5526c6a..9768412 100644
              this.logger.debug('srtp per-jid keys initialized', {
                  callId: this.info.callId,
                  sendJid: ourDeviceJid,
-@@ -1015,6 +1031,44 @@ export class WaCallMediaSession {
+@@ -1015,6 +1036,44 @@ export class WaCallMediaSession {
                  packetType: data[1],
                  bytes: data.length
              });
@@ -442,7 +466,7 @@ index 5526c6a..9768412 100644
              return;
          }
          if (!isRtpPacket(data))
-@@ -1081,7 +1135,9 @@ export class WaCallMediaSession {
+@@ -1081,7 +1140,9 @@ export class WaCallMediaSession {
                          timestamp: rtpPacket.header.timestamp,
                          ssrc: rtpPacket.header.ssrc,
                          marker: rtpPacket.header.marker,
@@ -473,6 +497,21 @@ index 3729d56..45ef979 100644
      hasConnection() {
          for (const conn of this.connections.values()) {
              if (conn.state === ConnectionState.Open)
+diff --git a/node_modules/@zapo-js/voip/dist/esm/signaling/signaling.js b/node_modules/@zapo-js/voip/dist/esm/signaling/signaling.js
+index 3162dc5..906b30e 100644
+--- a/node_modules/@zapo-js/voip/dist/esm/signaling/signaling.js
++++ b/node_modules/@zapo-js/voip/dist/esm/signaling/signaling.js
+@@ -229,7 +229,9 @@ export async function buildAcceptStanza(deps, callId, callKey, peerJid, callCrea
+         // video RTP at all.
+         acceptContent.push({ tag: 'video', attrs: { enc: 'h.264' } });
+     }
+-    const toJidClean = toUserJid(peerJid);
++    // Local patch: a caller on a linked device (another CRM number, WhatsApp Web) only gets the
++    // accept when it's addressed to that device; the bare account reaches the phone alone.
++    const toJidClean = /:[1-9]\d*@/.test(peerJid) ? peerJid : toUserJid(peerJid);
+     return {
+         tag: 'call',
+         attrs: { to: toJidClean, id: generateCallStanzaId() },
 diff --git a/node_modules/@zapo-js/voip/dist/relay/WaSctpRelay.js b/node_modules/@zapo-js/voip/dist/relay/WaSctpRelay.js
 index 199bfc0..63c2e4a 100644
 --- a/node_modules/@zapo-js/voip/dist/relay/WaSctpRelay.js
@@ -493,3 +532,18 @@ index 199bfc0..63c2e4a 100644
      hasConnection() {
          for (const conn of this.connections.values()) {
              if (conn.state === ConnectionState.Open)
+diff --git a/node_modules/@zapo-js/voip/dist/signaling/signaling.js b/node_modules/@zapo-js/voip/dist/signaling/signaling.js
+index 3f7dbf9..17ab129 100644
+--- a/node_modules/@zapo-js/voip/dist/signaling/signaling.js
++++ b/node_modules/@zapo-js/voip/dist/signaling/signaling.js
+@@ -250,7 +250,9 @@ async function buildAcceptStanza(deps, callId, callKey, peerJid, callCreator, is
+         // video RTP at all.
+         acceptContent.push({ tag: 'video', attrs: { enc: 'h.264' } });
+     }
+-    const toJidClean = (0, protocol_1.toUserJid)(peerJid);
++    // Local patch: a caller on a linked device (another CRM number, WhatsApp Web) only gets the
++    // accept when it's addressed to that device; the bare account reaches the phone alone.
++    const toJidClean = /:[1-9]\d*@/.test(peerJid) ? peerJid : (0, protocol_1.toUserJid)(peerJid);
+     return {
+         tag: 'call',
+         attrs: { to: toJidClean, id: generateCallStanzaId() },
