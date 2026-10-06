@@ -118,7 +118,7 @@ index 471a964..0e85b81 100644
  }
  exports.WaCallManager = WaCallManager;
 diff --git a/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js b/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
-index c48c448..45def3c 100644
+index c48c448..dbd7b6e 100644
 --- a/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
 +++ b/node_modules/@zapo-js/voip/dist/call/WaCallMediaSession.js
 @@ -146,10 +146,8 @@ class WaCallMediaSession {
@@ -311,7 +311,31 @@ index c48c448..45def3c 100644
              return;
          }
          if (!(0, stun_js_1.isRtpPacket)(data))
-@@ -1084,7 +1176,9 @@ class WaCallMediaSession {
+@@ -1031,6 +1123,23 @@ class WaCallMediaSession {
+                 this.selfEchoCount++;
+                 return;
+             }
++            // Local patch: WhatsApp doesn't pass the <accept> between two linked devices (two CRM
++            // numbers, say), so a call we placed kept ringing after it was answered. The other side
++            // only sends media once it has answered: a few packets of it while ringing mean answered.
++            if (this.info.direction === types_js_1.CallDirection.Outgoing && this.info.stateData.state === types_js_1.CallState.Ringing) {
++                this.mediaWhileRinging = (this.mediaWhileRinging || 0) + 1;
++                if (this.mediaWhileRinging >= 5) {
++                    this.logger.warn('answered (media arrived without an accept)', { callId: this.info.callId });
++                    try {
++                        this.info.applyTransition({ type: 'remote_accepted' });
++                        this.delegate.emitState(this.info);
++                    }
++                    catch (err) {
++                        this.logger.trace('call transition skipped', { message: String(err) });
++                    }
++                    this.onRelayConnected();
++                }
++            }
+             if (!this.ssrcResubscribed && this.actualPeerSsrc === null) {
+                 this.actualPeerSsrc = ssrc;
+                 const knownSsrc = this.peerSsrcs.includes(ssrc);
+@@ -1084,7 +1193,9 @@ class WaCallMediaSession {
                          timestamp: rtpPacket.header.timestamp,
                          ssrc: rtpPacket.header.ssrc,
                          marker: rtpPacket.header.marker,
@@ -349,7 +373,7 @@ index b5c8bc9..21db5d3 100644
              }
          });
 diff --git a/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js b/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
-index 5526c6a..8de5e69 100644
+index 5526c6a..5edbbff 100644
 --- a/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
 +++ b/node_modules/@zapo-js/voip/dist/esm/call/WaCallMediaSession.js
 @@ -3,7 +3,7 @@ import { getFirstNodeChild, getNodeChildrenByTag } from 'zapo-js/transport';
@@ -466,7 +490,31 @@ index 5526c6a..8de5e69 100644
              return;
          }
          if (!isRtpPacket(data))
-@@ -1081,7 +1140,9 @@ export class WaCallMediaSession {
+@@ -1028,6 +1087,23 @@ export class WaCallMediaSession {
+                 this.selfEchoCount++;
+                 return;
+             }
++            // Local patch: WhatsApp doesn't pass the <accept> between two linked devices (two CRM
++            // numbers, say), so a call we placed kept ringing after it was answered. The other side
++            // only sends media once it has answered: a few packets of it while ringing mean answered.
++            if (this.info.direction === CallDirection.Outgoing && this.info.stateData.state === CallState.Ringing) {
++                this.mediaWhileRinging = (this.mediaWhileRinging || 0) + 1;
++                if (this.mediaWhileRinging >= 5) {
++                    this.logger.warn('answered (media arrived without an accept)', { callId: this.info.callId });
++                    try {
++                        this.info.applyTransition({ type: 'remote_accepted' });
++                        this.delegate.emitState(this.info);
++                    }
++                    catch (err) {
++                        this.logger.trace('call transition skipped', { message: String(err) });
++                    }
++                    this.onRelayConnected();
++                }
++            }
+             if (!this.ssrcResubscribed && this.actualPeerSsrc === null) {
+                 this.actualPeerSsrc = ssrc;
+                 const knownSsrc = this.peerSsrcs.includes(ssrc);
+@@ -1081,7 +1157,9 @@ export class WaCallMediaSession {
                          timestamp: rtpPacket.header.timestamp,
                          ssrc: rtpPacket.header.ssrc,
                          marker: rtpPacket.header.marker,
