@@ -158,6 +158,15 @@ function closeBridge(host: InstanceHost, callId: string, reason: string) {
 
 function wireHost(host: InstanceHost) {
   host.on('voip_call_state', (call: any) => {
+    // Each number's side of each call, as it moves: shows where a call between two CRM numbers
+    // on this server stops (one end active, the other still connecting).
+    log('call state', {
+      instance: host.instance,
+      callId: call.callId,
+      direction: call.direction,
+      state: call.stateData?.state,
+      browser: bridges.has(keyOf(host, call.callId)),
+    });
     const bridge = bridges.get(keyOf(host, call.callId));
     if (!bridge) return;
     bridge.lastInbound = Date.now();
