@@ -80,7 +80,7 @@ async function endDeclinedOutgoing(host: InstanceHost, node: VoipNode) {
   if (!call || call.isEnded || call.direction !== 'outgoing') return;
   if (call.stateData?.state === 'active') return;
   // Tell the browser why first: the engine reports its own generic reason for the end.
-  closeBridge(callId, 'rejected');
+  closeBridge(host, callId, 'rejected');
   await host.engine.endCall(callId, 'rejected').catch(() => undefined);
 }
 
@@ -135,16 +135,19 @@ type Bridge = {
   /** Our video to the customer, for the 10 s log: how late it reaches us, and what we skipped. */
   outVideo?: { frames: number; dropped: number; bytes: number; minLag: number; maxLate: number; since: number; keyAskedAt: number };
 };
+// Keyed by number and call id: both ends of a call between two numbers on this server share the
+// call id, and must not take over each other's browser.
 const bridges = new Map<string, Bridge>();
+const keyOf = (host: InstanceHost, callId: string) => `${host.instance}|${callId}`;
 
 const control = (ws: WebSocket, message: Record<string, unknown>) => {
   if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(message));
 };
 
-function closeBridge(callId: string, reason: string) {
-  const bridge = bridges.get(callId);
+function closeBridge(host: InstanceHost, callId: string, reason: string) {
+  const bridge = bridges.get(keyOf(host, callId));
   if (!bridge) return;
-  bridges.delete(callId);
+  bridges.delete(keyOf(host, callId));
   control(bridge.ws, { t: 'ended', reason });
   try {
     bridge.ws.close(1000, reason.slice(0, 100));
@@ -155,13 +158,13 @@ function closeBridge(callId: string, reason: string) {
 
 function wireHost(host: InstanceHost) {
   host.on('voip_call_state', (call: any) => {
-    const bridge = bridges.get(call.callId);
+    const bridge = bridges.get(keyOf(host, call.callId));
     if (!bridge) return;
     bridge.lastInbound = Date.now();
     control(bridge.ws, { t: 'state', state: call.stateData?.state });
   });
   host.on('voip_call_peer_mute', ({ call, muted }: { call: any; muted: boolean }) => {
-    const bridge = bridges.get(call.callId);
+    const bridge = bridges.get(keyOf(host, call.callId));
     if (!bridge) return;
     bridge.peerMuted = Boolean(muted);
     bridge.lastInbound = Date.now();
@@ -169,16 +172,16 @@ function wireHost(host: InstanceHost) {
   });
   // The phone's REMB: how much of our video it can take. The browser sizes its encoder to it.
   host.on('voip_call_peer_bitrate', ({ call, bps }: { call: any; bps: number }) => {
-    const bridge = bridges.get(call?.callId);
+    const bridge = bridges.get(keyOf(host, call?.callId));
     if (bridge) control(bridge.ws, { t: 'bitrate', bps });
   });
   host.on('voip_call_ended', (call: any) => {
-    closeBridge(call.callId, call.stateData?.reason || 'ended');
+    closeBridge(host, call.callId, call.stateData?.reason || 'ended');
   });
   host.on(
     'voip_call_inbound_audio',
     ({ call, pcm }: { call: any; pcm: Float32Array }) => {
-      const bridge = bridges.get(call.callId);
+      const bridge = bridges.get(keyOf(host, call.callId));
       if (!bridge) return;
       bridge.lastInbound = Date.now();
       if (
@@ -201,7 +204,7 @@ function wireHost(host: InstanceHost) {
       call: any;
       frame: { keyFrame: boolean; timestamp: number; data: Uint8Array };
     }) => {
-      const bridge = bridges.get(call.callId);
+      const bridge = bridges.get(keyOf(host, call.callId));
       if (!bridge) return;
       bridge.lastInbound = Date.now();
       if (bridge.ws.readyState !== bridge.ws.OPEN) return;
@@ -270,7 +273,7 @@ function attachBridge(
     peerMuted: false,
     needKeyFrame: false,
   };
-  bridges.set(callId, bridge);
+  bridges.set(keyOf(host, callId), bridge);
 
   ws.on('message', (data: Buffer, isBinary: boolean) => {
     try {
@@ -294,7 +297,7 @@ function attachBridge(
       } else if (data[0] === FRAME_VIDEO && data.length > 9) {
         const timestampUs = data.readDoubleLE(1);
         const sent = host.engine.feedLiveVideo(callId, new Uint8Array(data.subarray(9)), timestampUs);
-        const bridge = bridges.get(callId);
+        const bridge = bridges.get(keyOf(host, callId));
         if (bridge) {
           const now = Date.now();
           const o = (bridge.outVideo ??= { frames: 0, dropped: 0, bytes: 0, minLag: Infinity, maxLate: 0, since: now, keyAskedAt: 0 });
@@ -331,8 +334,8 @@ function attachBridge(
     }
   });
   ws.on('close', () => {
-    if (bridges.get(callId)?.ws === ws) {
-      bridges.delete(callId);
+    if (bridges.get(keyOf(host, callId))?.ws === ws) {
+      bridges.delete(keyOf(host, callId));
       void host.engine.endCall(callId).catch(() => undefined);
     }
   });
@@ -349,7 +352,7 @@ async function answer(ws: WebSocket, instance: string, callId: string) {
   const call = host?.engine.getCall(callId);
   // The ring never reached this connection, or it is already over.
   if (!host || !call || call.isEnded) return refuse(ws, 'not_ringing', 4004);
-  if (bridges.has(callId)) return refuse(ws, 'taken', 4009);
+  if (bridges.has(keyOf(host, callId))) return refuse(ws, 'taken', 4009);
   if (bridges.size >= MAX_CALLS) return refuse(ws, 'busy', 4029);
 
   attachBridge(ws, host, callId, false);
@@ -372,7 +375,7 @@ async function answer(ws: WebSocket, instance: string, callId: string) {
     // Half-accepted: end it here so it doesn't hang in 'connecting' (the phone can still answer
     // a call that hasn't reached accept).
     void host.engine.endCall(callId).catch(() => undefined);
-    bridges.delete(callId);
+    bridges.delete(keyOf(host, callId));
     refuse(ws, 'failed', 4000);
   }
 }
@@ -442,7 +445,7 @@ setInterval(() => {
     const state = bridge.host.engine.getCall(bridge.callId)?.stateData?.state;
     if (bridge.outgoing && state !== 'active' && now - bridge.startedAt > RING_MS) {
       void bridge.host.engine.endCall(bridge.callId).catch(() => undefined);
-      closeBridge(bridge.callId, 'no_answer');
+      closeBridge(bridge.host, bridge.callId, 'no_answer');
       continue;
     }
     if (
@@ -452,7 +455,7 @@ setInterval(() => {
     ) {
       log('ending silent call', { callId: bridge.callId });
       void bridge.host.engine.endCall(bridge.callId).catch(() => undefined);
-      closeBridge(bridge.callId, 'connection_lost');
+      closeBridge(bridge.host, bridge.callId, 'connection_lost');
     }
   }
 }, 3_000).unref();
@@ -497,8 +500,8 @@ process.on('message', (message: ToWorker) => {
     } else if (message.kind === 'instanceGone') {
       const host = hosts.get(message.instance);
       if (!host) return;
-      for (const [callId, bridge] of bridges)
-        if (bridge.host === host) closeBridge(callId, 'disconnected');
+      for (const bridge of [...bridges.values()])
+        if (bridge.host === host) closeBridge(host, bridge.callId, 'disconnected');
       host.dispose();
       hosts.delete(message.instance);
     }
