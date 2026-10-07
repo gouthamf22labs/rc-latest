@@ -817,6 +817,29 @@ export const editMessageSchema: JSONSchema7 = {
   ...isNotEmpty('id', 'text'),
 };
 
+export const editEventSchema: JSONSchema7 = {
+  $id: ulid(),
+  type: 'object',
+  properties: {
+    id: { type: 'string', minLength: 1 },
+    event: {
+      type: 'object',
+      properties: {
+        name: { type: 'string' },
+        description: { type: 'string' },
+        startTime: { type: 'integer', minimum: 1, description: 'Unix seconds' },
+        endTime: { type: ['integer', 'null'], minimum: 1, description: 'Unix seconds; null drops it' },
+        location: { type: ['string', 'null'] },
+        joinLink: { type: ['string', 'null'] },
+        call: { type: 'string', enum: ['audio', 'video', 'none'] },
+        isCanceled: { type: 'boolean' },
+      },
+    },
+  },
+  required: ['id', 'event'],
+  ...isNotEmpty('id'),
+};
+
 // Group Schema
 export const createGroupSchema: JSONSchema7 = {
   $id: ulid(),

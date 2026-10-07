@@ -120,6 +120,7 @@ import { isArray, isBase64, isNotEmpty, isURL } from 'class-validator';
 import {
   ArchiveChatDto,
   DeleteMessage,
+  EditEvent,
   EditMessage,
   PinMessage,
   PollVote,
@@ -185,6 +186,12 @@ import {
   readPollVote,
   withoutPollSecret,
 } from '../../utils/poll-vote';
+import {
+  encryptEventEdit,
+  eventFields,
+  isEventType,
+  readEventEdit,
+} from '../../utils/event-edit';
 import { getObjectUrl } from '../../integrations/minio/minio.utils';
 import { encodeProps } from '../../utils/encode.props';
 import { voipSupervisor } from '../../voip/voip.supervisor';
@@ -2077,8 +2084,10 @@ export class WAStartupService {
           isGroup: isJidGroup(received.key.remoteJid),
         } as PrismType.Message;
 
-        // A poll keeps its secret so its votes can be read, and cast from here, later.
-        const pollSecret = isPollType(messageType) && pollSecretOf(received.message);
+        // A poll keeps its secret so its votes can be read, and cast from here, later; an event
+        // so its edits can be read, and made from here.
+        const pollSecret =
+          (isPollType(messageType) || isEventType(messageType)) && pollSecretOf(received.message);
         if (pollSecret) {
           messageRaw.content[POLL_SECRET_KEY] = pollSecret;
           messageRaw.content[POLL_ADDRESSING_KEY] =
@@ -2093,6 +2102,19 @@ export class WAStartupService {
           const vote = await this.readVote(received, user, group);
           if (vote) {
             messageRaw.content['vote'] = { ...(messageRaw.content['vote'] as object), ...vote };
+          }
+        }
+
+        // So does an event's edit or cancellation: name the new details for the webhook, and keep
+        // the stored event current.
+        if (
+          messageType === 'secretEncryptedMessage' &&
+          received.message.secretEncryptedMessage?.secretEncType ===
+            proto.Message.SecretEncryptedMessage.SecretEncType.EVENT_EDIT
+        ) {
+          const eventEdit = await this.readEventEditOf(received, user, group);
+          if (eventEdit) {
+            messageRaw.content['eventEdit'] = eventEdit;
           }
         }
 
@@ -3127,8 +3149,11 @@ export class WAStartupService {
         }
 
         const content = JSON.parse(JSON.stringify(m.message[getContentType(m.message)]));
-        // A poll keeps its secret so its votes can be read, and cast from here, later.
-        const pollSecret = isPollType(getContentType(m.message)) && pollSecretOf(m.message);
+        // A poll keeps its secret so its votes can be read, and cast from here, later; an event
+        // so it can be edited or cancelled from here.
+        const sentType = getContentType(m.message);
+        const pollSecret =
+          (isPollType(sentType) || isEventType(sentType)) && pollSecretOf(m.message);
         if (pollSecret) {
           content[POLL_SECRET_KEY] = pollSecret;
           content[POLL_ADDRESSING_KEY] =
@@ -4213,6 +4238,238 @@ export class WAStartupService {
         edit: messageKey,
         text: data.text,
       });
+    } catch (error) {
+      this.logger.error(error);
+      throw new BadRequestException(error.toString());
+    }
+  }
+
+  /** The newest stored event with this WhatsApp id (or our row id), if it is an event. */
+  private async findEvent(id: string) {
+    const event = await this.repository.message.findFirst({
+      where: {
+        instanceId: this.instance.id,
+        ...(/^\d+$/.test(id) ? { OR: [{ id: Number.parseInt(id) }, { keyId: id }] } : { keyId: id }),
+      },
+      orderBy: { id: 'desc' },
+    });
+    return event && isEventType(event.messageType) ? event : undefined;
+  }
+
+  /** The event's content to store: the new event as WhatsApp's JSON, its secret kept. */
+  private storedEvent(event: proto.Message.IEventMessage, content: Record<string, any>) {
+    const json = proto.Message.EventMessage.fromObject({ ...event, contextInfo: undefined }).toJSON();
+    return {
+      ...json,
+      [POLL_SECRET_KEY]: content[POLL_SECRET_KEY],
+      ...(content[POLL_ADDRESSING_KEY] ? { [POLL_ADDRESSING_KEY]: content[POLL_ADDRESSING_KEY] } : {}),
+    } as PrismType.Prisma.JsonObject;
+  }
+
+  /**
+   * Reads an incoming (or our own phone's) event edit or cancellation with the event's stored
+   * secret, and brings the stored event up to date: `{ eventId, ...the new details }`. Undefined
+   * when the event or its secret is unknown, as for events from before secrets were kept.
+   */
+  private async readEventEditOf(
+    received: WAMessage,
+    user: { jid?: string; lid?: string },
+    group: { jid?: string; lid?: string },
+  ) {
+    try {
+      const enc = received.message?.secretEncryptedMessage;
+      const eventId = enc?.targetMessageKey?.id;
+      if (!eventId) {
+        return undefined;
+      }
+      const event = await this.findEvent(eventId);
+      const content = event?.content as Record<string, any>;
+      const secret = content?.[POLL_SECRET_KEY];
+      if (typeof secret !== 'string') {
+        return undefined;
+      }
+      const me = this.ownVoteJids();
+      const read = readEventEdit(enc, {
+        eventSecret: Buffer.from(secret, 'base64'),
+        eventMsgId: eventId,
+        creators: event.keyFromMe
+          ? [me.pn, me.lid]
+          : event.isGroup
+            ? [event.keyParticipant, event.keyParticipantLid]
+            : [event.keyRemoteJid, event.keyLid],
+        editors: received.key.fromMe
+          ? [me.pn, me.lid]
+          : isJidGroup(received.key.remoteJid)
+            ? [group?.jid, group?.lid]
+            : [user?.jid, user?.lid],
+      });
+      if (!read) {
+        this.logger.warn(`event edit for ${eventId} could not be decrypted`);
+        return undefined;
+      }
+      await this.repository.message.update({
+        where: { id: event.id },
+        data: { content: this.storedEvent(read.event, content) },
+      });
+      return { eventId, ...eventFields(read.event) };
+    } catch (error) {
+      this.logger.error(error);
+      return undefined;
+    }
+  }
+
+  /**
+   * Edits or cancels an event this number sent, as WhatsApp's Edit event / Cancel event do: the
+   * whole new event, encrypted with the event's stored secret (a secretEncryptedMessage of type
+   * EVENT_EDIT), so both sides see the new details. A cancelled event keeps its details and can
+   * no longer be edited. Only for events whose secret was kept (sent or received since then).
+   */
+  public async editEvent(data: EditEvent) {
+    const raw = String(data.id ?? '').trim();
+    const stored = raw ? await this.findEvent(raw) : undefined;
+    if (!stored) {
+      throw new NotFoundException('Event not found');
+    }
+    if (!stored.keyFromMe) {
+      throw new BadRequestException('Only events this number sent can be edited');
+    }
+    if (isJidNewsletter(stored.keyRemoteJid)) {
+      throw new BadRequestException('Channel events can only be edited from the phone');
+    }
+    const content = stored.content as Record<string, any>;
+    if (typeof content?.[POLL_SECRET_KEY] !== 'string') {
+      throw new NotFoundException('This event can only be edited from the phone');
+    }
+    const current = proto.Message.EventMessage.fromObject(withoutPollSecret(content));
+    if (current.isCanceled) {
+      throw new BadRequestException('This event was cancelled');
+    }
+
+    const changes = data.event ?? {};
+    let next: proto.Message.IEventMessage;
+    if (changes.isCanceled) {
+      // Cancelling changes nothing else, as on the phone.
+      next = { ...current, contextInfo: undefined, isCanceled: true };
+    } else {
+      const name = changes.name?.trim();
+      if (!name) {
+        throw new BadRequestException('The event needs a name');
+      }
+      const startTime = changes.startTime ?? Number(current.startTime?.toString());
+      if (!startTime) {
+        throw new BadRequestException('The event needs a start time');
+      }
+      const endTime =
+        changes.endTime === null
+          ? undefined
+          : (changes.endTime ?? (Number(current.endTime?.toString()) || undefined));
+      if (endTime && endTime <= startTime) {
+        throw new BadRequestException('The event must end after it starts');
+      }
+      const location =
+        changes.location === undefined
+          ? current.location
+          : changes.location?.trim()
+            ? { name: changes.location.trim() }
+            : undefined;
+
+      // The call link: kept when its kind is unchanged, a new one when the kind changes.
+      let joinLink = current.joinLink || undefined;
+      if (changes.call === 'none' || changes.joinLink === null) {
+        joinLink = undefined;
+      } else if (changes.call) {
+        const prefix =
+          changes.call === 'audio'
+            ? 'https://call.whatsapp.com/voice/'
+            : 'https://call.whatsapp.com/video/';
+        if (!joinLink?.startsWith(prefix)) {
+          const token = await this.client.createCallLink(changes.call, { startTime });
+          joinLink = token ? prefix + token : undefined;
+        }
+      } else if (typeof changes.joinLink === 'string') {
+        joinLink = changes.joinLink.trim() || undefined;
+      }
+
+      next = {
+        ...current,
+        contextInfo: undefined,
+        name,
+        description: changes.description === undefined ? current.description : changes.description,
+        startTime,
+        endTime,
+        location,
+        joinLink,
+        isScheduleCall: !!joinLink && (!!changes.call || !!current.isScheduleCall),
+        isCanceled: false,
+      };
+    }
+
+    const addressing: PollAddressing =
+      content[POLL_ADDRESSING_KEY] ?? (stored.keyRemoteJid ? 'pn' : 'lid');
+    const lid = addressing === 'lid';
+    const me = this.ownVoteJids();
+    const self = (lid ? me.lid : me.pn) ?? me.pn ?? me.lid;
+    const chat = stored.isGroup
+      ? stored.keyRemoteJid
+      : ((lid ? stored.keyLid : stored.keyRemoteJid) ?? stored.keyRemoteJid ?? stored.keyLid);
+    if (!chat || !self) {
+      throw new BadRequestException('Cannot tell which chat this event belongs to');
+    }
+
+    try {
+      const targetMessageKey = { remoteJid: chat, fromMe: true, id: stored.keyId };
+      const message: proto.IMessage = {
+        secretEncryptedMessage: {
+          targetMessageKey,
+          ...encryptEventEdit(next, {
+            eventSecret: Buffer.from(content[POLL_SECRET_KEY], 'base64'),
+            eventMsgId: stored.keyId,
+            eventCreatorJid: self,
+            editorJid: self,
+          }),
+          secretEncType: proto.Message.SecretEncryptedMessage.SecretEncType.EVENT_EDIT,
+        },
+      };
+      // The stanza WhatsApp sends for an event edit: type "event", edit="1" and an
+      // event_type="edit" meta node (Baileys would type it "text" and add neither).
+      const keyId = await this.client.relayMessage(chat, message, {
+        additionalAttributes: { type: 'event', edit: '1' },
+        additionalNodes: [{ tag: 'meta', attrs: { event_type: 'edit' }, content: undefined }],
+      });
+
+      await this.repository.message.update({
+        where: { id: stored.id },
+        data: { content: this.storedEvent(next, content) },
+      });
+
+      // Saved and announced like an edit made on the phone, the new details already named.
+      const messageSent = {
+        keyId,
+        keyFromMe: true,
+        keyRemoteJid: stored.keyRemoteJid ?? chat,
+        keyLid: stored.keyLid,
+        messageType: 'secretEncryptedMessage',
+        content: {
+          targetMessageKey,
+          secretEncType: 'EVENT_EDIT',
+          eventEdit: { eventId: stored.keyId, ...eventFields(next) },
+        },
+        messageTimestamp: Math.floor(Date.now() / 1000),
+        instanceId: this.instance.id,
+        device: 'web',
+        isGroup: !!stored.isGroup,
+      } as Partial<PrismType.Message>;
+      if (this.databaseOptions.DB_OPTIONS.NEW_MESSAGE) {
+        const { id } = await this.repository.message.create({
+          data: messageSent as PrismType.Message,
+        });
+        messageSent.id = id;
+      }
+      this.ws.send(this.instance.name, 'messages.upsert', messageSent);
+      this.sendDataWebhook('messagesUpsert', messageSent).catch((error) =>
+        this.logger.error(error),
+      );
+      return messageSent;
     } catch (error) {
       this.logger.error(error);
       throw new BadRequestException(error.toString());

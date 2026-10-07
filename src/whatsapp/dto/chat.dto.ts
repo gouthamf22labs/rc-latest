@@ -137,6 +137,24 @@ export class PinMessage extends MessageId {
   time?: 86400 | 604800 | 2592000;
 }
 
+/**
+ * Edits (or cancels) an event this number sent, as WhatsApp's Edit event does: the whole new
+ * event. Times are unix seconds; `call` adds, swaps or (`none`) drops the WhatsApp call link,
+ * left out keeps it; `isCanceled` cancels the event and keeps everything else.
+ */
+export class EditEvent extends MessageId {
+  event: {
+    name?: string;
+    description?: string;
+    startTime?: number;
+    endTime?: number | null;
+    location?: string | null;
+    joinLink?: string | null;
+    call?: 'audio' | 'video' | 'none';
+    isCanceled?: boolean;
+  };
+}
+
 /** Votes in a poll as this number: `id` is the poll's WhatsApp id, `options` our whole choice. */
 export class PollVote extends MessageId {
   options: string[];

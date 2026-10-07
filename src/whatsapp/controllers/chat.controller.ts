@@ -43,6 +43,7 @@ import {
   WhatsAppNumberDto,
   ReadMessageIdDto,
   RejectCallDto,
+  EditEvent,
   EditMessage,
   PinMessage,
   PollVote,
@@ -190,5 +191,9 @@ export class ChatController {
 
   public async editMessage({ instanceName }: InstanceDto, data: EditMessage) {
     return await this.waMonitor.waInstances.get(instanceName).editMessage(data);
+  }
+
+  public async editEvent({ instanceName }: InstanceDto, data: EditEvent) {
+    return await this.waMonitor.waInstances.get(instanceName).editEvent(data);
   }
 }

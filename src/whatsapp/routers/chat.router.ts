@@ -39,6 +39,7 @@ import {
   archiveChatSchema,
   contactValidateSchema,
   deleteMessageSchema,
+  editEventSchema,
   editMessageSchema,
   pinMessageSchema,
   pollVoteSchema,
@@ -57,6 +58,7 @@ import {
 import {
   ArchiveChatDto,
   DeleteMessage,
+  EditEvent,
   EditMessage,
   PinMessage,
   PollVote,
@@ -408,6 +410,15 @@ export function ChatRouter(chatController: ChatController, ...guards: RequestHan
         request: req,
         schema: editMessageSchema,
         execute: (instance, data) => chatController.editMessage(instance, data),
+      });
+
+      res.status(HttpStatus.OK).json(response);
+    })
+    .post(routerPath('editEvent'), ...guards, async (req, res) => {
+      const response = await dataValidate<EditEvent>({
+        request: req,
+        schema: editEventSchema,
+        execute: (instance, data) => chatController.editEvent(instance, data),
       });
 
       res.status(HttpStatus.OK).json(response);
