@@ -115,7 +115,7 @@ import {
   SendStickerDto,
   SendTextDto,
 } from '../dto/sendMessage.dto';
-import { isArray, isBase64, isInt, isNotEmpty, isURL } from 'class-validator';
+import { isArray, isBase64, isNotEmpty, isURL } from 'class-validator';
 import {
   ArchiveChatDto,
   DeleteMessage,
@@ -4134,17 +4134,21 @@ export class WAStartupService {
 
   public async editMessage(data: EditMessage) {
     try {
-      const where: any = {
-        instanceId: this.instance.id,
-      };
-      if (isInt(data.id)) {
-        const id = Number.parseInt(data.id);
-        where.id = id;
-      } else {
-        where.keyId = data.id;
+      // The same lookup as pinMessage: a missing id must never fall through to "any message".
+      const raw = String(data.id ?? '').trim();
+      if (!raw) {
+        throw new Error('Message id is required');
       }
-
-      const message = await this.repository.message.findFirst({ where });
+      const message = await this.repository.message.findFirst({
+        where: {
+          instanceId: this.instance.id,
+          ...(/^\d+$/.test(raw) ? { OR: [{ id: Number.parseInt(raw) }, { keyId: raw }] } : { keyId: raw }),
+        },
+        orderBy: { id: 'desc' },
+      });
+      if (!message) {
+        throw new Error('Message not found');
+      }
       const messageKey: proto.IMessageKey = {
         id: message.keyId,
         fromMe: message.keyFromMe,

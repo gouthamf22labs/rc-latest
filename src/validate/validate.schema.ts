@@ -797,10 +797,12 @@ export const editMessageSchema: JSONSchema7 = {
   $id: ulid(),
   type: 'object',
   properties: {
+    // Which message: without it the lookup below matched any message of the instance.
+    id: { type: 'string', minLength: 1 },
     text: { type: 'string' },
   },
-  required: ['text'],
-  ...isNotEmpty('text'),
+  required: ['id', 'text'],
+  ...isNotEmpty('id', 'text'),
 };
 
 // Group Schema
