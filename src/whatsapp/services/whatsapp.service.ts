@@ -58,6 +58,7 @@ import makeWASocket, {
   isJidGroup,
   isJidNewsletter,
   isLidUser,
+  jidNormalizedUser,
   makeCacheableSignalKeyStore,
   MessageUpsertType,
   ParticipantAction,
@@ -121,6 +122,7 @@ import {
   DeleteMessage,
   EditMessage,
   PinMessage,
+  PollVote,
   ForwardMessage,
   OnWhatsAppDto,
   ReadMessageDto,
@@ -129,7 +131,11 @@ import {
   UpdatePresenceDto,
   WhatsAppNumberDto,
 } from '../dto/chat.dto';
-import { BadRequestException, InternalServerErrorException } from '../../exceptions';
+import {
+  BadRequestException,
+  InternalServerErrorException,
+  NotFoundException,
+} from '../../exceptions';
 import {
   CreateGroupDto,
   GroupJid,
@@ -169,6 +175,16 @@ import { useDatabaseAuthState } from '../../utils/use-database-auth-state';
 import { createProxyAgents } from '../../utils/proxy';
 import { fetchLatestBaileysVersionV2 } from '../../utils/wa-version';
 import { getJidUser, getUserGroup } from '../../utils/extract-id';
+import {
+  encryptPollVote,
+  isPollType,
+  POLL_ADDRESSING_KEY,
+  POLL_SECRET_KEY,
+  PollAddressing,
+  pollSecretOf,
+  readPollVote,
+  withoutPollSecret,
+} from '../../utils/poll-vote';
 import { getObjectUrl } from '../../integrations/minio/minio.utils';
 import { encodeProps } from '../../utils/encode.props';
 import { voipSupervisor } from '../../voip/voip.supervisor';
@@ -1377,7 +1393,14 @@ export class WAStartupService {
         orderBy: { messageTimestamp: 'desc' },
       });
       if (!message?.content) return undefined;
-      return { [message.messageType]: message.content } as proto.IMessage;
+      // A re-sent poll must carry its secret again, or the recipient can never vote on it.
+      const secret = (message.content as Record<string, unknown>)[POLL_SECRET_KEY];
+      return {
+        [message.messageType]: withoutPollSecret(message.content),
+        ...(typeof secret === 'string'
+          ? { messageContextInfo: { messageSecret: Buffer.from(secret, 'base64') } }
+          : {}),
+      } as proto.IMessage;
     } catch {
       return undefined;
     }
@@ -2054,10 +2077,30 @@ export class WAStartupService {
           isGroup: isJidGroup(received.key.remoteJid),
         } as PrismType.Message;
 
+        // A poll keeps its secret so its votes can be read, and cast from here, later.
+        const pollSecret = isPollType(messageType) && pollSecretOf(received.message);
+        if (pollSecret) {
+          messageRaw.content[POLL_SECRET_KEY] = pollSecret;
+          messageRaw.content[POLL_ADDRESSING_KEY] =
+            received.key.addressingMode === 'lid' || isLidUser(received.key.remoteJid)
+              ? 'lid'
+              : 'pn';
+        }
+
+        // A vote arrives encrypted: name its choices for the webhook when the poll's secret is
+        // known. Without it the payload stays as it always was.
+        if (messageType === 'pollUpdateMessage') {
+          const vote = await this.readVote(received, user, group);
+          if (vote) {
+            messageRaw.content['vote'] = { ...(messageRaw.content['vote'] as object), ...vote };
+          }
+        }
+
         if (this.databaseOptions.DB_OPTIONS.NEW_MESSAGE) {
           const { id } = await this.repository.message.create({ data: messageRaw });
           messageRaw.id = id;
         }
+        messageRaw.content = withoutPollSecret(messageRaw.content);
 
         if (type === 'append') {
           const find = await this.repository.message.findFirst({
@@ -2959,9 +3002,11 @@ export class WAStartupService {
     // does the existence leg only, bounded and cached.
     const recipient = await this.resolveRecipient(jid);
 
+    // A group's addressing mode decides which jid form its poll votes are encrypted with.
+    let groupAddressing: string | undefined;
     if (isJidGroup(recipient)) {
       try {
-        await this.client.groupMetadata(recipient);
+        groupAddressing = (await this.client.groupMetadata(recipient))?.addressingMode;
       } catch (error) {
         throw new BadRequestException('Group not found');
       }
@@ -3081,6 +3126,15 @@ export class WAStartupService {
           timestamp = 0;
         }
 
+        const content = JSON.parse(JSON.stringify(m.message[getContentType(m.message)]));
+        // A poll keeps its secret so its votes can be read, and cast from here, later.
+        const pollSecret = isPollType(getContentType(m.message)) && pollSecretOf(m.message);
+        if (pollSecret) {
+          content[POLL_SECRET_KEY] = pollSecret;
+          content[POLL_ADDRESSING_KEY] =
+            isLidUser(recipient) || groupAddressing === 'lid' ? 'lid' : 'pn';
+        }
+
         return {
           keyId: m.key.id,
           keyFromMe: m.key.fromMe,
@@ -3088,9 +3142,7 @@ export class WAStartupService {
           keyParticipant: m?.participant,
           pushName: m?.pushName,
           messageType: getContentType(m.message),
-          content: JSON.parse(
-            JSON.stringify(m.message[getContentType(m.message)]),
-          ) as PrismType.Prisma.JsonValue,
+          content: content as PrismType.Prisma.JsonValue,
           messageTimestamp: timestamp,
           instanceId: this.instance.id,
           device: 'web',
@@ -3103,6 +3155,7 @@ export class WAStartupService {
         });
         messageSent.id = id;
       }
+      messageSent.content = withoutPollSecret(messageSent.content);
 
       messageSent['externalAttributes'] = options?.externalAttributes;
 
@@ -4092,7 +4145,7 @@ export class WAStartupService {
         remoteJid: message.keyRemoteJid,
         participant: message.keyParticipant ?? undefined,
       },
-      message: { [message.messageType]: message.content as any },
+      message: { [message.messageType]: withoutPollSecret(message.content) as any },
     } as WAMessage;
     const sent = [];
     for (const to of data.to) {
@@ -4163,6 +4216,189 @@ export class WAStartupService {
     } catch (error) {
       this.logger.error(error);
       throw new BadRequestException(error.toString());
+    }
+  }
+
+  /** This number's own jids, phone-number form and LID, without the device suffix. */
+  private ownVoteJids() {
+    const pn = this.client?.user?.id ? jidNormalizedUser(this.client.user.id) : this.instance.ownerJid;
+    const lid = this.client?.user?.lid ? jidNormalizedUser(this.client.user.lid) : undefined;
+    return { pn, lid };
+  }
+
+  /** The newest stored poll with this WhatsApp id, if it is a poll. */
+  private async findPoll(keyId: string) {
+    const poll = await this.repository.message.findFirst({
+      where: { instanceId: this.instance.id, keyId },
+      orderBy: { id: 'desc' },
+    });
+    return poll && isPollType(poll.messageType) ? poll : undefined;
+  }
+
+  /**
+   * Names the choices of an incoming (or our own phone's) poll vote, from the poll's stored
+   * secret: `{ pollId, options, voter }`. Undefined when the poll or its secret is unknown, as for
+   * polls from before secrets were kept. An empty `options` is a vote taken back.
+   */
+  private async readVote(
+    received: WAMessage,
+    user: { jid?: string; lid?: string },
+    group: { jid?: string; lid?: string },
+  ) {
+    try {
+      const update = received.message?.pollUpdateMessage;
+      const pollId = update?.pollCreationMessageKey?.id;
+      if (!pollId || !update.vote?.encPayload || !update.vote?.encIv) {
+        return undefined;
+      }
+      const poll = await this.findPoll(pollId);
+      const content = poll?.content as Record<string, any>;
+      const secret = content?.[POLL_SECRET_KEY];
+      if (typeof secret !== 'string') {
+        return undefined;
+      }
+      const me = this.ownVoteJids();
+      const creators = poll.keyFromMe
+        ? [me.pn, me.lid]
+        : poll.isGroup
+          ? [poll.keyParticipant, poll.keyParticipantLid]
+          : [poll.keyRemoteJid, poll.keyLid];
+      const voters = received.key.fromMe
+        ? [me.pn, me.lid]
+        : isJidGroup(received.key.remoteJid)
+          ? [group?.jid, group?.lid]
+          : [user?.jid, user?.lid];
+      const read = readPollVote(update.vote, {
+        pollEncKey: Buffer.from(secret, 'base64'),
+        pollMsgId: pollId,
+        creators,
+        voters,
+        optionNames: (content.options ?? []).map((o: any) => String(o?.optionName ?? '')),
+      });
+      if (!read) {
+        this.logger.warn(`poll vote for ${pollId} could not be decrypted`);
+        return undefined;
+      }
+      // The jid form that worked is how this chat's votes are encrypted: cast ours the same way.
+      if (content[POLL_ADDRESSING_KEY] !== read.addressing) {
+        await this.repository.message.update({
+          where: { id: poll.id },
+          data: { content: { ...content, [POLL_ADDRESSING_KEY]: read.addressing } },
+        });
+      }
+      return { pollId, options: read.options, voter: read.voterJid };
+    } catch (error) {
+      this.logger.error(error);
+      return undefined;
+    }
+  }
+
+  /**
+   * Votes in a poll as this number, as tapping the options in WhatsApp does: `options` replaces
+   * our previous choice, and an empty list takes the vote back. Only for polls whose secret was
+   * kept (sent or received since then).
+   */
+  public async pollVote(data: PollVote) {
+    const raw = String(data.id ?? '').trim();
+    const poll = raw ? await this.findPoll(raw) : undefined;
+    if (!poll) {
+      throw new NotFoundException('Poll not found');
+    }
+    const content = poll.content as Record<string, any>;
+    const secret = content?.[POLL_SECRET_KEY];
+    if (typeof secret !== 'string') {
+      throw new NotFoundException('This poll can only be voted on from the phone');
+    }
+    if (isJidNewsletter(poll.keyRemoteJid)) {
+      throw new BadRequestException('Channel polls can only be voted on from the phone');
+    }
+
+    const names: string[] = (content.options ?? []).map((o: any) => String(o?.optionName ?? ''));
+    // Matched as written, else ignoring outer spaces (callers may keep options trimmed); the
+    // vote names each by the poll's own text, which is what WhatsApp hashes.
+    const resolve = (o: string) =>
+      names.find((n) => n === o) ?? names.find((n) => n.trim() === o.trim());
+    const unknown = (data.options ?? []).filter((o) => resolve(o) === undefined);
+    const options = [...new Set((data.options ?? []).map(resolve).filter((o) => o !== undefined))];
+    if (unknown.length) {
+      throw new BadRequestException(`Not an option of this poll: ${unknown.join(', ')}`);
+    }
+    const selectable = Number(content.selectableOptionsCount ?? 0);
+    if (selectable > 0 && options.length > selectable) {
+      throw new BadRequestException(`This poll allows at most ${selectable} choice(s)`);
+    }
+
+    const addressing: PollAddressing =
+      content[POLL_ADDRESSING_KEY] ?? (poll.keyRemoteJid ? 'pn' : 'lid');
+    const lid = addressing === 'lid';
+    const me = this.ownVoteJids();
+    const self = (lid ? me.lid : me.pn) ?? me.pn ?? me.lid;
+    const chat = poll.isGroup
+      ? poll.keyRemoteJid
+      : ((lid ? poll.keyLid : poll.keyRemoteJid) ?? poll.keyRemoteJid ?? poll.keyLid);
+    const sender = poll.isGroup
+      ? ((lid ? poll.keyParticipantLid : poll.keyParticipant) ??
+        poll.keyParticipant ??
+        poll.keyParticipantLid)
+      : chat;
+    const creator = poll.keyFromMe ? self : sender;
+    if (!chat || !self || !creator) {
+      throw new BadRequestException('Cannot tell who this poll belongs to');
+    }
+
+    try {
+      const message: proto.IMessage = {
+        pollUpdateMessage: {
+          pollCreationMessageKey: {
+            remoteJid: chat,
+            fromMe: poll.keyFromMe,
+            id: poll.keyId,
+            participant: poll.isGroup && !poll.keyFromMe ? creator : undefined,
+          },
+          vote: encryptPollVote(options, {
+            pollEncKey: Buffer.from(secret, 'base64'),
+            pollMsgId: poll.keyId,
+            pollCreatorJid: creator,
+            voterJid: self,
+          }),
+          senderTimestampMs: Date.now(),
+        },
+      };
+      const keyId = await this.client.relayMessage(chat, message, {
+        additionalNodes: [{ tag: 'meta', attrs: { polltype: 'vote' }, content: undefined }],
+      });
+
+      // Saved and announced like a vote cast on the phone, choices already named.
+      const messageSent = {
+        keyId,
+        keyFromMe: true,
+        keyRemoteJid: poll.keyRemoteJid ?? chat,
+        keyLid: poll.keyLid,
+        messageType: 'pollUpdateMessage',
+        content: {
+          pollCreationMessageKey: { remoteJid: chat, fromMe: poll.keyFromMe, id: poll.keyId },
+          vote: { pollId: poll.keyId, options, voter: self },
+          senderTimestampMs: Date.now(),
+        },
+        messageTimestamp: Math.floor(Date.now() / 1000),
+        instanceId: this.instance.id,
+        device: 'web',
+        isGroup: !!poll.isGroup,
+      } as Partial<PrismType.Message>;
+      if (this.databaseOptions.DB_OPTIONS.NEW_MESSAGE) {
+        const { id } = await this.repository.message.create({
+          data: messageSent as PrismType.Message,
+        });
+        messageSent.id = id;
+      }
+      this.ws.send(this.instance.name, 'messages.upsert', messageSent);
+      this.sendDataWebhook('messagesUpsert', messageSent).catch((error) =>
+        this.logger.error(error),
+      );
+      return messageSent;
+    } catch (error) {
+      this.logger.error(error);
+      throw new BadRequestException(error?.toString?.() ?? 'Could not vote');
     }
   }
 
@@ -4685,7 +4921,7 @@ export class WAStartupService {
         total: count,
         pages: Math.ceil(count / query.offset),
         currentPage: query.page,
-        records: messages,
+        records: messages.map((m) => ({ ...m, content: withoutPollSecret(m.content) })),
       },
     };
   }

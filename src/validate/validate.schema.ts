@@ -793,6 +793,18 @@ export const pinMessageSchema: JSONSchema7 = {
   required: ['id', 'pin'],
 };
 
+export const pollVoteSchema: JSONSchema7 = {
+  $id: ulid(),
+  type: 'object',
+  properties: {
+    id: { type: 'string', minLength: 1 },
+    // Our whole choice; empty takes the vote back. Checked against the poll itself on send.
+    options: { type: 'array', uniqueItems: true, items: { type: 'string', minLength: 1 } },
+  },
+  required: ['id', 'options'],
+  ...isNotEmpty('id'),
+};
+
 export const editMessageSchema: JSONSchema7 = {
   $id: ulid(),
   type: 'object',

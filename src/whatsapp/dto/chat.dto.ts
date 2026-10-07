@@ -136,3 +136,8 @@ export class PinMessage extends MessageId {
   pin: boolean;
   time?: 86400 | 604800 | 2592000;
 }
+
+/** Votes in a poll as this number: `id` is the poll's WhatsApp id, `options` our whole choice. */
+export class PollVote extends MessageId {
+  options: string[];
+}

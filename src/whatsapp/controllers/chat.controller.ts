@@ -45,6 +45,7 @@ import {
   RejectCallDto,
   EditMessage,
   PinMessage,
+  PollVote,
   ForwardMessage,
   FetchPresenceDto,
   WatchPresenceDto,
@@ -181,6 +182,10 @@ export class ChatController {
 
   public async pinMessage({ instanceName }: InstanceDto, data: PinMessage) {
     return await this.waMonitor.waInstances.get(instanceName).pinMessage(data);
+  }
+
+  public async pollVote({ instanceName }: InstanceDto, data: PollVote) {
+    return await this.waMonitor.waInstances.get(instanceName).pollVote(data);
   }
 
   public async editMessage({ instanceName }: InstanceDto, data: EditMessage) {

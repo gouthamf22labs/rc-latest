@@ -41,6 +41,7 @@ import {
   deleteMessageSchema,
   editMessageSchema,
   pinMessageSchema,
+  pollVoteSchema,
   forwardMessageSchema,
   messageValidateSchema,
   profilePictureSchema,
@@ -58,6 +59,7 @@ import {
   DeleteMessage,
   EditMessage,
   PinMessage,
+  PollVote,
   ForwardMessage,
   NumberDto,
   ReadMessageDto,
@@ -391,6 +393,15 @@ export function ChatRouter(chatController: ChatController, ...guards: RequestHan
       });
 
       res.status(HttpStatus.OK).json(response);
+    })
+    .post(routerPath('pollVote'), ...guards, async (req, res) => {
+      const response = await dataValidate<PollVote>({
+        request: req,
+        schema: pollVoteSchema,
+        execute: (instance, data) => chatController.pollVote(instance, data),
+      });
+
+      res.status(HttpStatus.CREATED).json(response);
     })
     .post(routerPath('editMessage'), ...guards, async (req, res) => {
       const response = await dataValidate<EditMessage>({
