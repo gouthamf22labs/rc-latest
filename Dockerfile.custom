@@ -15,9 +15,11 @@ WORKDIR /codechat
 
 COPY package*.json .npmrc ./
 
+# Exactly the committed lockfile (npm ci): every build gets the same versions - Baileys stays on the
+# release our patches are for - and this layer stays cached until package*.json change.
 # postinstall runs patch-package; with no patches/ yet it does nothing. The patches are applied
 # below, so editing one doesn't redo the whole install.
-RUN --mount=type=cache,target=/root/.npm npm install --force
+RUN --mount=type=cache,target=/root/.npm npm ci --legacy-peer-deps --no-audit --no-fund
 
 COPY ./patches ./patches
 RUN npx patch-package
