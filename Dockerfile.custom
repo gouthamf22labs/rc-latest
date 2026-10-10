@@ -37,7 +37,8 @@ RUN npx prisma generate
 
 RUN npm run build
 
-RUN npm prune --omit=dev --legacy-peer-deps
+# No `npm prune --omit=dev` (it took ~3 min): the sharp reinstall below brought every dev package
+# back anyway, and the image needs one of them - the prisma CLI that deploy_db.sh runs at startup.
 
 # sharp ships per-platform native binaries as optionalDependencies; a lockfile
 # generated on macOS plus `npm install --force` can leave the linux binary out,
