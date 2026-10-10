@@ -60,6 +60,12 @@ export type LogLevel = 'fatal' | 'error' | 'warn' | 'info' | 'debug' | 'trace';
 export type Log = {
   LEVEL: LogLevel;
   COLOR: boolean;
+  /** Grafana Loki push URL (same as the scheduler backend's LOKI_EXTERNAL_URL); empty = no Loki. */
+  LOKI_URL: string;
+  LOKI_APPLICATION: string;
+  LOKI_ENVIRONMENT: string;
+  /** Lowest level sent to Loki (the file/console keep LOG_LEVEL), so debug noise stays local. */
+  LOKI_LEVEL: LogLevel;
 };
 
 export type DBOptions = {
@@ -112,6 +118,9 @@ export type QrCodLimit = number;
 
 export type EnvProxy = { WS?: string; FETCH?: string };
 
+/** Who-chatted-with-whom index (src/utils/contact-activity.ts). */
+export type ContactActivityConf = { ENABLED: boolean };
+
 export interface Env {
   SERVER: HttpServer;
   STORE: StoreConf;
@@ -130,6 +139,7 @@ export interface Env {
   WA_VERSION: string;
   PROXY: EnvProxy;
   BAILEYS_LOG_LEVEL: LogLevel;
+  CONTACT_ACTIVITY: ContactActivityConf;
 }
 
 export type Key = keyof Env;
@@ -201,6 +211,13 @@ export class ConfigService {
       LOG: {
         LEVEL: (process.env?.LOG_LEVEL?.toLowerCase() as LogLevel) ?? 'debug',
         COLOR: process.env?.LOG_COLOR === 'true',
+        // Same name as the scheduler backend's, so one value serves both.
+        // DISABLE_LOKI=true turns it off without removing the URL (same switch as the backend).
+        LOKI_URL:
+          process.env?.DISABLE_LOKI === 'true' ? '' : process.env?.LOKI_URL || process.env?.LOKI_EXTERNAL_URL || '',
+        LOKI_APPLICATION: process.env?.LOKI_APPLICATION || 'codechat',
+        LOKI_ENVIRONMENT: process.env?.LOKI_ENVIRONMENT || process.env?.NODE_ENV || 'production',
+        LOKI_LEVEL: (process.env?.LOKI_LEVEL?.toLowerCase() as LogLevel) || 'info',
       },
       INSTANCE_EXPIRATION_TIME:
         process.env?.INSTANCE_EXPIRATION_TIME === 'false'
@@ -253,6 +270,9 @@ export class ConfigService {
       },
       PRODUCTION: process.env?.NODE_ENV === 'production',
       BAILEYS_LOG_LEVEL: (process.env?.BAILEYS_LOG_LEVEL ?? 'error') as LogLevel,
+      CONTACT_ACTIVITY: {
+        ENABLED: process.env?.CONTACT_ACTIVITY_ENABLED !== 'false',
+      },
     };
   }
 }

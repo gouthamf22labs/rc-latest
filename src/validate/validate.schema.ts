@@ -840,6 +840,21 @@ export const editEventSchema: JSONSchema7 = {
   ...isNotEmpty('id'),
 };
 
+export const contactActivitySchema: JSONSchema7 = {
+  $id: ulid(),
+  type: 'object',
+  properties: {
+    // Phone digits or jids (`@s.whatsapp.net` or `@lid`); others are ignored.
+    jids: {
+      type: 'array',
+      minItems: 1,
+      maxItems: 2000,
+      items: { type: 'string', minLength: 1, maxLength: 100 },
+    },
+  },
+  required: ['jids'],
+};
+
 // Group Schema
 export const createGroupSchema: JSONSchema7 = {
   $id: ulid(),

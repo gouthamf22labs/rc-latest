@@ -1,0 +1,98 @@
+{
+  "title": "CodeChat",
+  "uid": "codechat-runtime",
+  "tags": ["codechat", "whatsapp"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "1m",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      { "name": "ds", "label": "Loki", "type": "datasource", "query": "loki" },
+      {
+        "name": "env",
+        "label": "Environment",
+        "type": "query",
+        "datasource": { "type": "loki", "uid": "${ds}" },
+        "query": "label_values({application=\"codechat\"}, environment)",
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Event-loop stall (worst per minute, ms)",
+      "description": "loopMaxMs from the once-a-minute runtime line. Above ~500 ms, sockets start missing keepalives.",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "loki", "uid": "${ds}" },
+      "fieldConfig": { "defaults": { "unit": "ms", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 200 }, { "color": "red", "value": 500 }] } } },
+      "targets": [{ "refId": "A", "expr": "max_over_time({application=\"codechat\", environment=\"$env\"} |= \"runtime rss=\" | json | unwrap loopMaxMs [2m])", "legendFormat": "loop max" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Memory (MB)",
+      "description": "RSS and V8 heap used, from the runtime line.",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "loki", "uid": "${ds}" },
+      "fieldConfig": { "defaults": { "unit": "decmbytes" } },
+      "targets": [
+        { "refId": "A", "expr": "max_over_time({application=\"codechat\", environment=\"$env\"} |= \"runtime rss=\" | json | unwrap rssMb [2m])", "legendFormat": "rss" },
+        { "refId": "B", "expr": "max_over_time({application=\"codechat\", environment=\"$env\"} |= \"runtime rss=\" | json | unwrap heapUsedMb [2m])", "legendFormat": "heap used" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "GC time per minute (ms)",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "loki", "uid": "${ds}" },
+      "fieldConfig": { "defaults": { "unit": "ms" } },
+      "targets": [
+        { "refId": "A", "expr": "max_over_time({application=\"codechat\", environment=\"$env\"} |= \"runtime rss=\" | json | unwrap gcTotalMs [2m])", "legendFormat": "gc total" },
+        { "refId": "B", "expr": "max_over_time({application=\"codechat\", environment=\"$env\"} |= \"runtime rss=\" | json | unwrap gcMajorMs [2m])", "legendFormat": "gc major" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Warnings and errors (per 5 min)",
+      "description": "pino levels: 40 warn, 50 error, 60 fatal.",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "loki", "uid": "${ds}" },
+      "targets": [
+        { "refId": "A", "expr": "sum(count_over_time({application=\"codechat\", environment=\"$env\"} | json | level = 40 [5m]))", "legendFormat": "warn" },
+        { "refId": "B", "expr": "sum(count_over_time({application=\"codechat\", environment=\"$env\"} | json | level >= 50 [5m]))", "legendFormat": "error" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Connection churn (per 5 min)",
+      "description": "Reconnects, conflicts and closes: a rising line is the flapping we fixed before.",
+      "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
+      "datasource": { "type": "loki", "uid": "${ds}" },
+      "targets": [
+        { "refId": "A", "expr": "sum(count_over_time({application=\"codechat\", environment=\"$env\"} |~ \"(?i)reconnect\" [5m]))", "legendFormat": "reconnect" },
+        { "refId": "B", "expr": "sum(count_over_time({application=\"codechat\", environment=\"$env\"} |~ \"(?i)conflict|replaced\" [5m]))", "legendFormat": "conflict / replaced" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Contact index saves (per minute)",
+      "description": "From 'contact activity flushed (last minute)': rows written, retained after a failed write, dropped.",
+      "gridPos": { "x": 12, "y": 16, "w": 12, "h": 8 },
+      "datasource": { "type": "loki", "uid": "${ds}" },
+      "targets": [
+        { "refId": "A", "expr": "sum(max_over_time({application=\"codechat\", environment=\"$env\"} |= \"contact activity flushed\" | json | unwrap rows [2m]))", "legendFormat": "rows" },
+        { "refId": "B", "expr": "sum(max_over_time({application=\"codechat\", environment=\"$env\"} |= \"contact activity flushed\" | json | unwrap retained [2m]))", "legendFormat": "retained" },
+        { "refId": "C", "expr": "sum(max_over_time({application=\"codechat\", environment=\"$env\"} |= \"contact activity flushed\" | json | unwrap dropped [2m]))", "legendFormat": "dropped" }
+      ]
+    },
+    {
+      "type": "logs",
+      "title": "Errors",
+      "gridPos": { "x": 0, "y": 24, "w": 24, "h": 10 },
+      "datasource": { "type": "loki", "uid": "${ds}" },
+      "options": { "showTime": true, "wrapLogMessage": true, "sortOrder": "Descending" },
+      "targets": [{ "refId": "A", "expr": "{application=\"codechat\", environment=\"$env\"} | json | level >= 50" }]
+    }
+  ]
+}

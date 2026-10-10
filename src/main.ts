@@ -123,6 +123,8 @@ async function onShutdownSignal(signal: string) {
     // Sockets are closed and flushed, so the successor can take over now instead of
     // waiting out the lease TTL.
     await context.get('module:socketLease')?.release?.();
+    // Sockets are closed, so nothing more is recorded: write what is still buffered.
+    await context.get('module:contactActivity')?.drain?.();
   } catch (error) {
     context.get('server:logger')?.error(['shutdown drain failed', error]);
   }

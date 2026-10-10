@@ -57,33 +57,57 @@ let rootLogger: pino.Logger | undefined;
 
 function getRootLogger(configService: ConfigService): pino.Logger {
   if (!rootLogger) {
-    rootLogger = pino({
-      level: configService.get<Log>('LOG').LEVEL,
-      timestamp: pino.stdTimeFunctions.isoTime,
-      transport: configService.get<boolean>('PRODUCTION')
-        ? {
-            target: 'pino/file',
-            options: {
-              destination: join(process.cwd(), 'logs', 'record'),
-              mkdir: true,
-              append: true,
-              sync: false,
-            },
-          }
-        : {
-            target: 'pino-pretty',
-            options: {
-              colorize: configService.get<Log>('LOG').COLOR,
-              translateTime: 'SYS:standard',
-              levelFirst: true,
-              singleLine: true,
-              ignore: 'pid,hostname',
-            },
+    const log = configService.get<Log>('LOG');
+    const local: pino.TransportTargetOptions = configService.get<boolean>('PRODUCTION')
+      ? {
+          target: 'pino/file',
+          level: log.LEVEL,
+          options: {
+            destination: join(process.cwd(), 'logs', 'record'),
+            mkdir: true,
+            append: true,
+            sync: false,
           },
+        }
+      : {
+          target: 'pino-pretty',
+          level: log.LEVEL,
+          options: {
+            colorize: log.COLOR,
+            translateTime: 'SYS:standard',
+            levelFirst: true,
+            singleLine: true,
+            ignore: 'pid,hostname',
+          },
+        };
+    // Also to Grafana Loki when configured (same stack as the scheduler backend), batched in the
+    // same transport worker thread, so the event loop only hands lines over. Loki gets LOKI_LEVEL
+    // and up; the local log keeps everything LOG_LEVEL allows.
+    const targets: pino.TransportTargetOptions[] = [local];
+    if (log.LOKI_URL) {
+      targets.push({
+        target: 'pino-loki',
+        level: log.LOKI_LEVEL,
+        options: {
+          host: log.LOKI_URL,
+          batching: true,
+          interval: 5,
+          labels: { application: log.LOKI_APPLICATION, environment: log.LOKI_ENVIRONMENT },
+        },
+      });
+    }
+    rootLogger = pino({
+      // The lowest of the two, so each target can filter to its own level.
+      level: lowest(log.LEVEL, log.LOKI_URL ? log.LOKI_LEVEL : log.LEVEL),
+      timestamp: pino.stdTimeFunctions.isoTime,
+      transport: { targets },
     });
   }
   return rootLogger;
 }
+
+const ORDER = ['trace', 'debug', 'info', 'warn', 'error', 'fatal'];
+const lowest = (a: string, b: string) => (ORDER.indexOf(a) <= ORDER.indexOf(b) ? a : b);
 
 export class Logger {
   constructor(

@@ -119,6 +119,7 @@ import {
 import { isArray, isBase64, isNotEmpty, isURL } from 'class-validator';
 import {
   ArchiveChatDto,
+  ContactActivityDto,
   DeleteMessage,
   EditEvent,
   EditMessage,
@@ -176,6 +177,11 @@ import { useDatabaseAuthState } from '../../utils/use-database-auth-state';
 import { createProxyAgents } from '../../utils/proxy';
 import { fetchLatestBaileysVersionV2 } from '../../utils/wa-version';
 import { getJidUser, getUserGroup } from '../../utils/extract-id';
+import {
+  contactActivity,
+  findKnownContacts,
+  ownerNumberOf,
+} from '../../utils/contact-activity';
 import {
   encryptPollVote,
   isPollType,
@@ -2041,6 +2047,16 @@ export class WAStartupService {
           // the batch (e.g. a newsletter post queued after a typeless message).
           continue;
         }
+
+        // The 1:1 "who chatted with whom" index; buffered, so no write here. Our own sends
+        // land here too (emitOwnEvents), as 'append' with fromMe.
+        contactActivity.record(
+          ownerNumberOf(this.instance.ownerJid || this.client?.user?.id),
+          received.key,
+          messageType,
+          timestamp as number,
+          this.client?.user?.lid ? jidNormalizedUser(this.client.user.lid) : undefined,
+        );
 
         if (typeof received.message[messageType] === 'string') {
           received.message[messageType] = {
@@ -4548,6 +4564,18 @@ export class WAStartupService {
       this.logger.error(error);
       return undefined;
     }
+  }
+
+  /**
+   * Which of `jids` this number has chatted 1:1 with, and when and how much (ContactActivity).
+   * Keyed by the account's phone number, so it spans every pairing of this number.
+   */
+  public async contactActivity(data: ContactActivityDto) {
+    const ownerNumber = ownerNumberOf(this.instance.ownerJid || this.client?.user?.id);
+    if (!ownerNumber) {
+      throw new BadRequestException('Instance is not paired to a number yet');
+    }
+    return { known: await findKnownContacts(this.repository, ownerNumber, data.jids) };
   }
 
   /**

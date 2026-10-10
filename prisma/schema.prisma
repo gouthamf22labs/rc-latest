@@ -206,3 +206,26 @@ model SocketLease {
   owner     String   @db.VarChar(200)
   expiresAt DateTime @db.Timestamptz(3)
 }
+
+/// Who a number has chatted 1:1 with — one row per (connected number, peer), kept by
+/// src/utils/contact-activity.ts from live messages. Keyed by the account's phone number,
+/// not instanceId, so it survives a QR re-pair onto a new instance.
+model ContactActivity {
+  /// Digits of the connected account's own number (from Instance.ownerJid).
+  ownerNumber   String   @db.VarChar(32)
+  /// `digits@s.whatsapp.net` when the phone number is known, else the peer's `@lid` jid.
+  peerJid       String   @db.VarChar(100)
+  /// The peer's LID when known, so a lookup by either form finds the row.
+  peerLid       String?  @db.VarChar(100)
+  firstAt       DateTime @db.Timestamptz(3)
+  lastAt        DateTime @db.Timestamptz(3)
+  fromMeCount   Int      @default(0)
+  fromThemCount Int      @default(0)
+  /// How the peer was first seen: "live" or "history".
+  source        String?  @db.VarChar(16)
+  createdAt     DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime @updatedAt @db.Timestamptz(3)
+
+  @@id([ownerNumber, peerJid])
+  @@index([ownerNumber, peerLid])
+}

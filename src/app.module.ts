@@ -43,7 +43,7 @@ import express, {
 import { Logger } from './config/logger.config';
 import { S3Service } from './integrations/minio/s3.service';
 import { Repository } from './repository/repository.service';
-import { ConfigService } from './config/env.config';
+import { ConfigService, ContactActivityConf } from './config/env.config';
 import { eventEmitter } from './config/event.config';
 import { ChatController } from './whatsapp/controllers/chat.controller';
 import { GroupController } from './whatsapp/controllers/group.controller';
@@ -75,6 +75,7 @@ import { voipSupervisor } from './voip/voip.supervisor';
 import { createServer } from 'http';
 import { RequestIdMiddleware } from './middle/req-id.middle';
 import { socketLease } from './utils/socket-lease';
+import { contactActivity } from './utils/contact-activity';
 
 export function describeRoutes(
   rootPath: string,
@@ -124,6 +125,12 @@ export async function AppModule(context: Map<string, any>) {
   // Before WAMonitoringService exists, so nothing can open a socket ahead of it.
   // loadInstance() below then waits inside connectToWhatsapp until the lease is won.
   socketLease.start(repository, logger.setCtx('socket-lease'));
+
+  contactActivity.start(
+    repository,
+    logger.setCtx('contact-activity'),
+    configService.get<ContactActivityConf>('CONTACT_ACTIVITY').ENABLED,
+  );
 
   const wss = new Websocket(configService);
   wss.server(server);
@@ -241,5 +248,6 @@ export async function AppModule(context: Map<string, any>) {
   // Exposed so the shutdown handler in main.ts can close every socket before exit.
   context.set('module:monitor', waMonitor);
   context.set('module:socketLease', socketLease);
+  context.set('module:contactActivity', contactActivity);
   context.set('module:config', configService);
 }

@@ -159,3 +159,11 @@ export class EditEvent extends MessageId {
 export class PollVote extends MessageId {
   options: string[];
 }
+
+/**
+ * Up to 2000 people to look up in this number's 1:1 history: phone digits or jids, `@lid`
+ * allowed.
+ */
+export class ContactActivityDto {
+  jids: string[];
+}

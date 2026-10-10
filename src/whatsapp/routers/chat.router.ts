@@ -37,6 +37,7 @@
 import { RequestHandler, Router } from 'express';
 import {
   archiveChatSchema,
+  contactActivitySchema,
   contactValidateSchema,
   deleteMessageSchema,
   editEventSchema,
@@ -57,6 +58,7 @@ import {
 } from '../../validate/validate.schema';
 import {
   ArchiveChatDto,
+  ContactActivityDto,
   DeleteMessage,
   EditEvent,
   EditMessage,
@@ -419,6 +421,15 @@ export function ChatRouter(chatController: ChatController, ...guards: RequestHan
         request: req,
         schema: editEventSchema,
         execute: (instance, data) => chatController.editEvent(instance, data),
+      });
+
+      res.status(HttpStatus.OK).json(response);
+    })
+    .post(routerPath('contactActivity'), ...guards, async (req, res) => {
+      const response = await dataValidate<ContactActivityDto>({
+        request: req,
+        schema: contactActivitySchema,
+        execute: (instance, data) => chatController.contactActivity(instance, data),
       });
 
       res.status(HttpStatus.OK).json(response);
