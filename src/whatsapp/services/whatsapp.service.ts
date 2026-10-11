@@ -4593,7 +4593,13 @@ export class WAStartupService {
     if (!ownerNumber) {
       throw new BadRequestException('Instance is not paired to a number yet');
     }
-    return { known: await findKnownContacts(this.repository, ownerNumber, data.jids) };
+    // `self`: this account's own ids, so a caller listing a group's members can leave the
+    // owner out even where the group only names them by LID.
+    const lid = this.client?.user?.lid ? jidNormalizedUser(this.client.user.lid) : null;
+    return {
+      known: await findKnownContacts(this.repository, ownerNumber, data.jids),
+      self: { pn: `${ownerNumber}@s.whatsapp.net`, lid },
+    };
   }
 
   /**
