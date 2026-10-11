@@ -207,6 +207,73 @@ export async function findKnownContacts(
   return [...known.values()];
 }
 
+export type HistoryCoverage = {
+  /** People first seen in this number's past 1:1 chats (history sync). Informational. */
+  historyPeople: number;
+  /** Newest conversation in the stored history (ISO); null = no past chats known for this number. */
+  historyUntil: string | null;
+  /** When live recording began (the index's first live row, any number), or null. */
+  liveSince: string | null;
+  /**
+   * Days between the newest stored past chat and live recording: conversations in between are
+   * in neither. 0 when the history reaches live recording; null when there is no history.
+   */
+  gapDays: number | null;
+};
+
+let liveSinceCache: { at: number; value: Date | null } | null = null;
+const LIVE_SINCE_TTL_MS = 60 * 60_000;
+
+/**
+ * How much of a number's past the index can vouch for. A caller deciding "has this person ever
+ * chatted with us?" from the index needs it: a number whose history never synced (not re-paired
+ * since chats were kept) reads as "nobody", which is not the same as knowing nobody did.
+ *
+ * historyUntil is the newest conversation timestamp in the chats CodeChat stored from history
+ * sync for this number (any of its instances), read from the Chat table as the backfill does.
+ */
+export async function historyCoverage(repository: Repository, ownerNumber: string): Promise<HistoryCoverage> {
+  const [people, until] = await Promise.all([
+    repository.$queryRaw<{ n: number }[]>`
+      SELECT count(*)::int AS n FROM "ContactActivity"
+      WHERE "ownerNumber" = ${ownerNumber} AND "source" = 'history'`,
+    repository.$queryRaw<{ sec: bigint | null }[]>`
+      SELECT max(GREATEST(
+        COALESCE((c.content->'conversationTimestamp'->>'low')::bigint, (c.content->>'conversationTimestamp')::bigint, 0),
+        COALESCE((c.content->>'lastMessageRecvTimestamp')::bigint, 0))) AS sec
+      FROM "Chat" c JOIN "Instance" i ON i.id = c."instanceId"
+      WHERE split_part(split_part(i."ownerJid", '@', 1), ':', 1) = ${ownerNumber}
+        AND (c."remoteJid" LIKE '%@s.whatsapp.net' OR c."remoteJid" LIKE '%@lid')
+        -- Not people: WhatsApp's own account, and "message yourself".
+        AND c."remoteJid" <> '0@s.whatsapp.net'
+        AND split_part(c."remoteJid", '@', 1) <> ${ownerNumber}
+        AND jsonb_typeof(c.content) = 'object'`,
+  ]);
+  if (!liveSinceCache || Date.now() - liveSinceCache.at > LIVE_SINCE_TTL_MS) {
+    const rows = await repository.$queryRaw<{ at: Date | null }[]>`
+      SELECT min("createdAt") AS at FROM "ContactActivity" WHERE "source" = 'live'`;
+    liveSinceCache = { at: Date.now(), value: rows[0]?.at ?? null };
+  }
+  const historyPeople = Number(people[0]?.n ?? 0);
+  const sec = Number(until[0]?.sec ?? 0);
+  const historyUntil = sec > 0 ? new Date(sec * 1000) : null;
+  const liveSince = liveSinceCache.value;
+  // From the stored chats, not historyPeople: someone first seen live keeps source "live" even
+  // once history sync also lists them, so a fresh pairing can have history but few "history" rows.
+  const gapDays =
+    !historyUntil
+      ? null
+      : liveSince && historyUntil < liveSince
+        ? Math.floor((liveSince.getTime() - historyUntil.getTime()) / 86_400_000)
+        : 0;
+  return {
+    historyPeople,
+    historyUntil: historyUntil?.toISOString() ?? null,
+    liveSince: liveSince?.toISOString() ?? null,
+    gapDays,
+  };
+}
+
 class ContactActivity {
   private buffer = new Map<string, Entry>();
   private repository?: Repository;

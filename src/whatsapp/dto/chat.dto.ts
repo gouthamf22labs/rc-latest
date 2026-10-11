@@ -166,4 +166,5 @@ export class PollVote extends MessageId {
  */
 export class ContactActivityDto {
   jids: string[];
+  coverage?: boolean;
 }

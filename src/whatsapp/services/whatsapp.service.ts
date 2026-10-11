@@ -180,6 +180,7 @@ import { getJidUser, getUserGroup } from '../../utils/extract-id';
 import {
   contactActivity,
   findKnownContacts,
+  historyCoverage,
   ownerNumberOf,
 } from '../../utils/contact-activity';
 import {
@@ -4599,6 +4600,7 @@ export class WAStartupService {
     return {
       known: await findKnownContacts(this.repository, ownerNumber, data.jids),
       self: { pn: `${ownerNumber}@s.whatsapp.net`, lid },
+      ...(data.coverage ? { coverage: await historyCoverage(this.repository, ownerNumber) } : {}),
     };
   }
 

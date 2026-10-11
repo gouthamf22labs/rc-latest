@@ -851,6 +851,8 @@ export const contactActivitySchema: JSONSchema7 = {
       maxItems: 2000,
       items: { type: 'string', minLength: 1, maxLength: 100 },
     },
+    // Also say how much of this number's past the index holds (see historyCoverage).
+    coverage: { type: 'boolean' },
   },
   required: ['jids'],
 };
