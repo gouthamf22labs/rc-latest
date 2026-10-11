@@ -13,6 +13,15 @@ import { yieldToLoop } from './yield-to-loop';
  * Who each connected number has chatted 1:1 with: one ContactActivity row per (number, peer)
  * with when they first and last talked and how many messages went each way.
  *
+ * Two sources feed it. Live messages (record) count each message. History sync
+ * (recordHistoryChat) only says "these two have a chat": it sets firstAt/lastAt and never the
+ * counts, since a history chunk is a partial, possibly repeated view of the past.
+ *
+ * One row per person: a peer is keyed by their phone jid whenever it can be found (from the
+ * message key, the history chat's pnJid, or the account's LID→PN store at flush time), with
+ * the LID kept alongside. A row written under a LID before the phone was known is folded into
+ * the phone row once a later write links the two.
+ *
  * Keyed by the account's own phone number, not the instance: a QR re-pair creates a new
  * instance for the same number, and its history with people must carry over.
  *
@@ -34,7 +43,11 @@ type Entry = {
   fromMe: number;
   fromThem: number;
   source: 'live' | 'history';
+  /** For a peer known only by LID: the account's LID→PN lookup, tried once at flush. */
+  resolvePn?: (lid: string) => Promise<string | null | undefined>;
 };
+
+export type LidToPn = (lid: string) => Promise<string | null | undefined>;
 
 const FLUSH_MS = 3_000;
 const FLUSH_AT_KEYS = 500;
@@ -64,6 +77,16 @@ function isMissingTable(error: unknown): boolean {
   );
 }
 
+/** A protobuf timestamp (number, numeric string, or Long) as unix seconds; 0 when absent. */
+function unixSeconds(value: unknown): number {
+  if (value == null) return 0;
+  if (typeof value === 'number') return value > 0 ? value : 0;
+  if (typeof value === 'string') return Number(value) > 0 ? Number(value) : 0;
+  const long = value as { toNumber?: () => number; low?: number };
+  const n = typeof long.toNumber === 'function' ? long.toNumber() : Number(long.low);
+  return n > 0 ? n : 0;
+}
+
 /** The account's own phone digits from an ownerJid / user id (`91…:12@s.whatsapp.net`). */
 export function ownerNumberOf(jid: string | undefined | null): string | undefined {
   const user = jid?.split('@')[0]?.split(':')[0];
@@ -83,8 +106,11 @@ export function peerOf(
   ownerNumber: string,
   ownLid?: string,
 ): { peerJid: string; peerLid: string | null } | undefined {
+  // "Us", or WhatsApp's own service account (0@s.whatsapp.net), which is not a person.
   const own = (jid: string) =>
-    jid === `${ownerNumber}@s.whatsapp.net` || (!!ownLid && jid === ownLid);
+    jid === `${ownerNumber}@s.whatsapp.net` ||
+    jid === '0@s.whatsapp.net' ||
+    (!!ownLid && jid === ownLid);
 
   const remote = key?.remoteJid ? jidNormalizedUser(key.remoteJid) : '';
   if (!(isPnUser(remote) || isLidUser(remote)) || own(remote)) {
@@ -217,7 +243,7 @@ class ContactActivity {
     messageType: string,
     at: number,
     ownLid?: string,
-    source: Entry['source'] = 'live',
+    resolvePn?: LidToPn,
   ): void {
     if (!this.enabled || !ownerNumber || IGNORED_TYPES.has(messageType)) {
       return;
@@ -238,7 +264,8 @@ class ContactActivity {
         lastAt: ms,
         fromMe,
         fromThem: 1 - fromMe,
-        source,
+        source: 'live',
+        resolvePn: peer.peerJid === peer.peerLid ? resolvePn : undefined,
       });
     } catch (error) {
       this.logger?.debug('contact activity record skipped', { error: String(error) });
@@ -247,6 +274,64 @@ class ContactActivity {
     if (this.buffer.size >= FLUSH_AT_KEYS) {
       void this.flush();
     }
+  }
+
+  /**
+   * One 1:1 chat from history sync: a sighting with its dates and no counts. `pnForLid` is the
+   * sync's own LID→PN pairs; anything it misses is tried against `resolvePn` at flush.
+   * Returns whether it was recorded (false for groups, channels, ourselves, or no timestamp).
+   */
+  recordHistoryChat(
+    ownerNumber: string | undefined,
+    chat: { id?: string | null; pnJid?: string | null; lidJid?: string | null } & Record<string, any>,
+    ownLid?: string,
+    pnForLid?: Map<string, string>,
+    resolvePn?: LidToPn,
+  ): boolean {
+    if (!this.enabled || !ownerNumber || !chat?.id) {
+      return false;
+    }
+    try {
+      const sec = Math.max(
+        unixSeconds(chat.conversationTimestamp),
+        unixSeconds(chat.lastMessageRecvTimestamp),
+      );
+      if (!sec) {
+        return false;
+      }
+      const id = jidNormalizedUser(chat.id);
+      const alt = (jid?: string | null) => (jid ? jidNormalizedUser(jid) : undefined);
+      const lid = isLidUser(id) ? id : alt(chat.lidJid);
+      const pn =
+        (isPnUser(id) ? id : alt(chat.pnJid)) ?? (lid ? pnForLid?.get(lid) : undefined);
+      const peer = peerOf(
+        { remoteJid: pn ?? id, remoteJidAlt: lid ?? undefined, fromMe: false },
+        ownerNumber,
+        ownLid,
+      );
+      if (!peer) {
+        return false;
+      }
+      const ms = sec * 1000;
+      this.merge({
+        ownerNumber,
+        peerJid: peer.peerJid,
+        peerLid: peer.peerLid,
+        firstAt: ms,
+        lastAt: ms,
+        fromMe: 0,
+        fromThem: 0,
+        source: 'history',
+        resolvePn: peer.peerJid === peer.peerLid ? resolvePn : undefined,
+      });
+    } catch (error) {
+      this.logger?.debug('contact activity history chat skipped', { error: String(error) });
+      return false;
+    }
+    if (this.buffer.size >= FLUSH_AT_KEYS) {
+      void this.flush();
+    }
+    return true;
   }
 
   /** Writes what is buffered. Resolves when done; never rejects. */
@@ -264,11 +349,11 @@ class ContactActivity {
     await this.flush();
   }
 
-  private merge(entry: Entry): void {
+  private merge(entry: Entry, into: Map<string, Entry> = this.buffer): void {
     const id = `${entry.ownerNumber}|${entry.peerJid}`;
-    const current = this.buffer.get(id);
+    const current = into.get(id);
     if (!current) {
-      this.buffer.set(id, entry);
+      into.set(id, entry);
       return;
     }
     current.firstAt = Math.min(current.firstAt, entry.firstAt);
@@ -276,12 +361,47 @@ class ContactActivity {
     current.fromMe += entry.fromMe;
     current.fromThem += entry.fromThem;
     current.peerLid ??= entry.peerLid;
+    current.resolvePn ??= entry.resolvePn;
+    if (current.source !== entry.source) current.source = 'live';
+  }
+
+  /**
+   * Swaps LID-only peers for their phone jid where the account's LID store knows it, then
+   * re-merges: two entries can become the same person, and one INSERT ... ON CONFLICT may not
+   * touch a row twice. A failed or empty lookup leaves the entry under its LID.
+   */
+  private async resolve(entries: Entry[]): Promise<Entry[]> {
+    const pending = entries.filter((e) => e.resolvePn && isLidUser(e.peerJid));
+    if (!pending.length) {
+      return entries;
+    }
+    await Promise.all(
+      pending.map(async (e) => {
+        try {
+          const pn = await e.resolvePn!(e.peerJid);
+          const jid = pn ? jidNormalizedUser(pn) : '';
+          if (isPnUser(jid) && jid !== `${e.ownerNumber}@s.whatsapp.net`) {
+            e.peerLid = e.peerJid;
+            e.peerJid = jid;
+          }
+        } catch {
+          // The socket may be gone by now; the LID row is still right, just not merged yet.
+        }
+      }),
+    );
+    const merged = new Map<string, Entry>();
+    for (const e of entries) {
+      e.resolvePn = undefined;
+      this.merge(e, merged);
+    }
+    return [...merged.values()];
   }
 
   private async write(): Promise<void> {
     // Taken whole, so record() keeps filling a fresh buffer while this one is on the wire.
-    const entries = [...this.buffer.values()];
+    const taken = [...this.buffer.values()];
     this.buffer = new Map();
+    const entries = await this.resolve(taken);
 
     for (let i = 0; i < entries.length && this.enabled; i += ROWS_PER_STATEMENT) {
       const slice = entries.slice(i, i + ROWS_PER_STATEMENT);
@@ -327,7 +447,7 @@ class ContactActivity {
     }
   }
 
-  private upsert(entries: Entry[]): Promise<number> {
+  private async upsert(entries: Entry[]): Promise<void> {
     // Times go as ISO strings with their Z, so the session's time zone cannot shift them.
     const values = entries.map(
       (e) => Prisma.sql`(
@@ -337,7 +457,7 @@ class ContactActivity {
         ${e.fromMe}::int, ${e.fromThem}::int, ${e.source}, NOW()
       )`,
     );
-    return this.repository!.$executeRaw`
+    await this.repository!.$executeRaw`
       INSERT INTO "ContactActivity" AS c (
         "ownerNumber", "peerJid", "peerLid", "firstAt", "lastAt",
         "fromMeCount", "fromThemCount", "source", "updatedAt"
@@ -352,6 +472,43 @@ class ContactActivity {
         "source" = COALESCE(c."source", EXCLUDED."source"),
         "updatedAt" = NOW()
     `;
+
+    // Fold a row kept under a LID into the phone row that now names the same LID. Only when
+    // this batch linked a LID to a phone, and only for those owners.
+    const linked = entries.filter((e) => e.peerLid && e.peerJid !== e.peerLid);
+    if (!linked.length) {
+      return;
+    }
+    const owners = [...new Set(linked.map((e) => e.ownerNumber))];
+    const lids = [...new Set(linked.map((e) => e.peerLid!))];
+    // The rows above are already written: a failure here must not send them back for a retry
+    // (that would count them twice). The LID row stays; a later link folds it.
+    await this.repository!.$executeRaw`
+      WITH gone AS (
+        DELETE FROM "ContactActivity" l
+        USING "ContactActivity" p
+        WHERE l."ownerNumber" = ANY(${owners}::varchar[])
+          AND l."peerJid" = ANY(${lids}::varchar[])
+          AND p."ownerNumber" = l."ownerNumber"
+          AND p."peerLid" = l."peerJid"
+          AND p."peerJid" <> l."peerJid"
+        RETURNING l."ownerNumber", l."peerJid", l."firstAt", l."lastAt",
+          l."fromMeCount", l."fromThemCount", l."source"
+      )
+      UPDATE "ContactActivity" c SET
+        "firstAt" = LEAST(c."firstAt", g."firstAt"),
+        "lastAt" = GREATEST(c."lastAt", g."lastAt"),
+        "fromMeCount" = c."fromMeCount" + g."fromMeCount",
+        "fromThemCount" = c."fromThemCount" + g."fromThemCount",
+        "updatedAt" = NOW()
+      FROM gone g
+      WHERE c."ownerNumber" = g."ownerNumber" AND c."peerLid" = g."peerJid"
+        AND c."peerJid" <> g."peerJid"
+    `.catch((error) =>
+      this.logger?.warn('contact activity LID merge failed', {
+        error: (error as Error)?.message ?? String(error),
+      }),
+    );
   }
 
   private summarize(): void {

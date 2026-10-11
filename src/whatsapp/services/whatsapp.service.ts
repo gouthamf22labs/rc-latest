@@ -1940,13 +1940,30 @@ export class WAStartupService {
     }
   }
 
+  /** The account's own LID→PN store (contact index: folds a LID-only peer into its phone). */
+  private readonly lidToPn = (lid: string) =>
+    this.client?.signalRepository?.lidMapping?.getPNForLID(lid);
+
   private readonly messageHandle = {
     'messaging-history.set': async ({
       messages,
       chats,
       isLatest,
+      lidPnMappings,
     }: BaileysEventMap['messaging-history.set']) => {
       if (chats && chats.length > 0) {
+        // Everyone this number has a 1:1 chat with, from its past (dates only, no counts).
+        const ownerNumber = ownerNumberOf(this.instance.ownerJid || this.client?.user?.id);
+        const ownLid = this.client?.user?.lid ? jidNormalizedUser(this.client.user.lid) : undefined;
+        const pnForLid = new Map(
+          (lidPnMappings ?? [])
+            .filter((m) => m?.lid && m?.pn)
+            .map((m) => [jidNormalizedUser(m.lid), jidNormalizedUser(m.pn)] as const),
+        );
+        for (const chat of chats) {
+          contactActivity.recordHistoryChat(ownerNumber, chat, ownLid, pnForLid, this.lidToPn);
+        }
+
         const chatsRaw: PrismType.Chat[] = chats.map((chat) => {
           const { id, ...item } = chat as any;
           return {
@@ -2056,6 +2073,7 @@ export class WAStartupService {
           messageType,
           timestamp as number,
           this.client?.user?.lid ? jidNormalizedUser(this.client.user.lid) : undefined,
+          this.lidToPn,
         );
 
         if (typeof received.message[messageType] === 'string') {
