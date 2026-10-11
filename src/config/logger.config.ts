@@ -92,6 +92,10 @@ function getRootLogger(configService: ConfigService): pino.Logger {
           host: log.LOKI_URL,
           batching: true,
           interval: 5,
+          // pino-loki reads `time` as epoch ms, but ours is an ISO string (isoTime, above), which
+          // it turned into "NaN" and Loki rejected every batch. Let it stamp each line itself
+          // (nanoseconds, at most one batch interval after the log call).
+          replaceTimestamp: true,
           labels: { application: log.LOKI_APPLICATION, environment: log.LOKI_ENVIRONMENT },
         },
       });
