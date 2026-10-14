@@ -5629,7 +5629,10 @@ export class WAStartupService {
     const messageType = getContentType(m.message);
     if (!messageType || m.message?.protocolMessage || m.message?.senderKeyDistributionMessage) return null;
     let timestamp: unknown = m.messageTimestamp;
-    if (timestamp && typeof timestamp === 'object' && typeof (timestamp as any).toNumber === 'function') {
+    // A message read back from the stored chat has its time as text ("1780413192").
+    if (typeof timestamp === 'string' && /^\d+$/.test(timestamp)) {
+      timestamp = Number(timestamp);
+    } else if (timestamp && typeof timestamp === 'object' && typeof (timestamp as any).toNumber === 'function') {
       timestamp = (timestamp as any).toNumber();
     } else if (timestamp && typeof timestamp === 'object' && 'low' in (timestamp as any)) {
       timestamp = Number((timestamp as any).low) || 0;
@@ -5647,7 +5650,10 @@ export class WAStartupService {
       keyParticipant: group?.jid,
       keyParticipantLid: group?.lid,
       messageType,
-      content: toJsonValue(m.message[messageType]),
+      // A plain text message is a bare string: wrapped as { text } like messages.upsert does.
+      content: toJsonValue(
+        typeof m.message[messageType] === 'string' ? { text: m.message[messageType] } : m.message[messageType],
+      ),
       messageTimestamp: timestamp as number,
       instanceId: this.instance.id,
       device: getDevice(m.key.id),
