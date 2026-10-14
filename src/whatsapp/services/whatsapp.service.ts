@@ -3998,13 +3998,18 @@ export class WAStartupService {
         // the group uses. See isSelfParticipant.
         const self = participants.find((p) => this.isSelfParticipant(p));
 
+        // WhatsApp's bulk answer sometimes leaves a group's participant list out (seen on large
+        // groups). Not finding ourselves in an empty list says nothing: report membership as
+        // unknown (undefined) then, as annotateGroupRights does for partial events, so the
+        // consumer keeps what it had instead of marking the group left and dropping its roster.
+        const known = participants.length > 0;
         result.push({
           ...g,
           participants,
           // Posting rights, for consumers to combine: canSend = isMember && (!announce || isAdmin).
           // admin is 'admin' | 'superadmin' | null — both admin kinds may post to announce groups.
-          isMember: !!self,
-          isAdmin: !!self?.admin,
+          isMember: known ? !!self : undefined,
+          isAdmin: known ? !!self?.admin : undefined,
         });
 
         sinceYield += participants.length;
