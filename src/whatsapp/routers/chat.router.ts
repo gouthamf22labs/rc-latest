@@ -50,6 +50,7 @@ import {
   readMessageForIdSchema,
   readMessageSchema,
   rejectCallSchema,
+  fetchHistorySchema,
   updatePresenceSchema,
   fetchPresenceSchema,
   watchPresenceSchema,
@@ -69,6 +70,7 @@ import {
   ReadMessageDto,
   ReadMessageIdDto,
   RejectCallDto,
+  FetchHistoryDto,
   UpdatePresenceDto,
   FetchPresenceDto,
   WatchPresenceDto,
@@ -358,6 +360,16 @@ export function ChatRouter(chatController: ChatController, ...guards: RequestHan
         schema: null,
         execute: (instance) =>
           chatController.fetchChats(instance, req.query?.type as string),
+      });
+
+      res.status(HttpStatus.OK).json(response);
+    })
+    // A chat's older messages, asked of the phone (it must be online); waits for its answer.
+    .post(routerPath('fetchHistory'), ...guards, async (req, res) => {
+      const response = await dataValidate<FetchHistoryDto>({
+        request: req,
+        schema: fetchHistorySchema,
+        execute: (instance, data) => chatController.fetchHistory(instance, data),
       });
 
       res.status(HttpStatus.OK).json(response);

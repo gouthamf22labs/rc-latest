@@ -729,6 +729,21 @@ export const rejectCallSchema: JSONSchema7 = {
   required: ['callId', 'callFrom'],
 };
 
+export const fetchHistorySchema: JSONSchema7 = {
+  $id: ulid(),
+  type: 'object',
+  properties: {
+    jid: { type: 'string' },
+    oldestId: { type: 'string' },
+    oldestFromMe: { type: 'boolean' },
+    oldestTimestamp: { type: 'integer', minimum: 1 },
+    count: { type: 'integer', minimum: 1, maximum: 50 },
+    waitMs: { type: 'integer', minimum: 1000, maximum: 25000 },
+  },
+  ...isNotEmpty('jid', 'oldestId'),
+  required: ['jid', 'oldestId', 'oldestFromMe', 'oldestTimestamp'],
+};
+
 export const messageValidateSchema: JSONSchema7 = {
   $id: ulid(),
   type: 'object',

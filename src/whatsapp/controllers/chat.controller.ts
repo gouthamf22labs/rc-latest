@@ -43,6 +43,7 @@ import {
   WhatsAppNumberDto,
   ReadMessageIdDto,
   RejectCallDto,
+  FetchHistoryDto,
   ContactActivityDto,
   EditEvent,
   EditMessage,
@@ -166,6 +167,10 @@ export class ChatController {
 
   public async fetchChats({ instanceName }: InstanceDto, type?: string) {
     return await this.waMonitor.waInstances.get(instanceName).fetchChats(type);
+  }
+
+  public async fetchHistory({ instanceName }: InstanceDto, data: FetchHistoryDto) {
+    return await this.waMonitor.waInstances.get(instanceName).fetchHistory(data);
   }
 
   public async rejectCall({ instanceName }: InstanceDto, data: RejectCallDto) {

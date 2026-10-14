@@ -122,6 +122,20 @@ export class RejectCallDto {
   callFrom: string;
 }
 
+/**
+ * Asks the phone for a chat's messages older than one we have (WhatsApp's on-demand history):
+ * `oldestId`/`oldestFromMe`/`oldestTimestamp` (ms) name that message, `count` how many before it.
+ */
+export class FetchHistoryDto {
+  jid: string;
+  oldestId: string;
+  oldestFromMe: boolean;
+  oldestTimestamp: number;
+  count?: number;
+  /** How long to wait for the phone's answer, in ms (default 20 s, at most 25 s). */
+  waitMs?: number;
+}
+
 export class EditMessage extends MessageId {
   text: string;
 }

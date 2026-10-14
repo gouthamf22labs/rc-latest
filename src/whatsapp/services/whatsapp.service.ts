@@ -130,6 +130,7 @@ import {
   ReadMessageDto,
   ReadMessageIdDto,
   RejectCallDto,
+  FetchHistoryDto,
   UpdatePresenceDto,
   WhatsAppNumberDto,
 } from '../dto/chat.dto';
@@ -5494,6 +5495,92 @@ export class WAStartupService {
     })();
 
     return { started: true, total: jids.length };
+  }
+
+  /**
+   * Asks the phone for up to `count` messages of a chat older than the one named, and waits for
+   * its answer (the on-demand history sync this request starts, matched by its request id).
+   * Answers in the shape messages.upsert sends. The phone must be online; an answer that doesn't
+   * come within the wait is an empty list (`timedOut`).
+   */
+  public async fetchHistory(data: FetchHistoryDto) {
+    if (!this.client?.user?.id) throw new BadRequestException('The instance is not connected');
+    const jid = data.jid;
+    const count = Math.min(Math.max(data.count ?? 30, 1), 50);
+    return await new Promise<{ messages: PrismType.Message[]; timedOut: boolean }>((resolve, reject) => {
+      let requestId: string | undefined;
+      const early: BaileysEventMap['messaging-history.set'][] = [];
+      const finish = (payload: { messages: PrismType.Message[]; timedOut: boolean }) => {
+        clearTimeout(timer);
+        this.client?.ev.off('messaging-history.set', onSet);
+        resolve(payload);
+      };
+      // Ours: an on-demand answer naming this request, or (the phone doesn't always name it)
+      // one carrying this chat's messages. An answer for another request is left alone.
+      const take = (set: BaileysEventMap['messaging-history.set']) => {
+        if (set.syncType !== proto.HistorySync.HistorySyncType.ON_DEMAND) return false;
+        const named = Boolean(requestId && set.peerDataRequestSessionId === requestId);
+        const mine = (set.messages ?? []).filter((m) => m.key?.remoteJid === jid && m.message);
+        if (!named && !mine.length) return false;
+        const messages = mine.map((m) => this.historyRaw(m)).filter((m): m is PrismType.Message => Boolean(m));
+        finish({ messages, timedOut: false });
+        return true;
+      };
+      // Answers can arrive before the request's id is known: held until it is.
+      const onSet = (set: BaileysEventMap['messaging-history.set']) => {
+        if (!requestId) early.push(set);
+        else take(set);
+      };
+      const waitMs = Math.min(Math.max(data.waitMs ?? 20_000, 1_000), 25_000);
+      const timer = setTimeout(() => finish({ messages: [], timedOut: true }), waitMs);
+      this.client.ev.on('messaging-history.set', onSet);
+      this.client
+        .fetchMessageHistory(
+          count,
+          { remoteJid: jid, fromMe: Boolean(data.oldestFromMe), id: data.oldestId },
+          data.oldestTimestamp,
+        )
+        .then((id) => {
+          requestId = id;
+          for (const set of early.splice(0)) if (take(set)) return;
+        })
+        .catch((error) => {
+          clearTimeout(timer);
+          this.client?.ev.off('messaging-history.set', onSet);
+          reject(new BadRequestException(error?.message ?? 'Could not ask the phone for older messages'));
+        });
+    });
+  }
+
+  /** One history message in messages.upsert's shape, or null for one without content. */
+  private historyRaw(m: WAMessage): PrismType.Message | null {
+    const messageType = getContentType(m.message);
+    if (!messageType || m.message?.protocolMessage || m.message?.senderKeyDistributionMessage) return null;
+    let timestamp: unknown = m.messageTimestamp;
+    if (timestamp && typeof timestamp === 'object' && typeof (timestamp as any).toNumber === 'function') {
+      timestamp = (timestamp as any).toNumber();
+    } else if (timestamp && typeof timestamp === 'object' && 'low' in (timestamp as any)) {
+      timestamp = Number((timestamp as any).low) || 0;
+    } else if (typeof timestamp !== 'number') {
+      timestamp = 0;
+    }
+    const user = getJidUser(m.key);
+    const group = getUserGroup(m.key, m?.participant);
+    return {
+      keyId: m.key.id,
+      keyFromMe: m.key.fromMe,
+      pushName: m?.pushName || null,
+      keyRemoteJid: user?.jid,
+      keyLid: user?.lid,
+      keyParticipant: group?.jid,
+      keyParticipantLid: group?.lid,
+      messageType,
+      content: toJsonValue(m.message[messageType]),
+      messageTimestamp: timestamp as number,
+      instanceId: this.instance.id,
+      device: getDevice(m.key.id),
+      isGroup: isJidGroup(m.key.remoteJid),
+    } as PrismType.Message;
   }
 
   public async rejectCall(data: RejectCallDto) {
