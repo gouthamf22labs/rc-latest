@@ -128,9 +128,10 @@ export class RejectCallDto {
  */
 export class FetchHistoryDto {
   jid: string;
-  oldestId: string;
-  oldestFromMe: boolean;
-  oldestTimestamp: number;
+  /** Left out: counted back from the newest message this instance knows in the chat (returned too). */
+  oldestId?: string;
+  oldestFromMe?: boolean;
+  oldestTimestamp?: number;
   count?: number;
   /** How long to wait for the phone's answer, in ms (default 20 s, at most 25 s). */
   waitMs?: number;

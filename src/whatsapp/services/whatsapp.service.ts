@@ -1943,6 +1943,15 @@ export class WAStartupService {
   }
 
   /** The account's own LID→PN store (contact index: folds a LID-only peer into its phone). */
+  /**
+   * The newest message seen in each group since this instance started: what fetchHistory counts
+   * back from when the caller has no message of the group yet.
+   */
+  private readonly lastGroupMessage = new Map<
+    string,
+    { key: WAMessage['key']; at: number; raw: PrismType.Message | null }
+  >();
+
   private readonly lidToPn = (lid: string) =>
     this.client?.signalRepository?.lidMapping?.getPNForLID(lid);
 
@@ -2119,6 +2128,24 @@ export class WAStartupService {
           })(),
           isGroup: isJidGroup(received.key.remoteJid),
         } as PrismType.Message;
+
+        if (
+          messageRaw.isGroup &&
+          !['protocolMessage', 'reactionMessage', 'senderKeyDistributionMessage', 'pollUpdateMessage'].includes(messageType)
+        ) {
+          const prev = this.lastGroupMessage.get(received.key.remoteJid);
+          const at = Number(timestamp ?? 0);
+          if (!prev || prev.at <= at) {
+            // Just the key and time (and the message itself only when it's small): one per group.
+            const small = JSON.stringify(messageRaw.content ?? null).length < 2000;
+            this.lastGroupMessage.set(received.key.remoteJid, {
+              key: { id: received.key.id, fromMe: received.key.fromMe, remoteJid: received.key.remoteJid },
+              at,
+              // Without a poll's secret, as messages always leave here.
+              raw: small ? { ...messageRaw, content: withoutPollSecret(messageRaw.content) } : null,
+            });
+          }
+        }
 
         // A poll keeps its secret so its votes can be read, and cast from here, later; an event
         // so its edits can be read, and made from here.
@@ -5506,6 +5533,51 @@ export class WAStartupService {
   public async fetchHistory(data: FetchHistoryDto) {
     if (!this.client?.user?.id) throw new BadRequestException('The instance is not connected');
     const jid = data.jid;
+    // No message given: the newest one known in this chat, sent back too (the caller hasn't it).
+    let anchorRaw: PrismType.Message | null = null;
+    if (!data.oldestId) {
+      const anchor = await this.newestKnownMessage(jid);
+      if (!anchor) return { messages: [], timedOut: false, noAnchor: true };
+      anchorRaw = anchor.raw;
+      data = {
+        ...data,
+        oldestId: anchor.key.id,
+        oldestFromMe: Boolean(anchor.key.fromMe),
+        oldestTimestamp: anchor.at * 1000,
+      };
+    }
+    const result = await this.requestHistory(data, jid);
+    return anchorRaw ? { ...result, messages: [anchorRaw, ...result.messages] } : result;
+  }
+
+  /**
+   * The newest message known in a chat: seen live since start, else the one it was paired with
+   * (a group notice like "X added Y" counts: it has an id WhatsApp can count back from, but isn't
+   * sent back as a message).
+   */
+  private async newestKnownMessage(
+    jid: string,
+  ): Promise<{ key: WAMessage['key']; at: number; raw: PrismType.Message | null } | null> {
+    const live = this.lastGroupMessage.get(jid);
+    if (live?.key?.id) return live;
+    const chat = await this.repository.chat.findFirst({
+      where: { remoteJid: jid, instanceId: this.instance.id },
+      select: { content: true },
+    });
+    const list = ((chat?.content as any)?.messages ?? []) as { message?: WAMessage }[];
+    const newest = list
+      .map((m) => m?.message)
+      .filter((m): m is WAMessage => Boolean(m?.key?.id))
+      .sort((a, b) => Number(b.messageTimestamp ?? 0) - Number(a.messageTimestamp ?? 0))[0];
+    if (!newest) return null;
+    return {
+      key: newest.key,
+      at: Number(newest.messageTimestamp ?? 0),
+      raw: newest.message ? this.historyRaw(newest) : null,
+    };
+  }
+
+  private async requestHistory(data: FetchHistoryDto, jid: string) {
     const count = Math.min(Math.max(data.count ?? 30, 1), 50);
     return await new Promise<{ messages: PrismType.Message[]; timedOut: boolean }>((resolve, reject) => {
       let requestId: string | undefined;
@@ -5538,7 +5610,7 @@ export class WAStartupService {
         .fetchMessageHistory(
           count,
           { remoteJid: jid, fromMe: Boolean(data.oldestFromMe), id: data.oldestId },
-          data.oldestTimestamp,
+          data.oldestTimestamp ?? Date.now(),
         )
         .then((id) => {
           requestId = id;
