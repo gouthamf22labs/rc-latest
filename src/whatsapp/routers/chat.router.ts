@@ -51,6 +51,8 @@ import {
   readMessageSchema,
   rejectCallSchema,
   fetchHistorySchema,
+  warehouseSchema,
+  chatHistorySchema,
   updatePresenceSchema,
   fetchPresenceSchema,
   watchPresenceSchema,
@@ -71,6 +73,8 @@ import {
   ReadMessageIdDto,
   RejectCallDto,
   FetchHistoryDto,
+  WarehouseDto,
+  ChatHistoryDto,
   UpdatePresenceDto,
   FetchPresenceDto,
   WatchPresenceDto,
@@ -372,6 +376,24 @@ export function ChatRouter(chatController: ChatController, ...guards: RequestHan
         execute: (instance, data) => chatController.fetchHistory(instance, data),
       });
 
+      res.status(HttpStatus.OK).json(response);
+    })
+    // Keeps this number's messages (the CRM's members): { enabled }.
+    .post(routerPath('warehouse'), ...guards, async (req, res) => {
+      const response = await dataValidate<WarehouseDto>({
+        request: req,
+        schema: warehouseSchema,
+        execute: (instance, data) => chatController.setWarehouse(instance, data),
+      });
+      res.status(HttpStatus.OK).json(response);
+    })
+    // A chat's kept messages, newest first: { jid, before?, limit? }.
+    .post(routerPath('history'), ...guards, async (req, res) => {
+      const response = await dataValidate<ChatHistoryDto>({
+        request: req,
+        schema: chatHistorySchema,
+        execute: (instance, data) => chatController.chatHistory(instance, data),
+      });
       res.status(HttpStatus.OK).json(response);
     })
     .post(routerPath('rejectCall'), ...guards, async (req, res) => {

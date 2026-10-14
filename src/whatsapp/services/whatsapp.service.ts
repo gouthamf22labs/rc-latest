@@ -52,6 +52,7 @@ import makeWASocket, {
   generateWAMessageFromContent,
   getBinaryNodeChild,
   getContentType,
+  getAggregateVotesInPollMessage,
   getDevice,
   GroupMetadata,
   GroupParticipant,
@@ -293,6 +294,12 @@ const groupFetchLimiter = new Semaphore(
  * {low, high, unsigned}, a Buffer {type, data}), which is also exactly what the webhooks already
  * put on the wire when they serialise the same objects.
  */
+/** An on-demand history anchor's time in seconds, whether given in seconds or milliseconds. */
+const historySeconds = (t?: number) => {
+  const v = t ?? Date.now();
+  return v > 1e12 ? Math.floor(v / 1000) : v;
+};
+
 const toJsonValue = (value: unknown): PrismType.Prisma.JsonValue =>
   value === undefined ? null : JSON.parse(JSON.stringify(value));
 
@@ -1891,6 +1898,79 @@ export class WAStartupService {
     },
   };
 
+  // ── Message warehouse ────────────────────────────────────────────────────────
+  // A number flagged for it (externalAttributes.warehouse, set by the CRM for its members) keeps
+  // every message here: live, sent, history, and their updates, each once. NEW_MESSAGE still keeps
+  // every number's, as before.
+
+  private warehouseOn = false;
+  private warehouseReadAt = 0;
+
+  /** Whether this number's messages are kept (re-read from its record at most once a minute). */
+  private async keepsMessages(): Promise<boolean> {
+    if (this.databaseOptions.DB_OPTIONS.NEW_MESSAGE) return true;
+    if (Date.now() - this.warehouseReadAt > 60_000 && this.instance?.id) {
+      this.warehouseReadAt = Date.now();
+      const row = await this.repository.instance
+        .findUnique({ where: { id: this.instance.id }, select: { externalAttributes: true } })
+        .catch(() => null);
+      this.warehouseOn = Boolean((row?.externalAttributes as Record<string, unknown> | null)?.warehouse);
+    }
+    return this.warehouseOn;
+  }
+
+  /** Turns keeping this number's messages on or off (the CRM's members). */
+  public async setWarehouse(enabled: boolean) {
+    const row = await this.repository.instance.findUnique({
+      where: { id: this.instance.id },
+      select: { externalAttributes: true },
+    });
+    const attrs = { ...((row?.externalAttributes as Record<string, unknown>) ?? {}), warehouse: enabled };
+    await this.repository.instance.update({ where: { id: this.instance.id }, data: { externalAttributes: attrs } });
+    this.warehouseOn = enabled;
+    this.warehouseReadAt = Date.now();
+    return { warehouse: enabled };
+  }
+
+  /** Stores one message once; a copy already there is that row. Never throws. */
+  private async saveMessage(data: PrismType.Message): Promise<number | undefined> {
+    try {
+      const { id } = await this.repository.message.create({ data });
+      return id;
+    } catch (error) {
+      if ((error as { code?: string })?.code === 'P2002') {
+        const found = await this.repository.message
+          .findFirst({ where: { instanceId: this.instance.id, keyId: data.keyId }, select: { id: true } })
+          .catch(() => null);
+        return found?.id;
+      }
+      this.logger.warn(`Keeping a message failed: ${(error as Error)?.message}`);
+      return undefined;
+    }
+  }
+
+  /**
+   * A chat's kept messages, newest first, older than `before` (unix seconds) when given: what the
+   * CRM shows of a chat or group it just added, without asking the phone. In messages.upsert's
+   * shape (a poll's secret left out).
+   */
+  public async chatHistory(data: { jid: string; before?: number; limit?: number }) {
+    const limit = Math.min(Math.max(data.limit ?? 100, 1), 500);
+    const rows = await this.repository.message.findMany({
+      where: {
+        instanceId: this.instance.id,
+        keyRemoteJid: data.jid,
+        ...(data.before ? { messageTimestamp: { lt: data.before } } : {}),
+      },
+      orderBy: { messageTimestamp: 'desc' },
+      take: limit,
+    });
+    return {
+      messages: rows.map((r) => ({ ...r, content: withoutPollSecret(r.content) })),
+      kept: await this.keepsMessages(),
+    };
+  }
+
   private async syncMessage(messages: PrismType.Message[]) {
     if (messages.length === 0) return;
 
@@ -1902,7 +1982,8 @@ export class WAStartupService {
     const existingSet = new Set(existing.map((m) => m.keyId));
     const toCreate = messages.filter((m) => !existingSet.has(m.keyId));
     if (toCreate.length > 0) {
-      await this.repository.message.createMany({ data: toCreate });
+      // Another copy can land between the check and the write: skipped, not failed.
+      await this.repository.message.createMany({ data: toCreate, skipDuplicates: true });
     }
   }
 
@@ -2053,15 +2134,20 @@ export class WAStartupService {
             keyParticipant: group?.jid,
             keyParticipantLid: group?.lid,
             messageType,
-            content: toJsonValue(m.message[messageType]),
+            content: this.historyContent(m, messageType),
             messageTimestamp: timestamp,
             instanceId: this.instance.id,
             device: getDevice(m.key.id),
           } as PrismType.Message);
         }
-        this.sendDataWebhook('messagesSet', messagesRaw).catch(() => null);
-        if (this.databaseOptions.DB_OPTIONS.SYNC_MESSAGES) {
-          await this.syncMessage(messagesRaw);
+        this.sendDataWebhook(
+          'messagesSet',
+          messagesRaw.map((r) => ({ ...r, content: withoutPollSecret(r.content) })),
+        ).catch(() => null);
+        if (this.databaseOptions.DB_OPTIONS.SYNC_MESSAGES || (await this.keepsMessages())) {
+          await this.syncMessage(messagesRaw).catch((error) =>
+            this.logger.warn(`Keeping history failed: ${(error as Error)?.message}`),
+          );
         }
         messages = undefined as any;
         messagesRaw.length = 0;
@@ -2222,9 +2308,9 @@ export class WAStartupService {
           }
         }
 
-        if (this.databaseOptions.DB_OPTIONS.NEW_MESSAGE) {
-          const { id } = await this.repository.message.create({ data: messageRaw });
-          messageRaw.id = id;
+        if (await this.keepsMessages()) {
+          const id = await this.saveMessage(messageRaw);
+          if (id) messageRaw.id = id;
         }
         messageRaw.content = withoutPollSecret(messageRaw.content);
 
@@ -2329,7 +2415,7 @@ export class WAStartupService {
           this.ws.send(this.instance.name, 'messages.update', message);
 
           await this.sendDataWebhook('messagesUpdated', message);
-          if (this.databaseOptions.DB_OPTIONS.MESSAGE_UPDATE) {
+          if (this.databaseOptions.DB_OPTIONS.MESSAGE_UPDATE || (await this.keepsMessages())) {
             this.repository.message
               .findFirst({
                 where: {
@@ -3278,11 +3364,9 @@ export class WAStartupService {
           isGroup: isJidGroup(m.key.remoteJid),
         };
       })();
-      if (this.databaseOptions.DB_OPTIONS.NEW_MESSAGE) {
-        const { id } = await this.repository.message.create({
-          data: messageSent as PrismType.Message,
-        });
-        messageSent.id = id;
+      if (await this.keepsMessages()) {
+        const id = await this.saveMessage(messageSent as PrismType.Message);
+        if (id) messageSent.id = id;
       }
       messageSent.content = withoutPollSecret(messageSent.content);
 
@@ -4568,11 +4652,9 @@ export class WAStartupService {
         device: 'web',
         isGroup: !!stored.isGroup,
       } as Partial<PrismType.Message>;
-      if (this.databaseOptions.DB_OPTIONS.NEW_MESSAGE) {
-        const { id } = await this.repository.message.create({
-          data: messageSent as PrismType.Message,
-        });
-        messageSent.id = id;
+      if (await this.keepsMessages()) {
+        const id = await this.saveMessage(messageSent as PrismType.Message);
+        if (id) messageSent.id = id;
       }
       this.ws.send(this.instance.name, 'messages.upsert', messageSent);
       this.sendDataWebhook('messagesUpsert', messageSent).catch((error) =>
@@ -4770,11 +4852,9 @@ export class WAStartupService {
         device: 'web',
         isGroup: !!poll.isGroup,
       } as Partial<PrismType.Message>;
-      if (this.databaseOptions.DB_OPTIONS.NEW_MESSAGE) {
-        const { id } = await this.repository.message.create({
-          data: messageSent as PrismType.Message,
-        });
-        messageSent.id = id;
+      if (await this.keepsMessages()) {
+        const id = await this.saveMessage(messageSent as PrismType.Message);
+        if (id) messageSent.id = id;
       }
       this.ws.send(this.instance.name, 'messages.upsert', messageSent);
       this.sendDataWebhook('messagesUpsert', messageSent).catch((error) =>
@@ -5674,7 +5754,12 @@ export class WAStartupService {
             messages.push(raw);
           }
           await this.namesFromContacts(messages);
-          finish({ messages, timedOut: false });
+          // Kept like any other history (with poll secrets); sent on without them.
+          if (await this.keepsMessages()) await this.syncMessage(messages).catch(() => undefined);
+          finish({
+            messages: messages.map((r) => ({ ...r, content: withoutPollSecret(r.content) })),
+            timedOut: false,
+          });
         })();
         return true;
       };
@@ -5690,7 +5775,8 @@ export class WAStartupService {
         .fetchMessageHistory(
           count,
           { remoteJid: jid, fromMe: Boolean(data.oldestFromMe), id: data.oldestId },
-          data.oldestTimestamp ?? Date.now(),
+          // WhatsApp reads this field (named "…TimestampMs") as seconds, as whatsmeow sends it.
+          historySeconds(data.oldestTimestamp),
         )
         .then((id) => {
           requestId = id;
@@ -5751,6 +5837,32 @@ export class WAStartupService {
     for (const m of unnamed) m.pushName = nameOf.get(m.keyParticipant as string) ?? null;
   }
 
+  /**
+   * A history message's content as messages.upsert keeps it: plain text as { text }, and for a
+   * poll its secret (so votes cast later can be read) and the votes WhatsApp sent with it
+   * (`votesAggregate`: each option with who chose it).
+   */
+  private historyContent(m: WAMessage, messageType: string): PrismType.Prisma.JsonValue {
+    const inner = m.message?.[messageType];
+    const content: Record<string, unknown> =
+      typeof inner === 'string' ? { text: inner } : { ...((toJsonValue(inner) as Record<string, unknown>) ?? {}) };
+    if (isPollType(messageType)) {
+      const secret = pollSecretOf(m.message);
+      if (secret) content[POLL_SECRET_KEY] = secret;
+      if (m.pollUpdates?.length) {
+        try {
+          content.votesAggregate = getAggregateVotesInPollMessage(
+            { message: m.message, pollUpdates: m.pollUpdates },
+            this.ownVoteJids().pn ?? undefined,
+          ).map((v) => ({ name: v.name, voters: v.voters }));
+        } catch {
+          // Votes that can't be counted are left to the phone.
+        }
+      }
+    }
+    return toJsonValue(content);
+  }
+
   /** One history message in messages.upsert's shape, or null for one without content. */
   private historyRaw(m: WAMessage): PrismType.Message | null {
     const messageType = getContentType(m.message);
@@ -5777,10 +5889,7 @@ export class WAStartupService {
       keyParticipant: group?.jid,
       keyParticipantLid: group?.lid,
       messageType,
-      // A plain text message is a bare string: wrapped as { text } like messages.upsert does.
-      content: toJsonValue(
-        typeof m.message[messageType] === 'string' ? { text: m.message[messageType] } : m.message[messageType],
-      ),
+      content: this.historyContent(m, messageType),
       messageTimestamp: timestamp as number,
       instanceId: this.instance.id,
       device: getDevice(m.key.id),

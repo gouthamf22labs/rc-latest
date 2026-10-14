@@ -126,6 +126,18 @@ export class RejectCallDto {
  * Asks the phone for a chat's messages older than one we have (WhatsApp's on-demand history):
  * `oldestId`/`oldestFromMe`/`oldestTimestamp` (ms) name that message, `count` how many before it.
  */
+/** Keeps (or stops keeping) this number's messages: the CRM's members. */
+export class WarehouseDto {
+  enabled: boolean;
+}
+
+/** A chat's kept messages, newest first, older than `before` (unix seconds) when given. */
+export class ChatHistoryDto {
+  jid: string;
+  before?: number;
+  limit?: number;
+}
+
 export class FetchHistoryDto {
   jid: string;
   /** Left out: counted back from the newest message this instance knows in the chat (returned too). */

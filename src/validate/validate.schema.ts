@@ -729,6 +729,25 @@ export const rejectCallSchema: JSONSchema7 = {
   required: ['callId', 'callFrom'],
 };
 
+export const warehouseSchema: JSONSchema7 = {
+  $id: ulid(),
+  type: 'object',
+  properties: { enabled: { type: 'boolean' } },
+  required: ['enabled'],
+};
+
+export const chatHistorySchema: JSONSchema7 = {
+  $id: ulid(),
+  type: 'object',
+  properties: {
+    jid: { type: 'string' },
+    before: { type: 'integer', minimum: 1 },
+    limit: { type: 'integer', minimum: 1, maximum: 500 },
+  },
+  ...isNotEmpty('jid'),
+  required: ['jid'],
+};
+
 export const fetchHistorySchema: JSONSchema7 = {
   $id: ulid(),
   type: 'object',

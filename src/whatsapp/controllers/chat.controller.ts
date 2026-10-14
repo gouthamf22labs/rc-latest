@@ -44,6 +44,8 @@ import {
   ReadMessageIdDto,
   RejectCallDto,
   FetchHistoryDto,
+  WarehouseDto,
+  ChatHistoryDto,
   ContactActivityDto,
   EditEvent,
   EditMessage,
@@ -167,6 +169,14 @@ export class ChatController {
 
   public async fetchChats({ instanceName }: InstanceDto, type?: string) {
     return await this.waMonitor.waInstances.get(instanceName).fetchChats(type);
+  }
+
+  public async setWarehouse({ instanceName }: InstanceDto, data: WarehouseDto) {
+    return await this.waMonitor.waInstances.get(instanceName).setWarehouse(data.enabled);
+  }
+
+  public async chatHistory({ instanceName }: InstanceDto, data: ChatHistoryDto) {
+    return await this.waMonitor.waInstances.get(instanceName).chatHistory(data);
   }
 
   public async fetchHistory({ instanceName }: InstanceDto, data: FetchHistoryDto) {

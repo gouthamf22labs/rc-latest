@@ -106,9 +106,11 @@ model Message {
   MessageUpdate     MessageUpdate[]
   Media             Media?
 
+  @@unique([instanceId, keyId])
   @@index([keyId], name: "keyId")
   @@index([instanceId, keyId])
   @@index([instanceId], map: "idx_message_instanceid")
+  @@index([instanceId, keyRemoteJid, messageTimestamp(sort: Desc)])
 }
 
 model Media {
