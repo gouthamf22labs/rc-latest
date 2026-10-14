@@ -5673,6 +5673,7 @@ export class WAStartupService {
             await this.withSender(raw, m, names, pnOf);
             messages.push(raw);
           }
+          await this.namesFromContacts(messages);
           finish({ messages, timedOut: false });
         })();
         return true;
@@ -5728,6 +5729,26 @@ export class WAStartupService {
     }
     if (pn) raw.keyParticipant = pn;
     if (!raw.pushName) raw.pushName = names.get(id) || (pn ? names.get(pn) : undefined) || null;
+  }
+
+  /**
+   * Senders the answer didn't name: the name this number's contacts have for them (people it has
+   * talked to or saved), in one read.
+   */
+  private async namesFromContacts(messages: PrismType.Message[]): Promise<void> {
+    const unnamed = messages.filter((m) => !m.pushName && m.keyParticipant?.endsWith('@s.whatsapp.net'));
+    if (!unnamed.length) return;
+    const jids = [...new Set(unnamed.map((m) => m.keyParticipant as string))];
+    const contacts = await this.repository.contact
+      .findMany({ where: { instanceId: this.instance.id, remoteJid: { in: jids } }, select: { remoteJid: true, pushName: true } })
+      .catch(() => []);
+    const nameOf = new Map(
+      contacts
+        // A contact without a name has its id standing in for one.
+        .filter((c) => c.pushName && c.pushName !== c.remoteJid && !/^\+?\d+$/.test(c.pushName))
+        .map((c) => [c.remoteJid, c.pushName as string]),
+    );
+    for (const m of unnamed) m.pushName = nameOf.get(m.keyParticipant as string) ?? null;
   }
 
   /** One history message in messages.upsert's shape, or null for one without content. */
