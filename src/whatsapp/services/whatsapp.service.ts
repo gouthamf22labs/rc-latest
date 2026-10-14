@@ -1951,6 +1951,45 @@ export class WAStartupService {
     string,
     { key: WAMessage['key']; at: number; raw: PrismType.Message | null }
   >();
+  /** Groups whose newest message changed since it was last saved (flushed once a minute). */
+  private readonly lastGroupDirty = new Set<string>();
+  private lastGroupFlushTimer: NodeJS.Timeout | undefined;
+
+  /**
+   * Saves each changed group's newest message on its chat row (content.slLastMessage), so it
+   * outlives a restart: what fetchHistory counts back from when nothing newer is known. One small
+   * upsert per active group a minute.
+   */
+  private scheduleLastGroupFlush() {
+    // One timer while there's something to save; none otherwise (nothing kept alive for a
+    // number that's gone).
+    if (this.lastGroupFlushTimer) return;
+    this.lastGroupFlushTimer = setTimeout(() => {
+      this.lastGroupFlushTimer = undefined;
+      void this.flushLastGroupMessages();
+    }, 60_000);
+    this.lastGroupFlushTimer.unref?.();
+  }
+
+  private async flushLastGroupMessages() {
+    if (!this.lastGroupDirty.size || !this.instance?.id) return;
+    const jids = [...this.lastGroupDirty];
+    this.lastGroupDirty.clear();
+    for (const jid of jids) {
+      const entry = this.lastGroupMessage.get(jid);
+      if (!entry) continue;
+      const value = JSON.stringify(entry);
+      try {
+        await this.repository.$executeRaw`
+          INSERT INTO "Chat" ("remoteJid", "instanceId", "content", "updatedAt")
+          VALUES (${jid}, ${this.instance.id}, jsonb_build_object('slLastMessage', ${value}::jsonb), now())
+          ON CONFLICT ("instanceId", "remoteJid") DO UPDATE
+          SET "content" = jsonb_set(coalesce("Chat"."content", '{}'::jsonb), '{slLastMessage}', ${value}::jsonb)`;
+      } catch (error) {
+        this.logger.warn(`Saving a group's newest message failed: ${(error as Error)?.message}`);
+      }
+    }
+  }
 
   private readonly lidToPn = (lid: string) =>
     this.client?.signalRepository?.lidMapping?.getPNForLID(lid);
@@ -2144,6 +2183,8 @@ export class WAStartupService {
               // Without a poll's secret, as messages always leave here.
               raw: small ? { ...messageRaw, content: withoutPollSecret(messageRaw.content) } : null,
             });
+            this.lastGroupDirty.add(received.key.remoteJid);
+            this.scheduleLastGroupFlush();
           }
         }
 
@@ -5564,18 +5605,28 @@ export class WAStartupService {
       where: { remoteJid: jid, instanceId: this.instance.id },
       select: { content: true },
     });
-    const list = ((chat?.content as any)?.messages ?? []) as { message?: WAMessage }[];
-    const newest = list
-      .map((m) => m?.message)
-      .filter((m): m is WAMessage => Boolean(m?.key?.id))
-      .sort((a, b) => Number(b.messageTimestamp ?? 0) - Number(a.messageTimestamp ?? 0))[0];
-    if (!newest) return null;
-    return {
-      key: newest.key,
-      at: Number(newest.messageTimestamp ?? 0),
-      raw: newest.message ? this.historyRaw(newest) : null,
+    const content = (chat?.content ?? {}) as {
+      slLastMessage?: { key?: WAMessage['key']; at?: number; raw?: PrismType.Message | null };
+      messages?: { message?: WAMessage }[];
     };
+    const candidates: { key: WAMessage['key']; at: number; raw: PrismType.Message | null }[] = [];
+    // The newest seen live before a restart, saved on the chat row.
+    const saved = content.slLastMessage;
+    if (saved?.key?.id) candidates.push({ key: saved.key, at: Number(saved.at ?? 0), raw: saved.raw ?? null });
+    // The one it was paired with.
+    for (const m of content.messages ?? []) {
+      const msg = m?.message;
+      if (!msg?.key?.id) continue;
+      candidates.push({
+        key: msg.key,
+        at: Number(msg.messageTimestamp ?? 0),
+        raw: msg.message ? this.historyRaw(msg) : null,
+      });
+    }
+    candidates.sort((a, b) => b.at - a.at);
+    return candidates[0] ?? null;
   }
+
 
   private async requestHistory(data: FetchHistoryDto, jid: string) {
     const count = Math.min(Math.max(data.count ?? 30, 1), 50);
@@ -5594,8 +5645,28 @@ export class WAStartupService {
         const named = Boolean(requestId && set.peerDataRequestSessionId === requestId);
         const mine = (set.messages ?? []).filter((m) => m.key?.remoteJid === jid && m.message);
         if (!named && !mine.length) return false;
-        const messages = mine.map((m) => this.historyRaw(m)).filter((m): m is PrismType.Message => Boolean(m));
-        finish({ messages, timedOut: false });
+        // Who sent each: the answer carries members' names and their numbers for private ids.
+        const names = new Map<string, string>();
+        for (const ct of (set.contacts ?? []) as any[]) {
+          const name = ct?.notify || ct?.name || ct?.verifiedName;
+          if (!name) continue;
+          for (const id of [ct.id, ct.lid, ct.phoneNumber]) if (id) names.set(jidNormalizedUser(id), name);
+        }
+        const pnOf = new Map(
+          (set.lidPnMappings ?? [])
+            .filter((m) => m?.lid && m?.pn)
+            .map((m) => [jidNormalizedUser(m.lid), jidNormalizedUser(m.pn)] as const),
+        );
+        void (async () => {
+          const messages: PrismType.Message[] = [];
+          for (const m of mine) {
+            const raw = this.historyRaw(m);
+            if (!raw) continue;
+            await this.withSender(raw, m, names, pnOf);
+            messages.push(raw);
+          }
+          finish({ messages, timedOut: false });
+        })();
         return true;
       };
       // Answers can arrive before the request's id is known: held until it is.
@@ -5622,6 +5693,33 @@ export class WAStartupService {
           reject(new BadRequestException(error?.message ?? 'Could not ask the phone for older messages'));
         });
     });
+  }
+
+  /**
+   * A history message's sender as messages.upsert names them: their number (from a private id,
+   * through the answer's own mapping or this instance's) and the name they go by.
+   */
+  private async withSender(
+    raw: PrismType.Message,
+    m: WAMessage,
+    names: Map<string, string>,
+    pnOf: Map<string, string>,
+  ): Promise<void> {
+    if (m.key.fromMe) return;
+    const participant = m.key.participant || m.participant || raw.keyParticipant || '';
+    if (!participant) return;
+    const id = jidNormalizedUser(participant);
+    let pn = id.endsWith('@s.whatsapp.net') ? id : null;
+    if (!pn && id.endsWith('@lid')) {
+      pn = pnOf.get(id) ?? null;
+      if (!pn) {
+        const found = await Promise.resolve(this.lidToPn(id)).catch(() => null);
+        pn = found ? jidNormalizedUser(found) : null;
+      }
+      raw.keyParticipantLid = id;
+    }
+    if (pn) raw.keyParticipant = pn;
+    if (!raw.pushName) raw.pushName = names.get(id) || (pn ? names.get(pn) : undefined) || null;
   }
 
   /** One history message in messages.upsert's shape, or null for one without content. */
