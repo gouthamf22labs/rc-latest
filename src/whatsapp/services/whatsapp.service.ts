@@ -5587,6 +5587,14 @@ export class WAStartupService {
         oldestTimestamp: anchor.at * 1000,
       };
     }
+    // The message counted back from names its sender like the rest (a private id → their number).
+    if (anchorRaw && !anchorRaw.keyFromMe) {
+      const sender = anchorRaw.keyParticipantLid || anchorRaw.keyParticipant || '';
+      if (sender.endsWith('@lid') && !anchorRaw.keyParticipant?.endsWith('@s.whatsapp.net')) {
+        const pn = await Promise.resolve(this.lidToPn(jidNormalizedUser(sender))).catch(() => null);
+        anchorRaw = { ...anchorRaw, keyParticipantLid: jidNormalizedUser(sender), ...(pn ? { keyParticipant: jidNormalizedUser(pn) } : {}) };
+      }
+    }
     const result = await this.requestHistory(data, jid);
     return anchorRaw ? { ...result, messages: [anchorRaw, ...result.messages] } : result;
   }
