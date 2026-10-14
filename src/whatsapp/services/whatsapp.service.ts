@@ -5751,6 +5751,7 @@ export class WAStartupService {
             const raw = this.historyRaw(m);
             if (!raw) continue;
             await this.withSender(raw, m, names, pnOf);
+            await this.withVoterNumbers(raw, pnOf);
             messages.push(raw);
           }
           await this.namesFromContacts(messages);
@@ -5861,6 +5862,32 @@ export class WAStartupService {
       }
     }
     return toJsonValue(content);
+  }
+
+  /**
+   * A history poll's voters as their numbers where known (votes come keyed by private id): the
+   * answer's own mapping, else this instance's.
+   */
+  private async withVoterNumbers(raw: PrismType.Message, pnOf: Map<string, string>): Promise<void> {
+    const content = raw.content as { votesAggregate?: { name?: string; voters?: string[] }[] } | null;
+    if (!content?.votesAggregate?.length) return;
+    for (const option of content.votesAggregate) {
+      const voters: string[] = [];
+      for (const v of option.voters ?? []) {
+        const id = jidNormalizedUser(v);
+        if (!id.endsWith('@lid')) {
+          voters.push(id);
+          continue;
+        }
+        let pn = pnOf.get(id) ?? null;
+        if (!pn) {
+          const found = await Promise.resolve(this.lidToPn(id)).catch(() => null);
+          pn = found ? jidNormalizedUser(found) : null;
+        }
+        voters.push(pn ?? id);
+      }
+      option.voters = voters;
+    }
   }
 
   /** One history message in messages.upsert's shape, or null for one without content. */
