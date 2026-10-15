@@ -100,6 +100,10 @@ export class ChatController {
     return await this.waMonitor.waInstances.get(instanceName).profilePicture(data.number);
   }
 
+  public async fetchProfile({ instanceName }: InstanceDto, data: NumberDto) {
+    return await this.waMonitor.waInstances.get(instanceName).profile(data.number);
+  }
+
   public async fetchContacts({ instanceName }: InstanceDto, query: Query<Contact>) {
     return await this.waMonitor.waInstances.get(instanceName).fetchContacts(query);
   }
@@ -135,7 +139,9 @@ export class ChatController {
       throw new BadRequestException('Media type not provided');
     }
 
-    if (!TypeMediaMessage().includes(mediaType + 'Message')) {
+    // A shared link's preview picture is encrypted with its own key ("thumbnail-link"), not a
+    // message media type.
+    if (mediaType !== 'thumbnail-link' && !TypeMediaMessage().includes(mediaType + 'Message')) {
       throw new BadRequestException('Media type not supported');
     }
 

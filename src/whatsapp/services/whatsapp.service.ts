@@ -498,6 +498,25 @@ const HEIC_UNSUPPORTED_MESSAGE =
   'Unsupported image format: HEIC/HEIF. WhatsApp cannot render it and this server cannot ' +
   'decode it (sharp ships an AVIF-only libheif). Convert the image to JPEG before sending';
 
+/** Group notices kept as messages (see withGroupNotice); the rest (call logs, security codes…) aren't. */
+const GROUP_NOTICES = new Set([
+  'GROUP_CREATE',
+  'GROUP_CHANGE_SUBJECT',
+  'GROUP_CHANGE_DESCRIPTION',
+  'GROUP_CHANGE_ICON',
+  'GROUP_CHANGE_ANNOUNCE',
+  'GROUP_CHANGE_RESTRICT',
+  'GROUP_PARTICIPANT_ADD',
+  'GROUP_PARTICIPANT_REMOVE',
+  'GROUP_PARTICIPANT_LEAVE',
+  'GROUP_PARTICIPANT_PROMOTE',
+  'GROUP_PARTICIPANT_DEMOTE',
+  'GROUP_PARTICIPANT_INVITE',
+  'GROUP_PARTICIPANT_ACCEPT',
+  'GROUP_PARTICIPANT_ADD_REQUEST_JOIN',
+  'GROUP_PARTICIPANT_CHANGE_NUMBER',
+]);
+
 export class WAStartupService {
   constructor(
     private readonly configService: ConfigService,
@@ -1977,13 +1996,35 @@ export class WAStartupService {
     const keyIds = messages.map((m) => m.keyId);
     const existing = await this.repository.message.findMany({
       where: { instanceId: this.instance.id, keyId: { in: keyIds } },
-      select: { keyId: true },
+      select: { id: true, keyId: true },
     });
     const existingSet = new Set(existing.map((m) => m.keyId));
     const toCreate = messages.filter((m) => !existingSet.has(m.keyId));
     if (toCreate.length > 0) {
       // Another copy can land between the check and the write: skipped, not failed.
       await this.repository.message.createMany({ data: toCreate, skipDuplicates: true });
+    }
+    // One kept already, fetched again with its reactions as they are now: those brought up to date
+    // (only those rows are read in full).
+    const withReactions = new Set(
+      messages
+        .filter((m) => existingSet.has(m.keyId) && (m.content as { historyReactions?: unknown } | null)?.historyReactions)
+        .map((m) => m.keyId),
+    );
+    if (!withReactions.size) return;
+    const rows = await this.repository.message.findMany({
+      where: { instanceId: this.instance.id, keyId: { in: [...withReactions] } },
+      select: { id: true, keyId: true, content: true },
+    });
+    const stored = new Map(rows.map((m) => [m.keyId, m]));
+    for (const m of messages) {
+      const reactions = (m.content as { historyReactions?: unknown } | null)?.historyReactions;
+      const row = stored.get(m.keyId);
+      if (!reactions || !row || !row.content || typeof row.content !== 'object' || Array.isArray(row.content)) continue;
+      if (JSON.stringify((row.content as { historyReactions?: unknown }).historyReactions) === JSON.stringify(reactions)) continue;
+      await this.repository.message
+        .update({ where: { id: row.id }, data: { content: toJsonValue({ ...row.content, historyReactions: reactions }) } })
+        .catch(() => undefined);
     }
   }
 
@@ -2111,7 +2152,14 @@ export class WAStartupService {
       // Process messages if SYNC_MESSAGES enabled
       if (messages && messages.length > 0) {
         const messagesRaw: PrismType.Message[] = [];
+        // Members known by private id: their numbers, from this same batch where it says.
+        const pnOf = new Map(
+          (lidPnMappings ?? [])
+            .filter((m) => m?.lid && m?.pn)
+            .map((m) => [jidNormalizedUser(m.lid), jidNormalizedUser(m.pn)] as const),
+        );
         for (const [, m] of Object.entries(messages)) {
+          await this.withGroupNotice(m, pnOf);
           if (m.message?.protocolMessage || m.message?.senderKeyDistributionMessage || !m.message) continue;
           let timestamp = m?.messageTimestamp;
           if (timestamp && typeof timestamp === 'object' && typeof (timestamp as any).toNumber === 'function') {
@@ -2140,6 +2188,8 @@ export class WAStartupService {
             device: getDevice(m.key.id),
           } as PrismType.Message);
         }
+        // Voters and reactors known by private id: their numbers, as live ones carry.
+        for (const raw of messagesRaw) await this.withVoterNumbers(raw, pnOf);
         this.sendDataWebhook(
           'messagesSet',
           messagesRaw.map((r) => ({ ...r, content: withoutPollSecret(r.content) })),
@@ -2162,6 +2212,7 @@ export class WAStartupService {
       type: MessageUpsertType;
     }) => {
       for (const received of messages) {
+        await this.withGroupNotice(received);
         if (!received?.message) {
           await this.client.waitForMessage(received.key.id);
           continue;
@@ -2256,7 +2307,7 @@ export class WAStartupService {
 
         if (
           messageRaw.isGroup &&
-          !['protocolMessage', 'reactionMessage', 'senderKeyDistributionMessage', 'pollUpdateMessage'].includes(messageType)
+          !['protocolMessage', 'reactionMessage', 'senderKeyDistributionMessage', 'pollUpdateMessage', 'groupNoticeMessage'].includes(messageType)
         ) {
           const prev = this.lastGroupMessage.get(received.key.remoteJid);
           const at = Number(timestamp ?? 0);
@@ -2387,6 +2438,36 @@ export class WAStartupService {
         await this.sendDataWebhook('messagesUpsert', messageRaw);
 
         this.logger.trace(`type[${type}] - received`, messageRaw);
+      }
+    },
+
+    /**
+     * In a group, WhatsApp says who each of our messages reached and who read it, person by person
+     * (a chat's ticks come as messages.update instead). Sent on as messages.update with `receiptOf`:
+     * that person, by number where known.
+     */
+    'message-receipt.update': async (
+      updates: { key: WAMessage['key']; receipt: { userJid?: string; readTimestamp?: unknown; receiptTimestamp?: unknown } }[],
+    ) => {
+      for (const { key, receipt } of updates ?? []) {
+        if (!key?.id || !isJidGroup(key.remoteJid) || !receipt?.userJid) continue;
+        // Our own other devices reading it: not someone in the group.
+        if (this.isSelfParticipant({ id: receipt.userJid })) continue;
+        let who = jidNormalizedUser(receipt.userJid);
+        if (who.endsWith('@lid')) {
+          const pn = await Promise.resolve(this.lidToPn(who)).catch(() => null);
+          if (pn) who = jidNormalizedUser(pn);
+        }
+        const read = Number(receipt.readTimestamp ?? 0);
+        const at = read || Number(receipt.receiptTimestamp ?? 0) || Math.floor(Date.now() / 1000);
+        await this.sendDataWebhook('messagesUpdated', {
+          ...key,
+          receiptOf: who,
+          status: read ? 'READ' : 'DELIVERY_ACK',
+          at,
+          dateTime: new Date(),
+          instanceId: this.instance.id,
+        });
       }
     },
 
@@ -2578,6 +2659,11 @@ export class WAStartupService {
           this.messageHandle['messages.update'](payload);
         }
 
+        if (events?.['message-receipt.update']) {
+          const payload = events['message-receipt.update'];
+          this.messageHandle['message-receipt.update'](payload as any);
+        }
+
         if (events?.['presence.update']) {
           const payload = events['presence.update'];
           // Feed the cache/watches first: an online-trigger send must not wait on
@@ -2740,6 +2826,38 @@ export class WAStartupService {
         profilePictureUrl: null,
       };
     }
+  }
+
+  /**
+   * Someone's WhatsApp profile as their contact info shows it: their About, and for a business
+   * account its category, description, website, email and address. Each part null when hidden.
+   */
+  public async profile(number: string) {
+    const jid = this.createJid(number);
+    const status = await this.client
+      .fetchStatus(jid)
+      .then((r: any) => {
+        const s = Array.isArray(r) ? r[0]?.status : r;
+        const at = s?.setAt ? new Date(s.setAt) : null;
+        // A hidden About comes back empty and dated 1970.
+        return { about: typeof s?.status === 'string' && s.status.trim() ? s.status : null, setAt: at && at.getTime() > 0 ? at : null };
+      })
+      .catch(() => ({ about: null, setAt: null }));
+    const business = await this.client
+      .getBusinessProfile(jid)
+      .then((b: any) =>
+        b
+          ? {
+              category: b.category ?? null,
+              description: b.description ?? null,
+              website: Array.isArray(b.website) ? b.website.filter(Boolean) : b.website ? [b.website] : [],
+              email: b.email ?? null,
+              address: b.address ?? null,
+            }
+          : null,
+      )
+      .catch(() => null);
+    return { wuid: jid, ...status, business };
   }
 
   public async updatePresence(data: UpdatePresenceDto) {
@@ -5731,7 +5849,11 @@ export class WAStartupService {
       const take = (set: BaileysEventMap['messaging-history.set']) => {
         if (set.syncType !== proto.HistorySync.HistorySyncType.ON_DEMAND) return false;
         const named = Boolean(requestId && set.peerDataRequestSessionId === requestId);
-        const mine = (set.messages ?? []).filter((m) => m.key?.remoteJid === jid && m.message);
+        const mine = (set.messages ?? []).filter(
+          (m) =>
+            m.key?.remoteJid === jid &&
+            (m.message || GROUP_NOTICES.has(proto.WebMessageInfo.StubType[m.messageStubType as number] ?? '')),
+        );
         if (!named && !mine.length) return false;
         // Who sent each: the answer carries members' names and their numbers for private ids.
         const names = new Map<string, string>();
@@ -5748,6 +5870,7 @@ export class WAStartupService {
         void (async () => {
           const messages: PrismType.Message[] = [];
           for (const m of mine) {
+            await this.withGroupNotice(m, pnOf);
             const raw = this.historyRaw(m);
             if (!raw) continue;
             await this.withSender(raw, m, names, pnOf);
@@ -5843,6 +5966,41 @@ export class WAStartupService {
    * poll its secret (so votes cast later can be read) and the votes WhatsApp sent with it
    * (`votesAggregate`: each option with who chose it).
    */
+  /**
+   * A group's notice (someone added, removed, left, made admin; its name, description or picture
+   * changed) as a message of its own, `groupNoticeMessage`, so it's kept and sent on like any other.
+   * WhatsApp sends these with no content, only a type and its details; members as their numbers
+   * where known (else their private ids).
+   */
+  private async withGroupNotice(m: WAMessage, pnOf?: Map<string, string>): Promise<void> {
+    if (!m || m.message || !m.messageStubType || !isJidGroup(m.key?.remoteJid)) return;
+    const stub = proto.WebMessageInfo.StubType[m.messageStubType as number];
+    if (!stub || !GROUP_NOTICES.has(stub)) return;
+    const params: unknown[] = [];
+    for (const p of m.messageStubParameters ?? []) {
+      let v: unknown = p;
+      try {
+        const parsed = JSON.parse(p);
+        if (parsed && typeof parsed === 'object') v = parsed;
+      } catch {
+        // Plain text: a new name, description, or a member's id in older notices.
+      }
+      if (typeof v === 'string' && /@(s\.whatsapp\.net|c\.us|lid)$/.test(v)) v = { id: v };
+      if (v && typeof v === 'object' && typeof (v as { id?: unknown }).id === 'string') {
+        const o = v as { id: string; phoneNumber?: string; lid?: string };
+        const id = jidNormalizedUser(o.id);
+        let phone = id.endsWith('@s.whatsapp.net') ? id : o.phoneNumber ? jidNormalizedUser(o.phoneNumber) : null;
+        const lid = id.endsWith('@lid') ? id : o.lid ? jidNormalizedUser(o.lid) : null;
+        if (!phone && lid) {
+          const pn = pnOf?.get(lid) ?? (await Promise.resolve(this.lidToPn(lid)).catch(() => null));
+          phone = pn ? jidNormalizedUser(pn) : null;
+        }
+        params.push({ phone, lid });
+      } else params.push(v);
+    }
+    m.message = { groupNoticeMessage: { stub, params } } as any;
+  }
+
   private historyContent(m: WAMessage, messageType: string): PrismType.Prisma.JsonValue {
     const inner = m.message?.[messageType];
     const content: Record<string, unknown> =
@@ -5861,6 +6019,18 @@ export class WAStartupService {
         }
       }
     }
+    // Reactions given before this device saw the message come attached to it, not as messages of
+    // their own: kept with it, or they'd be lost.
+    const reactions = (m.reactions ?? [])
+      .filter((r) => typeof r?.text === 'string' && r.text)
+      .map((r) => ({
+        text: r.text,
+        fromMe: Boolean(r.key?.fromMe),
+        // In a group the reactor is the participant; the chat's id names them only in a 1:1 chat.
+        by: r.key?.participant || (r.key?.fromMe || isJidGroup(r.key?.remoteJid) ? null : r.key?.remoteJid) || null,
+        at: Number(r.senderTimestampMs ?? 0) || null,
+      }));
+    if (reactions.length) content.historyReactions = reactions;
     return toJsonValue(content);
   }
 
@@ -5869,7 +6039,21 @@ export class WAStartupService {
    * answer's own mapping, else this instance's.
    */
   private async withVoterNumbers(raw: PrismType.Message, pnOf: Map<string, string>): Promise<void> {
-    const content = raw.content as { votesAggregate?: { name?: string; voters?: string[] }[] } | null;
+    const content = raw.content as {
+      votesAggregate?: { name?: string; voters?: string[] }[];
+      historyReactions?: { by?: string | null }[];
+    } | null;
+    // Who reacted, likewise.
+    for (const r of content?.historyReactions ?? []) {
+      if (!r.by) continue;
+      const id = jidNormalizedUser(r.by);
+      if (!id.endsWith('@lid')) {
+        r.by = id;
+        continue;
+      }
+      const pn = pnOf.get(id) ?? (await Promise.resolve(this.lidToPn(id)).catch(() => null));
+      r.by = pn ? jidNormalizedUser(pn) : id;
+    }
     if (!content?.votesAggregate?.length) return;
     for (const option of content.votesAggregate) {
       const voters: string[] = [];

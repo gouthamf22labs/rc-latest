@@ -242,6 +242,15 @@ export function ChatRouter(chatController: ChatController, ...guards: RequestHan
 
       res.status(HttpStatus.OK).json(response);
     })
+    .post(routerPath('fetchProfile'), ...guards, async (req, res) => {
+      const response = await dataValidate<NumberDto>({
+        request: req,
+        schema: profilePictureSchema,
+        execute: (instance, data) => chatController.fetchProfile(instance, data),
+      });
+
+      res.status(HttpStatus.OK).json(response);
+    })
     .post(routerPath('findContacts'), ...guards, async (req, res) => {
       const response = await dataValidate<Query<Contact>>({
         request: req,

@@ -1,5 +1,6 @@
 ### BASE IMAGE
-FROM public.ecr.aws/docker/library/node:24-bullseye-slim AS base
+# Debian 12 (bookworm): Debian 11's security mirror no longer serves the arm64 packages installed below.
+FROM public.ecr.aws/docker/library/node:24-bookworm-slim AS base
 
 ### BUILD IMAGE
 FROM base AS builder
@@ -25,6 +26,8 @@ RUN npx prisma generate
 
 RUN npm run build
 
+# The Prisma CLI is a regular dependency, so it stays after this: deploy_db.sh runs it at start
+# (migrate deploy) with the version package.json pins, and prisma.config.mjs imports it.
 RUN npm prune --omit=dev --legacy-peer-deps
 
 ### PRODUCTION IMAGE
