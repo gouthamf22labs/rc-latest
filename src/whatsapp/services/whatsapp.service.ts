@@ -201,6 +201,16 @@ import {
   isEventType,
   readEventEdit,
 } from '../../utils/event-edit';
+import {
+  EDITED_AT_KEY,
+  EDITED_FIELD,
+  editedAtOf,
+  editedTextOf,
+  isProtocolEdit,
+  isSecretMessageEdit,
+  messageSecretOf,
+  readMessageEdit,
+} from '../../utils/message-edit';
 import { getObjectUrl } from '../../integrations/minio/minio.utils';
 import { encodeProps } from '../../utils/encode.props';
 import { voipSupervisor } from '../../voip/voip.supervisor';
@@ -1969,23 +1979,114 @@ export class WAStartupService {
   }
 
   /**
+   * The ids a one-to-one chat goes by: its number and its private id (…@lid), whichever is known,
+   * and the one WhatsApp keeps the chat under here (a business is often kept by its private id
+   * only, so asking by number found none of its messages).
+   */
+  private async chatIdsOf(jid: string): Promise<{ pn: string | null; lid: string | null; chatJid: string }> {
+    if (jid.endsWith('@g.us') || jid.endsWith('@newsletter')) return { pn: null, lid: null, chatJid: jid };
+    // What this number's links (this one and those before it) know of the chat.
+    const id = { in: await this.sameNumberInstanceIds() };
+    if (jid.endsWith('@lid')) {
+      const chat = await this.repository.chat.findFirst({ where: { instanceId: id, remoteJid: jid }, select: { content: true } });
+      const known = (chat?.content as { pnJid?: unknown } | null)?.pnJid;
+      const pn = typeof known === 'string' ? known : await Promise.resolve(this.lidToPn(jid)).catch(() => null);
+      return { pn: pn ? jidNormalizedUser(pn) : null, lid: jid, chatJid: jid };
+    }
+    // By number: the chat kept under a private id that says it stands for this number.
+    const byLid = await this.repository.chat.findFirst({
+      where: { instanceId: id, remoteJid: { endsWith: '@lid' }, content: { path: ['pnJid'], equals: jid } },
+      select: { remoteJid: true },
+    });
+    let lid = byLid?.remoteJid ?? null;
+    if (!lid) {
+      const mapped = await Promise.resolve(
+        (this.client as any)?.signalRepository?.lidMapping?.getLIDForPN?.(jid),
+      ).catch(() => null);
+      lid = typeof mapped === 'string' ? jidNormalizedUser(mapped) : null;
+    }
+    const byPn = await this.repository.chat.findFirst({ where: { instanceId: id, remoteJid: jid }, select: { id: true } });
+    return { pn: jid, lid, chatJid: byPn || !byLid ? jid : byLid.remoteJid };
+  }
+
+  /**
+   * This number's links, this one and the ones before it (each logout and new link is a new
+   * instance, whose kept messages would otherwise be out of reach after linking again).
+   */
+  private async sameNumberInstanceIds(): Promise<number[]> {
+    const owner = this.instance.ownerJid || this.client?.user?.id;
+    if (!owner) return [this.instance.id];
+    const number = jidNormalizedUser(owner);
+    const rows = await this.repository.instance
+      .findMany({ where: { ownerJid: { in: [number, owner] } }, select: { id: true } })
+      .catch(() => []);
+    const ids = new Set([this.instance.id, ...rows.map((r) => r.id)]);
+    return [...ids];
+  }
+
+  /**
    * A chat's kept messages, newest first, older than `before` (unix seconds) when given: what the
    * CRM shows of a chat or group it just added, without asking the phone. In messages.upsert's
    * shape (a poll's secret left out).
    */
   public async chatHistory(data: { jid: string; before?: number; limit?: number }) {
     const limit = Math.min(Math.max(data.limit ?? 100, 1), 500);
-    const rows = await this.repository.message.findMany({
+    // Its messages under either id (kept by number, or by private id with the number unknown then).
+    const ids = await this.chatIdsOf(data.jid);
+    const or = [
+      ...(ids.pn ? [{ keyRemoteJid: ids.pn }] : []),
+      ...(ids.lid ? [{ keyRemoteJid: ids.lid }, { keyLid: ids.lid }] : []),
+    ];
+    // Kept by any of this number's links, each message once.
+    const instances = await this.sameNumberInstanceIds();
+    const found = await this.repository.message.findMany({
       where: {
-        instanceId: this.instance.id,
-        keyRemoteJid: data.jid,
+        instanceId: { in: instances },
+        ...(or.length > 1 ? { OR: or } : { keyRemoteJid: data.jid }),
         ...(data.before ? { messageTimestamp: { lt: data.before } } : {}),
       },
       orderBy: { messageTimestamp: 'desc' },
-      take: limit,
+      take: limit * Math.min(instances.length, 3),
     });
+    const seen = new Set<string>();
+    const rows = found.filter((r) => !seen.has(r.keyId) && Boolean(seen.add(r.keyId))).slice(0, limit);
     return {
       messages: rows.map((r) => ({ ...r, content: withoutPollSecret(r.content) })),
+      kept: await this.keepsMessages(),
+      // The ids it goes by, so a client can match messages that carry only one of them.
+      pn: ids.pn,
+      lid: ids.lid,
+    };
+  }
+
+  /**
+   * Every chat's kept messages from `since` (unix seconds) on, oldest first, a page at a time:
+   * what a client missed while it wasn't hearing from this number (a reconnect, a new link).
+   * `after` is the last page's cursor ({ at, id }).
+   */
+  public async messagesSince(data: { since: number; after?: { at: number; id: number }; limit?: number }) {
+    const limit = Math.min(Math.max(data.limit ?? 200, 1), 500);
+    const after = data.after;
+    const rows = await this.repository.message.findMany({
+      where: {
+        instanceId: this.instance.id,
+        messageTimestamp: { gte: data.since },
+        ...(after
+          ? {
+              OR: [
+                { messageTimestamp: { gt: after.at } },
+                { messageTimestamp: after.at, id: { gt: after.id } },
+              ],
+            }
+          : {}),
+      },
+      orderBy: [{ messageTimestamp: 'asc' }, { id: 'asc' }],
+      take: limit,
+    });
+    const last = rows[rows.length - 1];
+    return {
+      messages: rows.map((r) => ({ ...r, content: withoutPollSecret(r.content) })),
+      next: rows.length === limit && last ? { at: last.messageTimestamp, id: last.id } : null,
       kept: await this.keepsMessages(),
     };
   }
@@ -1996,7 +2097,7 @@ export class WAStartupService {
     const keyIds = messages.map((m) => m.keyId);
     const existing = await this.repository.message.findMany({
       where: { instanceId: this.instance.id, keyId: { in: keyIds } },
-      select: { id: true, keyId: true },
+      select: { id: true, keyId: true, keyRemoteJid: true },
     });
     const existingSet = new Set(existing.map((m) => m.keyId));
     const toCreate = messages.filter((m) => !existingSet.has(m.keyId));
@@ -2004,11 +2105,38 @@ export class WAStartupService {
       // Another copy can land between the check and the write: skipped, not failed.
       await this.repository.message.createMany({ data: toCreate, skipDuplicates: true });
     }
+    // Kept before without its secret (from before secrets were kept): this copy brings it, so the
+    // message's edits can be read.
+    const secrets = messages.filter(
+      (m) => existingSet.has(m.keyId) && typeof (m.content as Record<string, unknown> | null)?.[POLL_SECRET_KEY] === 'string',
+    );
+    if (secrets.length) {
+      await this.repository.$executeRaw`
+        UPDATE "Message" AS m
+        SET content = m.content || jsonb_build_object('messageSecret', s.secret)
+        FROM (
+          SELECT unnest(${secrets.map((x) => x.keyId)}::text[]) AS "keyId",
+                 unnest(${secrets.map((x) => (x.content as Record<string, string>)[POLL_SECRET_KEY])}::text[]) AS secret
+        ) AS s
+        WHERE m."instanceId" = ${this.instance.id} AND m."keyId" = s."keyId" AND NOT (m.content ? 'messageSecret')`.catch(
+        () => undefined,
+      );
+    }
+    // Kept before without its chat (an older group's id wasn't recognised): this copy names it.
+    const incoming = new Map(messages.map((m) => [m.keyId, m.keyRemoteJid]));
+    for (const row of existing) {
+      const jid = incoming.get(row.keyId);
+      if (!row.keyRemoteJid && jid)
+        await this.repository.message.update({ where: { id: row.id }, data: { keyRemoteJid: jid } }).catch(() => undefined);
+    }
     // One kept already, fetched again with its reactions as they are now: those brought up to date
     // (only those rows are read in full).
     const withReactions = new Set(
       messages
-        .filter((m) => existingSet.has(m.keyId) && (m.content as { historyReactions?: unknown } | null)?.historyReactions)
+        .filter((m) => {
+          const c = m.content as { historyReactions?: unknown; historyPin?: unknown } | null;
+          return existingSet.has(m.keyId) && Boolean(c?.historyReactions || c?.historyPin);
+        })
         .map((m) => m.keyId),
     );
     if (!withReactions.size) return;
@@ -2018,12 +2146,22 @@ export class WAStartupService {
     });
     const stored = new Map(rows.map((m) => [m.keyId, m]));
     for (const m of messages) {
-      const reactions = (m.content as { historyReactions?: unknown } | null)?.historyReactions;
+      const incoming = m.content as { historyReactions?: unknown; historyPin?: unknown } | null;
       const row = stored.get(m.keyId);
-      if (!reactions || !row || !row.content || typeof row.content !== 'object' || Array.isArray(row.content)) continue;
-      if (JSON.stringify((row.content as { historyReactions?: unknown }).historyReactions) === JSON.stringify(reactions)) continue;
+      if (!incoming || !row || !row.content || typeof row.content !== 'object' || Array.isArray(row.content)) continue;
+      const kept = row.content as { historyReactions?: unknown; historyPin?: unknown };
+      // Reactions and the pin as they are now, where they changed.
+      const next = {
+        ...(incoming.historyReactions ? { historyReactions: incoming.historyReactions } : {}),
+        ...(incoming.historyPin ? { historyPin: incoming.historyPin } : {}),
+      };
+      if (
+        JSON.stringify(kept.historyReactions ?? null) === JSON.stringify(next.historyReactions ?? kept.historyReactions ?? null) &&
+        JSON.stringify(kept.historyPin ?? null) === JSON.stringify(next.historyPin ?? kept.historyPin ?? null)
+      )
+        continue;
       await this.repository.message
-        .update({ where: { id: row.id }, data: { content: toJsonValue({ ...row.content, historyReactions: reactions }) } })
+        .update({ where: { id: row.id }, data: { content: toJsonValue({ ...row.content, ...next }) } })
         .catch(() => undefined);
     }
   }
@@ -2160,7 +2298,13 @@ export class WAStartupService {
         );
         for (const [, m] of Object.entries(messages)) {
           await this.withGroupNotice(m, pnOf);
-          if (m.message?.protocolMessage || m.message?.senderKeyDistributionMessage || !m.message) continue;
+          // A message's edit is kept (its message may be read back later): other protocol messages aren't.
+          if (
+            (m.message?.protocolMessage && !isProtocolEdit(m.message.protocolMessage)) ||
+            m.message?.senderKeyDistributionMessage ||
+            !m.message
+          )
+            continue;
           let timestamp = m?.messageTimestamp;
           if (timestamp && typeof timestamp === 'object' && typeof (timestamp as any).toNumber === 'function') {
             timestamp = (timestamp as any).toNumber();
@@ -2190,6 +2334,7 @@ export class WAStartupService {
         }
         // Voters and reactors known by private id: their numbers, as live ones carry.
         for (const raw of messagesRaw) await this.withVoterNumbers(raw, pnOf);
+        await this.withEdits(messagesRaw);
         this.sendDataWebhook(
           'messagesSet',
           messagesRaw.map((r) => ({ ...r, content: withoutPollSecret(r.content) })),
@@ -2307,7 +2452,14 @@ export class WAStartupService {
 
         if (
           messageRaw.isGroup &&
-          !['protocolMessage', 'reactionMessage', 'senderKeyDistributionMessage', 'pollUpdateMessage', 'groupNoticeMessage'].includes(messageType)
+          ![
+            'protocolMessage',
+            'reactionMessage',
+            'senderKeyDistributionMessage',
+            'pollUpdateMessage',
+            'groupNoticeMessage',
+            'secretEncryptedMessage',
+          ].includes(messageType)
         ) {
           const prev = this.lastGroupMessage.get(received.key.remoteJid);
           const at = Number(timestamp ?? 0);
@@ -2335,6 +2487,9 @@ export class WAStartupService {
             received.key.addressingMode === 'lid' || isLidUser(received.key.remoteJid)
               ? 'lid'
               : 'pn';
+        } else if (EDITED_FIELD[messageType] && messageSecretOf(received)) {
+          // A message that can be edited keeps its secret too: WhatsApp encrypts its edits with it.
+          messageRaw.content[POLL_SECRET_KEY] = messageSecretOf(received);
         }
 
         // A vote arrives encrypted: name its choices for the webhook when the poll's secret is
@@ -2356,6 +2511,14 @@ export class WAStartupService {
           const eventEdit = await this.readEventEditOf(received, user, group);
           if (eventEdit) {
             messageRaw.content['eventEdit'] = eventEdit;
+          }
+        }
+
+        // A message's edit: its new words named for the webhook (`messageEdit`), and kept on it.
+        if (messageType === 'protocolMessage' || messageType === 'secretEncryptedMessage') {
+          const messageEdit = await this.readMessageEditOf(messageRaw);
+          if (messageEdit) {
+            messageRaw.content['messageEdit'] = messageEdit;
           }
         }
 
@@ -3102,6 +3265,43 @@ export class WAStartupService {
   }
 
   /**
+   * Who is typing or recording in a group right now, for a chat someone has
+   * open. Each call keeps the group subscribed (see PresenceWatcher.touchGroup),
+   * so the first answer after opening is usually empty and later ones fill in.
+   * Members arrive keyed by LID; their phone number is added when known. Our
+   * own number is left out.
+   */
+  public async fetchGroupPresence(data: { number: string }) {
+    this.assertConnected();
+    const groupJid = this.createJid(data.number);
+    if (!isJidGroup(groupJid)) {
+      throw new BadRequestException('Not a group jid');
+    }
+    await this.presenceWatcher.touchGroup(groupJid);
+
+    const own = new Set(
+      [this.client.user?.id, this.client.user?.lid]
+        .filter(Boolean)
+        .map((jid) => jidNormalizedUser(jid)),
+    );
+    const members = [];
+    for (const snapshot of this.presenceWatcher.groupActivity(groupJid)) {
+      const jid = jidNormalizedUser(snapshot.jid);
+      if (own.has(jid)) continue;
+      const pn = isLidUser(jid) ? await Promise.resolve(this.lidToPn(jid)).catch(() => null) : jid;
+      if (pn && own.has(jidNormalizedUser(pn))) continue;
+      members.push({
+        jid,
+        lid: isLidUser(jid) ? jid : null,
+        phone: pn ? jidNormalizedUser(pn).split('@')[0] : null,
+        presence: snapshot.lastKnownPresence,
+        updatedAt: new Date(snapshot.updatedAt).toISOString(),
+      });
+    }
+    return { groupJid, members };
+  }
+
+  /**
    * Registers a one-shot watch that emits `presence.online` the moment the
    * contact is next seen online. Idempotent on `watchId`, so the owner of the
    * pending action can re-register on a cadence and survive a restart on either
@@ -3466,6 +3666,9 @@ export class WAStartupService {
           content[POLL_SECRET_KEY] = pollSecret;
           content[POLL_ADDRESSING_KEY] =
             isLidUser(recipient) || groupAddressing === 'lid' ? 'lid' : 'pn';
+        } else if (EDITED_FIELD[sentType] && content && typeof content === 'object' && messageSecretOf(m)) {
+          // So an edit made on the phone later can be read.
+          content[POLL_SECRET_KEY] = messageSecretOf(m);
         }
 
         return {
@@ -4630,6 +4833,143 @@ export class WAStartupService {
   }
 
   /**
+   * A message's edit made on WhatsApp, as `{ messageId, text, at }` (at: unix seconds): a
+   * protocolMessage edit, history's editedMessage, or the secretEncryptedMessage WhatsApp now sends,
+   * read with the message's kept secret. The kept message takes the new words too (unless a newer
+   * edit is on it already), so reading it back later shows it edited. `batch`: history's messages
+   * not kept yet, looked in first. Undefined when it isn't a message's edit or can't be read (the
+   * message or its secret unknown, as for messages kept before secrets were).
+   */
+  private async readMessageEditOf(edit: PrismType.Message, batch?: Map<string, PrismType.Message>) {
+    try {
+      const content = edit.content as Record<string, any>;
+      let messageId: string | undefined;
+      let message: any;
+      if (edit.messageType === 'protocolMessage' && isProtocolEdit(content)) {
+        messageId = content?.key?.id;
+        message = { protocolMessage: content };
+      } else if (edit.messageType === 'editedMessage') {
+        messageId = content?.message?.protocolMessage?.key?.id ?? edit.keyId;
+        message = { editedMessage: content };
+      } else if (edit.messageType === 'secretEncryptedMessage' && isSecretMessageEdit(content)) {
+        messageId = content?.targetMessageKey?.id;
+        if (!messageId) {
+          return undefined;
+        }
+        const target = batch?.get(messageId) ?? (await this.findEditable(messageId));
+        const secret = (target?.content as Record<string, unknown> | null)?.[POLL_SECRET_KEY];
+        if (!target || typeof secret !== 'string') {
+          return undefined;
+        }
+        // Who sent the message and who edited it, by each name they may go by.
+        const me = this.ownVoteJids();
+        const by = (row: PrismType.Message) =>
+          (row.keyFromMe
+            ? [me.pn, me.lid]
+            : isJidGroup(row.keyRemoteJid)
+              ? [row.keyParticipant, row.keyParticipantLid]
+              : [row.keyRemoteJid, row.keyLid]
+          )
+            .filter(Boolean)
+            .map((jid) => jidNormalizedUser(jid));
+        message = readMessageEdit(content, {
+          secret: Buffer.from(secret, 'base64'),
+          messageId,
+          creators: by(target),
+          editors: by(edit),
+        });
+        if (!message) {
+          this.logger.warn(`message edit for ${messageId} could not be decrypted`);
+          return undefined;
+        }
+      } else {
+        return undefined;
+      }
+      const text = editedTextOf(message);
+      if (!messageId || !text) {
+        return undefined;
+      }
+      const at = editedAtOf(message) ?? (Number(edit.messageTimestamp) || Math.floor(Date.now() / 1000));
+      await this.keepEdit(messageId, text, at, batch);
+      return { messageId, text, at };
+    } catch (error) {
+      this.logger.error(error);
+      return undefined;
+    }
+  }
+
+  /** The newest kept message with this WhatsApp id, not counting edits and other changes to it. */
+  private async findEditable(keyId: string) {
+    return await this.repository.message.findFirst({
+      where: {
+        instanceId: this.instance.id,
+        keyId,
+        messageType: { notIn: ['protocolMessage', 'secretEncryptedMessage', 'editedMessage'] },
+      },
+      orderBy: { id: 'desc' },
+    });
+  }
+
+  /**
+   * An edit's words kept on the message it edits (its text, or its caption), with when it was
+   * made: in history's batch and kept already alike. An older edit than the one there changes nothing.
+   */
+  private async keepEdit(messageId: string, text: string, at: number, batch?: Map<string, PrismType.Message>) {
+    const edited = (row: PrismType.Message) => {
+      const field = EDITED_FIELD[row.messageType];
+      const content = row.content as Record<string, unknown> | null;
+      if (!field || !content || typeof content !== 'object' || Number(content[EDITED_AT_KEY] ?? 0) > at) {
+        return undefined;
+      }
+      return { ...content, [field]: text, [EDITED_AT_KEY]: at };
+    };
+    const pending = batch?.get(messageId);
+    const next = pending && edited(pending);
+    if (next) {
+      pending.content = next as PrismType.Prisma.JsonObject;
+    }
+    const row = await this.findEditable(messageId);
+    const kept = row && edited(row);
+    if (kept) {
+      await this.repository.message.update({ where: { id: row.id }, data: { content: kept as PrismType.Prisma.JsonObject } });
+    }
+  }
+
+  /**
+   * History's edits read and kept on what they edit (in the same batch, or kept before), and edits
+   * kept before that couldn't be read then: read now that the message they edit came with its secret.
+   */
+  private async withEdits(rows: PrismType.Message[]) {
+    const changes = new Set(['protocolMessage', 'secretEncryptedMessage', 'editedMessage']);
+    const batch = new Map(rows.filter((r) => !changes.has(r.messageType)).map((r) => [r.keyId, r] as const));
+    for (const raw of rows) {
+      if (!changes.has(raw.messageType)) continue;
+      const messageEdit = await this.readMessageEditOf(raw, batch);
+      if (messageEdit) {
+        raw.content = { ...(raw.content as object), messageEdit } as PrismType.Prisma.JsonObject;
+      }
+    }
+    const withSecret = [...batch.values()]
+      .filter((r) => typeof (r.content as Record<string, unknown> | null)?.[POLL_SECRET_KEY] === 'string')
+      .map((r) => r.keyId);
+    if (!withSecret.length) return;
+    const unread = await this.repository.$queryRaw<PrismType.Message[]>`
+      SELECT * FROM "Message"
+      WHERE "instanceId" = ${this.instance.id}
+        AND "messageType" = 'secretEncryptedMessage'
+        AND content->'targetMessageKey'->>'id' = ANY(${withSecret})
+        AND NOT (content ? 'messageEdit')`.catch(() => [] as PrismType.Message[]);
+    for (const row of unread) {
+      const messageEdit = await this.readMessageEditOf(row, batch);
+      if (messageEdit) {
+        await this.repository.message
+          .update({ where: { id: row.id }, data: { content: { ...(row.content as object), messageEdit } } })
+          .catch(() => undefined);
+      }
+    }
+  }
+
+  /**
    * Edits or cancels an event this number sent, as WhatsApp's Edit event / Cancel event do: the
    * whole new event, encrypted with the event's stored secret (a secretEncryptedMessage of type
    * EVENT_EDIT), so both sides see the new details. A cancelled event keeps its details and can
@@ -5771,7 +6111,9 @@ export class WAStartupService {
    */
   public async fetchHistory(data: FetchHistoryDto) {
     if (!this.client?.user?.id) throw new BadRequestException('The instance is not connected');
-    const jid = data.jid;
+    // Asked of the phone under the id WhatsApp keeps the chat by (a private id for many businesses).
+    const ids = await this.chatIdsOf(data.jid);
+    const jid = ids.chatJid;
     // No message given: the newest one known in this chat, sent back too (the caller hasn't it).
     let anchorRaw: PrismType.Message | null = null;
     if (!data.oldestId) {
@@ -5878,6 +6220,7 @@ export class WAStartupService {
             messages.push(raw);
           }
           await this.namesFromContacts(messages);
+          await this.withEdits(messages);
           // Kept like any other history (with poll secrets); sent on without them.
           if (await this.keepsMessages()) await this.syncMessage(messages).catch(() => undefined);
           finish({
@@ -6005,6 +6348,11 @@ export class WAStartupService {
     const inner = m.message?.[messageType];
     const content: Record<string, unknown> =
       typeof inner === 'string' ? { text: inner } : { ...((toJsonValue(inner) as Record<string, unknown>) ?? {}) };
+    // A message that can be edited keeps its secret, so its edits can be read.
+    if (EDITED_FIELD[messageType]) {
+      const secret = messageSecretOf(m);
+      if (secret) content[POLL_SECRET_KEY] = secret;
+    }
     if (isPollType(messageType)) {
       const secret = pollSecretOf(m.message);
       if (secret) content[POLL_SECRET_KEY] = secret;
@@ -6031,6 +6379,20 @@ export class WAStartupService {
         at: Number(r.senderTimestampMs ?? 0) || null,
       }));
     if (reactions.length) content.historyReactions = reactions;
+    // Likewise a pin on it (or its undoing), with when and for how long: the latest one.
+    const pins: { unpin: boolean; at: number; durationSecs: number | null }[] = [];
+    const pinOf = (type: unknown, at: unknown, secs: unknown) => {
+      const kind = Number(type);
+      const ms = Number(at ?? 0);
+      if ((kind === 1 || kind === 2) && ms > 0) pins.push({ unpin: kind === 2, at: ms, durationSecs: Number(secs ?? 0) || null });
+    };
+    const inChat = (m as any).pinInChat;
+    if (inChat) pinOf(inChat.type, inChat.senderTimestampMs ?? inChat.serverTimestampMs, inChat.messageAddOnContextInfo?.messageAddOnDurationInSecs);
+    for (const a of ((m as any).messageAddOns ?? []) as any[]) {
+      const pin = a?.messageAddOn?.pinInChatMessage;
+      if (pin) pinOf(pin.type, a.senderTimestampMs ?? pin.senderTimestampMs ?? a.serverTimestampMs, a.addOnContextInfo?.messageAddOnDurationInSecs);
+    }
+    if (pins.length) content.historyPin = pins.sort((x, y) => y.at - x.at)[0];
     return toJsonValue(content);
   }
 
@@ -6077,7 +6439,12 @@ export class WAStartupService {
   /** One history message in messages.upsert's shape, or null for one without content. */
   private historyRaw(m: WAMessage): PrismType.Message | null {
     const messageType = getContentType(m.message);
-    if (!messageType || m.message?.protocolMessage || m.message?.senderKeyDistributionMessage) return null;
+    if (
+      !messageType ||
+      (m.message?.protocolMessage && !isProtocolEdit(m.message.protocolMessage)) ||
+      m.message?.senderKeyDistributionMessage
+    )
+      return null;
     let timestamp: unknown = m.messageTimestamp;
     // A message read back from the stored chat has its time as text ("1780413192").
     if (typeof timestamp === 'string' && /^\d+$/.test(timestamp)) {

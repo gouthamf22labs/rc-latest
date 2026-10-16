@@ -1,7 +1,9 @@
 import { WAMessageKey } from '@whiskeysockets/baileys';
 
 const isJid = (v: string) => {
-  const regexp = new RegExp(/^\w+@(s.whatsapp.net|g.us|broadcast|newsletter)$/i);
+  // Older groups' ids have a hyphen ("<creator>-<created>@g.us"): without it in the pattern, every
+  // message of such a group lost its chat id (and was dropped downstream).
+  const regexp = new RegExp(/^[\w-]+@(s\.whatsapp\.net|g\.us|broadcast|newsletter)$/i);
   return regexp.test(v);
 };
 

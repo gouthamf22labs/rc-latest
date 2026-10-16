@@ -628,6 +628,17 @@ export const fetchPresenceSchema: JSONSchema7 = {
   ...isNotEmpty('number'),
 };
 
+export const fetchGroupPresenceSchema: JSONSchema7 = {
+  $id: ulid(),
+  type: 'object',
+  properties: {
+    // The group's jid.
+    number: { ...numberDefinition },
+  },
+  required: ['number'],
+  ...isNotEmpty('number'),
+};
+
 export const watchPresenceSchema: JSONSchema7 = {
   $id: ulid(),
   type: 'object',
@@ -746,6 +757,21 @@ export const chatHistorySchema: JSONSchema7 = {
   },
   ...isNotEmpty('jid'),
   required: ['jid'],
+};
+
+export const messagesSinceSchema: JSONSchema7 = {
+  $id: ulid(),
+  type: 'object',
+  properties: {
+    since: { type: 'integer', minimum: 0 },
+    after: {
+      type: 'object',
+      properties: { at: { type: 'integer' }, id: { type: 'integer' } },
+      required: ['at', 'id'],
+    },
+    limit: { type: 'integer', minimum: 1, maximum: 500 },
+  },
+  required: ['since'],
 };
 
 export const fetchHistorySchema: JSONSchema7 = {

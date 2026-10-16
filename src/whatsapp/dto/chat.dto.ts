@@ -138,6 +138,13 @@ export class ChatHistoryDto {
   limit?: number;
 }
 
+/** Every chat's kept messages from `since` (unix seconds), oldest first; `after`: the last page's cursor. */
+export class MessagesSinceDto {
+  since: number;
+  after?: { at: number; id: number };
+  limit?: number;
+}
+
 export class FetchHistoryDto {
   jid: string;
   /** Left out: counted back from the newest message this instance knows in the chat (returned too). */

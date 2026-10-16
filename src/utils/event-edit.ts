@@ -19,15 +19,17 @@ type EditContext = {
   eventMsgId: string;
   eventCreatorJid: string;
   editorJid: string;
+  /** Which edit: an event's (the default) or a message's (message-edit). */
+  info?: string;
 };
 
-const editKey = ({ eventSecret, eventMsgId, eventCreatorJid, editorJid }: EditContext) =>
+export const editKey = ({ eventSecret, eventMsgId, eventCreatorJid, editorJid, info }: EditContext) =>
   Buffer.from(
     hkdfSync(
       'sha256',
       eventSecret,
       Buffer.alloc(0),
-      Buffer.from(eventMsgId + eventCreatorJid + editorJid + EVENT_EDIT_INFO),
+      Buffer.from(eventMsgId + eventCreatorJid + editorJid + (info ?? EVENT_EDIT_INFO)),
       32,
     ),
   );

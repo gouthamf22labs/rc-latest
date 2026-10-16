@@ -53,8 +53,10 @@ import {
   fetchHistorySchema,
   warehouseSchema,
   chatHistorySchema,
+  messagesSinceSchema,
   updatePresenceSchema,
   fetchPresenceSchema,
+  fetchGroupPresenceSchema,
   watchPresenceSchema,
   unwatchPresenceSchema,
   whatsappNumberSchema,
@@ -75,6 +77,7 @@ import {
   FetchHistoryDto,
   WarehouseDto,
   ChatHistoryDto,
+  MessagesSinceDto,
   UpdatePresenceDto,
   FetchPresenceDto,
   WatchPresenceDto,
@@ -140,6 +143,17 @@ export function ChatRouter(chatController: ChatController, ...guards: RequestHan
         request: req,
         schema: fetchPresenceSchema,
         execute: (instance, data) => chatController.fetchPresence(instance, data),
+      });
+
+      res.status(HttpStatus.OK).json(response);
+    })
+    // Who is typing in a group, for an open group chat. POST: it keeps the
+    // group subscribed on the live socket.
+    .post(routerPath('fetchGroupPresence'), ...guards, async (req, res) => {
+      const response = await dataValidate<NumberDto>({
+        request: req,
+        schema: fetchGroupPresenceSchema,
+        execute: (instance, data) => chatController.fetchGroupPresence(instance, data),
       });
 
       res.status(HttpStatus.OK).json(response);
@@ -402,6 +416,15 @@ export function ChatRouter(chatController: ChatController, ...guards: RequestHan
         request: req,
         schema: chatHistorySchema,
         execute: (instance, data) => chatController.chatHistory(instance, data),
+      });
+      res.status(HttpStatus.OK).json(response);
+    })
+    // Every chat's kept messages from a time on, oldest first: { since, after?, limit? }.
+    .post(routerPath('messagesSince'), ...guards, async (req, res) => {
+      const response = await dataValidate<MessagesSinceDto>({
+        request: req,
+        schema: messagesSinceSchema,
+        execute: (instance, data) => chatController.messagesSince(instance, data),
       });
       res.status(HttpStatus.OK).json(response);
     })

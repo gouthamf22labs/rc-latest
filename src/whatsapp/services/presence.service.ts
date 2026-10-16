@@ -176,6 +176,12 @@ const MAX_CACHED_SNAPSHOTS = 2000;
  * older than this is reported as stale rather than as current state.
  */
 export const PRESENCE_FRESH_MS = 45 * 1000;
+/**
+ * How long a group subscribe is assumed to hold while someone has the group
+ * open. A group's typing only reaches us after a subscribe to the group itself,
+ * and like any subscription it lapses, so it is re-sent at most this often.
+ */
+const GROUP_SUBSCRIBE_TTL_MS = 30 * 1000;
 /** Hard cap on live watches per instance; mass-subscribing is a ban signal. */
 export const MAX_WATCHES_PER_INSTANCE = 500;
 
@@ -188,6 +194,9 @@ export class PresenceWatcher {
   private readonly watchesByJid = new Map<string, Set<string>>();
   /** One-shot resolvers for `waitForUpdate`. */
   private readonly waiters = new Map<string, Array<(s: PresenceSnapshot) => void>>();
+
+  /** groupJid → ms epoch of its last subscribe, see touchGroup. */
+  private readonly groupSubscribedAt = new Map<string, number>();
 
   private readonly subscribeQueue = new Set<string>();
   private draining = false;
@@ -220,6 +229,8 @@ export class PresenceWatcher {
     // Keep the watches: they are re-subscribed on the next open. Drop only the
     // queue, whose entries would fail against a dead socket.
     this.subscribeQueue.clear();
+    // Group subscribes died with the socket too; the next look re-sends them.
+    this.groupSubscribedAt.clear();
   }
 
   /** Instance is going away for good — release timers and pending state. */
@@ -227,6 +238,7 @@ export class PresenceWatcher {
     this.connected = false;
     this.stopTimers();
     this.subscribeQueue.clear();
+    this.groupSubscribedAt.clear();
     this.watches.clear();
     this.watchesByJid.clear();
     this.snapshots.clear();
@@ -266,6 +278,44 @@ export class PresenceWatcher {
       }
     }
     return waiter;
+  }
+
+  /**
+   * Keeps a group's chat-state coming while someone is looking at it: WhatsApp
+   * sends members' typing only after a subscribe to the group, so it is re-sent
+   * once GROUP_SUBSCRIBE_TTL_MS has passed. Each re-subscribe re-announces too —
+   * the number is set unavailable after every incoming message, and a busy
+   * group would otherwise go quiet until the announce TTL ran out.
+   */
+  public async touchGroup(groupJid: string) {
+    const now = Date.now();
+    for (const [jid, at] of this.groupSubscribedAt) {
+      if (now - at >= GROUP_SUBSCRIBE_TTL_MS) this.groupSubscribedAt.delete(jid);
+    }
+    if (!this.connected || this.groupSubscribedAt.has(groupJid)) {
+      return;
+    }
+    this.groupSubscribedAt.set(groupJid, now);
+    this.lastAnnouncedAt = 0;
+    await this.ensureAvailable();
+    try {
+      await this.deps.subscribe(groupJid);
+    } catch (error) {
+      this.groupSubscribedAt.delete(groupJid);
+      this.deps.logger.warn(`presence subscribe failed for ${groupJid}: ${error?.message ?? error}`);
+    }
+  }
+
+  /**
+   * Members whose last state, heard through this group, is typing or recording.
+   * A member's state is cached under their own jid, so one who has since been
+   * heard elsewhere (another group, a 1:1) is not counted here.
+   */
+  public groupActivity(groupJid: string): PresenceSnapshot[] {
+    return [...this.snapshots.values()].filter(
+      (s) =>
+        s.viaJid === groupJid && isTypingPresence(s.lastKnownPresence) && this.isFresh(s),
+    );
   }
 
   private waitForUpdate(jids: string[], timeoutMs: number): Promise<PresenceSnapshot | null> {

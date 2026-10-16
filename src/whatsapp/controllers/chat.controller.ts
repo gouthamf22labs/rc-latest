@@ -46,6 +46,7 @@ import {
   FetchHistoryDto,
   WarehouseDto,
   ChatHistoryDto,
+  MessagesSinceDto,
   ContactActivityDto,
   EditEvent,
   EditMessage,
@@ -116,6 +117,10 @@ export class ChatController {
     return await this.waMonitor.waInstances.get(instanceName).fetchPresence(data);
   }
 
+  public async fetchGroupPresence({ instanceName }: InstanceDto, data: NumberDto) {
+    return await this.waMonitor.waInstances.get(instanceName).fetchGroupPresence(data);
+  }
+
   public async watchPresence({ instanceName }: InstanceDto, data: WatchPresenceDto) {
     return await this.waMonitor.waInstances.get(instanceName).watchPresence(data);
   }
@@ -179,6 +184,10 @@ export class ChatController {
 
   public async setWarehouse({ instanceName }: InstanceDto, data: WarehouseDto) {
     return await this.waMonitor.waInstances.get(instanceName).setWarehouse(data.enabled);
+  }
+
+  public async messagesSince({ instanceName }: InstanceDto, data: MessagesSinceDto) {
+    return await this.waMonitor.waInstances.get(instanceName).messagesSince(data);
   }
 
   public async chatHistory({ instanceName }: InstanceDto, data: ChatHistoryDto) {
