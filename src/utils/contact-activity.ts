@@ -130,6 +130,12 @@ export function peerOf(
 
 export type KnownContact = {
   jid: string;
+  /**
+   * The same person's phone-number jid and LID, when the index has them: a caller holding one
+   * form (a reply that came in under the LID alone) learns the other.
+   */
+  pn: string | null;
+  lid: string | null;
   firstAt: Date;
   lastAt: Date;
   fromMeCount: number;
@@ -189,6 +195,8 @@ export async function findKnownContacts(
         if (!current) {
           known.set(jid, {
             jid,
+            pn: row.peerJid?.endsWith('@s.whatsapp.net') ? row.peerJid : null,
+            lid: row.peerLid ?? (row.peerJid?.endsWith('@lid') ? row.peerJid : null),
             firstAt: row.firstAt,
             lastAt: row.lastAt,
             fromMeCount: row.fromMeCount,
@@ -196,6 +204,8 @@ export async function findKnownContacts(
           });
           continue;
         }
+        if (!current.pn && row.peerJid?.endsWith('@s.whatsapp.net')) current.pn = row.peerJid;
+        if (!current.lid && row.peerLid) current.lid = row.peerLid;
         if (row.firstAt < current.firstAt) current.firstAt = row.firstAt;
         if (row.lastAt > current.lastAt) current.lastAt = row.lastAt;
         current.fromMeCount += row.fromMeCount;

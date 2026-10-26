@@ -2254,6 +2254,21 @@ export class WAStartupService {
   private readonly lidToPn = (lid: string) =>
     this.client?.signalRepository?.lidMapping?.getPNForLID(lid);
 
+  /**
+   * The webhook copy of a one-to-one message, with the other person's phone-number jid as
+   * `keyRemoteJidPn`. WhatsApp often addresses a chat by the person's LID alone (no
+   * remoteJidAlt), which leaves `keyRemoteJid` empty: a consumer keyed by phone number
+   * (stop-on-reply, sequences) then can't tell who wrote. Resolved from the LID mapping here;
+   * the stored message is left exactly as it was.
+   */
+  private async withSenderNumber(messageRaw: PrismType.Message) {
+    if (messageRaw.isGroup) return messageRaw;
+    if (messageRaw.keyRemoteJid) return { ...messageRaw, keyRemoteJidPn: messageRaw.keyRemoteJid };
+    if (!messageRaw.keyLid) return messageRaw;
+    const pn = await Promise.resolve(this.lidToPn(messageRaw.keyLid)).catch(() => null);
+    return pn ? { ...messageRaw, keyRemoteJidPn: jidNormalizedUser(pn) } : messageRaw;
+  }
+
   private readonly messageHandle = {
     'messaging-history.set': async ({
       messages,
@@ -2598,7 +2613,7 @@ export class WAStartupService {
         }
 
         this.ws.send(this.instance.name, 'messages.upsert', messageRaw);
-        await this.sendDataWebhook('messagesUpsert', messageRaw);
+        await this.sendDataWebhook('messagesUpsert', await this.withSenderNumber(messageRaw));
 
         this.logger.trace(`type[${type}] - received`, messageRaw);
       }
