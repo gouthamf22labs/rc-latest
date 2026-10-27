@@ -49,11 +49,13 @@ import makeWASocket, {
   delay,
   DisconnectReason,
   downloadMediaMessage,
+  extractImageThumb,
   generateWAMessageFromContent,
   getBinaryNodeChild,
   getContentType,
   getAggregateVotesInPollMessage,
   getDevice,
+  getUrlInfo,
   GroupMetadata,
   GroupParticipant,
   isJidGroup,
@@ -76,6 +78,7 @@ import makeWASocket, {
   WAMessage,
   WAMessageUpdate,
   WASocket,
+  WAUrlInfo,
 } from '@whiskeysockets/baileys';
 import {
   ConfigService,
@@ -3747,9 +3750,102 @@ export class WAStartupService {
     }
     return await this.sendMessageWithTyping<AnyMessageContent>(
       data.number,
-      { text: data.textMessage.text, mentions },
+      {
+        text: data.textMessage.text,
+        mentions,
+        linkPreview: await this.linkPreviewFor(data.textMessage.text, data.number.includes('@newsletter')),
+      },
       data?.options,
     );
+  }
+
+  /**
+   * The card under the first link in a text message, as WhatsApp's own app adds it (the sender
+   * builds it; the receiver's phone never does). A YouTube link is read from YouTube's oEmbed API,
+   * since its page answers servers with a bot check; any other page through Baileys' getUrlInfo.
+   * undefined: no link. null: no card (the page failed, or came back as a bot check or an empty
+   * page): the text still goes, as a plain link, rather than a broken card.
+   */
+  private async linkPreviewFor(
+    text: string | undefined,
+    toChannel = false,
+  ): Promise<WAUrlInfo | null | undefined> {
+    const link = text?.match(/https?:\/\/[^\s<>"']+/i)?.[0]?.replace(/[).,!?]+$/, '');
+    if (!link) return undefined;
+    // Never holds the send up for long: past this, it goes as a plain link.
+    const LIMIT_MS = 8000;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        this.buildLinkPreview(link, toChannel),
+        new Promise<null>((resolve) => {
+          timer = setTimeout(() => resolve(null), LIMIT_MS);
+        }),
+      ]);
+    } catch (error) {
+      // The site only, never the whole link (it may carry a token).
+      let site = 'link';
+      try {
+        site = new URL(link).hostname;
+      } catch {
+        // keep "link"
+      }
+      this.logger.warn(`No link preview for ${site}: ${error?.message ?? error}`);
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * See linkPreviewFor. A channel post gets the small picture only: the large one is uploaded
+   * encrypted, as a chat needs it, which a channel's followers can't show.
+   */
+  private async buildLinkPreview(link: string, toChannel: boolean): Promise<WAUrlInfo | null> {
+    const upload = toChannel ? undefined : this.client.waUploadToServer;
+    const youtubeId = link.match(
+      /(?:youtube\.com\/(?:watch\?(?:[^#\s]*&)?v=|shorts\/|live\/|embed\/)|youtu\.be\/)([\w-]{11})/i,
+    )?.[1];
+    if (youtubeId) {
+      const watchUrl = `https://www.youtube.com/watch?v=${youtubeId}`;
+      const { data: video } = await axios.get('https://www.youtube.com/oembed', {
+        params: { url: watchUrl, format: 'json' },
+        timeout: 3000,
+      });
+      if (!video?.title) return null;
+      const info: WAUrlInfo = {
+        'canonical-url': watchUrl,
+        'matched-text': link,
+        title: video.title,
+        description: video.author_name,
+        originalThumbnailUrl: video.thumbnail_url,
+      };
+      if (video.thumbnail_url) {
+        if (upload) {
+          const { imageMessage } = await prepareWAMessageMedia(
+            { image: { url: video.thumbnail_url } },
+            { upload, mediaTypeOverride: 'thumbnail-link', options: { signal: AbortSignal.timeout(3000) } },
+          );
+          info.jpegThumbnail = imageMessage?.jpegThumbnail ? Buffer.from(imageMessage.jpegThumbnail) : undefined;
+          info.highQualityThumbnail = imageMessage || undefined;
+        } else {
+          const { data: image } = await axios.get(video.thumbnail_url, { responseType: 'arraybuffer', timeout: 3000 });
+          info.jpegThumbnail = (await extractImageThumb(Buffer.from(image), 192)).buffer;
+        }
+      }
+      return info;
+    }
+    const info = await getUrlInfo(link, {
+      thumbnailWidth: 192,
+      fetchOpts: { timeout: 3000 },
+      uploadImage: upload,
+    });
+    if (!info?.title) return null;
+    // A bot check (Google's "sorry" page) or a page with nothing to show but its own address.
+    const canonical = info['canonical-url'] ?? '';
+    if (/^https?:\/\/(www\.)?google\.[^/]+\/sorry\//i.test(canonical)) return null;
+    if (info.title === link && !info.jpegThumbnail && !info.description) return null;
+    return info;
   }
 
   private async generateVideoThumbnailFromStream<T = string>(

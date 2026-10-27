@@ -68,6 +68,7 @@
     "jsonschema": "^1.5.0",
     "jsonwebtoken": "^9.0.3",
     "libmlow-wasm": "0.1.1",
+    "link-preview-js": "3.2.0",
     "mime-types": "^3.0.2",
     "mine": "^0.1.0",
     "minio": "^8.0.7",
