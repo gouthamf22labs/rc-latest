@@ -530,6 +530,38 @@ const GROUP_NOTICES = new Set([
   'GROUP_PARTICIPANT_CHANGE_NUMBER',
 ]);
 
+
+/**
+ * The first link in a message, as WhatsApp's own app finds one: with a scheme ("https://…"), or
+ * written bare ("bolna.ai/symphony", "www.site.com"), which people paste all the time. Not an
+ * email address, and not "2.5" or "v1.2". Trailing punctuation is left out. A bare link is
+ * returned as written: the preview fetches it over https, and its matched text has to be exactly
+ * what's in the message for WhatsApp to show the card.
+ */
+export function firstLinkIn(text: string | undefined): string | undefined {
+  if (!text) return undefined;
+  const pattern =
+    /(?:https?:\/\/[^\s<>"']+|(?<![@\w.\/-])(?:www\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}(?::\d{2,5})?(?:[/?#][^\s<>"']*)?)/gi;
+  for (const match of text.matchAll(pattern)) {
+    const link = match[0].replace(/[).,!?:;'"]+$/, '');
+    if (/^https?:\/\//i.test(link)) return link;
+    // Bare: the name must end in a real-looking top-level domain, not "file.txt" or "etc.etc".
+    const host = link.replace(/[/?#:].*$/, '').toLowerCase();
+    const tld = host.slice(host.lastIndexOf('.') + 1);
+    if (BARE_LINK_TLDS.has(tld)) return link;
+  }
+  return undefined;
+}
+
+/** Top-level domains a link written without "https://" is recognised by (the common ones). */
+const BARE_LINK_TLDS = new Set([
+  'com', 'org', 'net', 'edu', 'gov', 'io', 'ai', 'co', 'in', 'me', 'app', 'dev', 'xyz', 'info', 'biz',
+  'uk', 'us', 'ca', 'au', 'nz', 'de', 'fr', 'es', 'it', 'nl', 'se', 'no', 'dk', 'fi', 'ie', 'ch', 'at',
+  'be', 'pt', 'pl', 'br', 'mx', 'ar', 'cl', 'za', 'ng', 'ke', 'ae', 'sa', 'qa', 'sg', 'my', 'id', 'ph',
+  'th', 'vn', 'jp', 'kr', 'cn', 'hk', 'tw', 'pk', 'bd', 'lk', 'np', 'tv', 'fm', 'gg', 'ly', 'to', 'link',
+  'site', 'online', 'store', 'shop', 'tech', 'live', 'blog', 'news', 'club', 'events', 'page', 'so', 'sh',
+]);
+
 export class WAStartupService {
   constructor(
     private readonly configService: ConfigService,
@@ -3770,7 +3802,7 @@ export class WAStartupService {
     text: string | undefined,
     toChannel = false,
   ): Promise<WAUrlInfo | null | undefined> {
-    const link = text?.match(/https?:\/\/[^\s<>"']+/i)?.[0]?.replace(/[).,!?]+$/, '');
+    const link = firstLinkIn(text);
     if (!link) return undefined;
     // Never holds the send up for long: past this, it goes as a plain link.
     const LIMIT_MS = 8000;
