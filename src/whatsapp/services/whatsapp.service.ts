@@ -51,6 +51,7 @@ import makeWASocket, {
   downloadMediaMessage,
   extractImageThumb,
   generateWAMessageFromContent,
+  encodeNewsletterMessage,
   getBinaryNodeChild,
   getContentType,
   getAggregateVotesInPollMessage,
@@ -393,6 +394,8 @@ export const MessageSubtype = () => [
   'documentWithCaptionMessage',
   'viewOnceMessage',
   'viewOnceMessageV2',
+  // WhatsApp's own animated stickers: { lottieStickerMessage: { message: { stickerMessage } } }
+  'lottieStickerMessage',
 ];
 
 export const TypeMediaMessage = () => [
@@ -561,6 +564,26 @@ const BARE_LINK_TLDS = new Set([
   'th', 'vn', 'jp', 'kr', 'cn', 'hk', 'tw', 'pk', 'bd', 'lk', 'np', 'tv', 'fm', 'gg', 'ly', 'to', 'link',
   'site', 'online', 'store', 'shop', 'tech', 'live', 'blog', 'news', 'club', 'events', 'page', 'so', 'sh',
 ]);
+
+/**
+ * In an animated WebP (RIFF "WEBP": VP8X, ANIM, then one ANMF chunk per frame), the number of
+ * bytes from the start of the file to the end of the first ANMF chunk: what WhatsApp calls a
+ * sticker's firstFrameLength. undefined when the file isn't laid out that way.
+ */
+export function webpFirstFrameLength(webp: Buffer): number | undefined {
+  if (webp.length < 12 || webp.toString('ascii', 0, 4) !== 'RIFF' || webp.toString('ascii', 8, 12) !== 'WEBP') {
+    return undefined;
+  }
+  let offset = 12;
+  while (offset + 8 <= webp.length) {
+    const fourcc = webp.toString('ascii', offset, offset + 4);
+    const size = webp.readUInt32LE(offset + 4);
+    const end = offset + 8 + size + (size % 2); // chunks are padded to an even length
+    if (fourcc === 'ANMF') return Math.min(end, webp.length);
+    offset = end;
+  }
+  return undefined;
+}
 
 export class WAStartupService {
   constructor(
@@ -2957,29 +2980,11 @@ export class WAStartupService {
     });
   }
 
-  // Check if the number is MX or AR
-  private formatMXOrARNumber(jid: string): string {
-    const regexp = new RegExp(/^(\d{2})(\d{2})\d{1}(\d{8})$/);
-    if (regexp.test(jid)) {
-      const match = regexp.exec(jid);
-      if (match && (match[1] === '52' || match[1] === '54')) {
-        const joker = Number.parseInt(match[3][0]);
-        const ddd = Number.parseInt(match[2]);
-        if (joker < 7 || ddd < 11) {
-          return match[0];
-        }
-        return match[1] === '52' ? '52' + match[3] : '54' + match[3];
-      }
-    }
-    return jid;
-  }
-
   // Check if the number is br
   // Returns `jid` untouched unless this is a BR number needing the 9th-digit fix. The
   // `return jid` sits at the end, not in an `else`: the 13-digit regex also matches MX
   // (52) and AR (54) numbers, and with the early-out in an else branch those fell off
-  // the end as `undefined`, so createJid built `undefined@s.whatsapp.net` and never
-  // reached formatMXOrARNumber. Mirrors that function's shape for exactly this reason.
+  // the end as `undefined`, so createJid built `undefined@s.whatsapp.net`.
   private formatBRNumber(jid: string): string {
     const regexp = new RegExp(/^(\d{2})(\d{2})\d{1}(\d{8})$/);
     if (regexp.test(jid)) {
@@ -3014,11 +3019,9 @@ export class WAStartupService {
       return `${formattedBRNumber}@s.whatsapp.net`;
     }
 
-    const formattedMXARNumber = this.formatMXOrARNumber(number);
-    if (formattedMXARNumber !== number) {
-      return `${formattedMXARNumber}@s.whatsapp.net`;
-    }
-
+    // No rewrite for Mexico (52) or Argentina (54): WhatsApp itself matches 52 / 521 and
+    // 54 / 549 forms of a number to its real id. The old rule here was a copy of the BR one
+    // and dropped a digit, so 5219997474943 became 5297474943, which isn't on WhatsApp.
     if (number.includes('-')) {
       return `${number}@g.us`;
     }
@@ -3558,6 +3561,13 @@ export class WAStartupService {
     number: string,
     message: T,
     options?: Options,
+    /**
+     * Channel media this service uploaded itself (see newsletterSticker): `message` is the
+     * finished proto, posted the way WhatsApp's own clients post channel media — stanza
+     * type "media" carrying the upload's handle as media_id, and the media type on the
+     * plaintext node. Baileys' own channel send does neither.
+     */
+    newsletterMedia?: { handle: string; mediatype: string },
   ) {
     let quoted: PrismType.Message = options?.quotedMessage;
     if (options?.quotedMessageId) {
@@ -3639,7 +3649,25 @@ export class WAStartupService {
           message?.['pollCreationMessageV2'] ||
           message?.['pollCreationMessageV3'];
 
-        if (!isPollProto && (message?.['react'] || message?.['edit'] || message?.['text'] || message?.['poll'] || message?.['forward'] || isJidNewsletter(recipient))) {
+        if (newsletterMedia && isJidNewsletter(recipient)) {
+          m = generateWAMessageFromContent(recipient, message as proto.IMessage, {
+            timestamp: new Date(),
+            userJid: this.instance.ownerJid,
+            messageId,
+          });
+          await (this.client as any).sendNode({
+            tag: 'message',
+            attrs: { to: recipient, id: messageId, type: 'media', media_id: newsletterMedia.handle },
+            content: [
+              {
+                tag: 'plaintext',
+                attrs: { mediatype: newsletterMedia.mediatype },
+                content: encodeNewsletterMessage(m.message),
+              },
+            ],
+          });
+          m.key = { id: messageId, remoteJid: jid, fromMe: true };
+        } else if (!isPollProto && (message?.['react'] || message?.['edit'] || message?.['text'] || message?.['poll'] || message?.['forward'] || isJidNewsletter(recipient))) {
           // Newsletters: client.sendMessage internally calls prepareWAMessageMedia with the
           // newsletter JID, which uses the correct unencrypted upload path for newsletters.
           // relayMessage() skips this and sends the pre-built proto which WhatsApp rejects for media.
@@ -4041,6 +4069,56 @@ export class WAStartupService {
     throw lastError;
   }
 
+  /**
+   * Any image as a WhatsApp sticker: WebP inside 512x512 on a transparent background, with
+   * GIF / animated WebP frames kept. A WebP that is already 512x512 and small enough is sent
+   * untouched, so pack stickers keep their own quality and sticker-pack details. WhatsApp
+   * refuses stickers over about 100 KB (still) or 500 KB (moving), so quality steps down
+   * until it fits.
+   */
+  private async toStickerWebp(input: Buffer): Promise<{ media: Buffer; animated: boolean }> {
+    const meta = await sharp(input, { animated: true }).metadata();
+    const animated = (meta.pages ?? 1) > 1;
+    const limit = animated ? 500 * 1024 : 100 * 1024;
+    const height = meta.pageHeight ?? meta.height;
+
+    // WhatsApp's sticker spec: every frame at least 8 ms, the whole animation at most 10 s.
+    // GIFs often say 0 ms, which browsers play as 100 ms, so do the same; then keep only the
+    // frames that fit in 10 s.
+    let delay: number[] | undefined;
+    let pages = meta.pages ?? 1;
+    if (animated) {
+      delay = (meta.delay ?? []).slice(0, pages).map((d) => (d >= 8 ? d : 100));
+      while (delay.length < pages) delay.push(100);
+      let total = 0;
+      const fit = delay.findIndex((d) => (total += d) > 10_000);
+      if (fit > 0) {
+        pages = fit;
+        delay = delay.slice(0, fit);
+      }
+    }
+    const withinSpec = !animated || (pages === meta.pages && delay.every((d, i) => d === meta.delay?.[i]));
+
+    if (
+      withinSpec &&
+      meta.format === 'webp' &&
+      meta.width === 512 &&
+      height === 512 &&
+      input.length <= limit
+    ) {
+      return { media: input, animated };
+    }
+    let out: Buffer;
+    for (const quality of [80, 60, 40, 25]) {
+      out = await sharp(input, animated ? { pages } : {})
+        .resize(512, 512, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
+        .webp({ quality, effort: 4, ...(animated ? { delay, loop: 0 } : {}) })
+        .toBuffer();
+      if (out.length <= limit) break;
+    }
+    return { media: out, animated };
+  }
+
   private async prepareMediaMessage(
     mediaMessage: MediaMessage & { mimetype?: string; convert?: boolean },
   ) {
@@ -4101,6 +4179,20 @@ export class WAStartupService {
         media = readFileSync(fileName);
       }
 
+      let stickerAnimated = false;
+      // WhatsApp's own animated stickers (.was): a zip of a Lottie animation signed by WhatsApp.
+      // They can only be passed on as they are, so they skip the WebP conversion.
+      const stickerLottie =
+        (mediaMessage.mediatype as string) === 'sticker' && media.subarray(0, 4).toString('binary') === 'PK\x03\x04';
+      if ((mediaMessage.mediatype as string) === 'sticker' && !stickerLottie) {
+        if (isHeicBuffer(media)) {
+          throw new BadRequestException(
+            `${HEIC_UNSUPPORTED_MESSAGE}: "${mediaLabel(mediaMessage?.fileName, mediaMessage?.media)}"`,
+          );
+        }
+        ({ media, animated: stickerAnimated } = await this.toStickerWebp(media));
+      }
+
       // Checked before prepareWAMessageMedia so an undeliverable image does not first
       // get encrypted and uploaded to WhatsApp's CDN just to fail on the thumbnail below.
       if (mediaMessage.mediatype === 'image' && isHeicBuffer(media)) {
@@ -4132,6 +4224,15 @@ export class WAStartupService {
       prepareMedia[mediaType].caption = mediaMessage?.caption;
       prepareMedia[mediaType].mimetype = mediaMessage?.mimetype || mimetype;
       prepareMedia[mediaType].fileName = mediaMessage.fileName;
+
+      // Baileys never sets this; without it phones show only the first frame of a moving sticker.
+      if (prepareMedia.stickerMessage) {
+        prepareMedia.stickerMessage.isAnimated = stickerAnimated || stickerLottie;
+        if (stickerLottie) {
+          prepareMedia.stickerMessage.isLottie = true;
+          prepareMedia.stickerMessage.mimetype = 'application/was';
+        }
+      }
 
       // Only an audio message can be a voice note (an .ogg sent as a document stays a document).
       if (isAccOrOgg && prepareMedia.audioMessage) {
@@ -4258,8 +4359,6 @@ export class WAStartupService {
       let jpegThumbnail: Buffer | undefined;
       let width: number | undefined;
       let height: number | undefined;
-      let thumbnailDirectPath: string | undefined;
-      let thumbnailSha256: Buffer | undefined;
 
       // Set inside the try below, acted on after it: the catch there deliberately swallows
       // everything to fall back to the original media, which for HEIC would mean quietly
@@ -4292,20 +4391,6 @@ export class WAStartupService {
             .toFormat('jpeg', { quality: 80 })
             .toBuffer();
 
-          // Upload thumbnail to WA CDN — native newsletter requires thumbnailDirectPath
-          const thumbPath = join(tmpdir(), `thumb-${ulid(Date.now())}.jpg`);
-          writeFileSync(thumbPath, jpegThumbnail);
-          const thumbSha256 = createHash('sha256').update(jpegThumbnail).digest();
-          const thumbSha256B64 = encodeURIComponent(thumbSha256.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''));
-          try {
-            const thumbUpload = await (this.client as any).waUploadToServer(thumbPath, {
-              mediaType: 'image',
-              fileEncSha256B64: thumbSha256B64,
-            });
-            thumbnailDirectPath = thumbUpload?.directPath;
-            thumbnailSha256 = thumbSha256;
-          } catch { /* best-effort */ }
-          try { unlinkSync(thumbPath); } catch { /* ignore */ }
         } catch { /* fall back to original if anything fails */ }
       }
 
@@ -4313,7 +4398,32 @@ export class WAStartupService {
         throw new BadRequestException(`${HEIC_UNSUPPORTED_MESSAGE}: "${mediaLabel(fileName, media)}"`);
       }
 
-      const content = { [mediatype]: mediaContent, caption, fileName, mimetype, jpegThumbnail, width, height, thumbnailDirectPath, thumbnailSha256 } as any;
+      // A photo is posted the way WhatsApp's own clients post channel media (as stickers are,
+      // see newsletterSticker): uploaded to the channel endpoint, and the post citing the
+      // upload's handle. Baileys' own path below (chat endpoint, no handle) is accepted by
+      // WhatsApp but the post never shows; it stays only for what isn't a JPEG photo.
+      if (mediatype === 'image' && mimetype === 'image/jpeg' && Buffer.isBuffer(mediaContent)) {
+        const upload = await this.uploadNewsletterMedia(mediaContent, 'image');
+        const message: proto.IMessage = {
+          imageMessage: {
+            url: upload.url,
+            directPath: upload.directPath,
+            fileSha256: upload.fileSha256,
+            fileLength: mediaContent.length,
+            mimetype: 'image/jpeg',
+            ...(caption ? { caption } : {}),
+            ...(width && height ? { width, height } : {}),
+            ...(jpegThumbnail ? { jpegThumbnail } : {}),
+          },
+        };
+        this.logger.info(`[newsletter-media] posting photo to ${jid} (${mediaContent.length} bytes) via the channel upload`);
+        return await this.sendMessageWithTyping(data.number, message, data?.options, {
+          handle: upload.handle,
+          mediatype: 'image',
+        });
+      }
+
+      const content = { [mediatype]: mediaContent, caption, fileName, mimetype, jpegThumbnail, width, height } as any;
       this.logger.info(`[newsletter-media] sending ${mediatype} to ${jid} url=${typeof mediaContent === 'object' && !Buffer.isBuffer(mediaContent) && (mediaContent as any).url ? (mediaContent as any).url : 'buffer'}`);
       const result = await this.sendMessageWithTyping(data.number, content, data?.options);
       this.logger.info(`[newsletter-media] sent keyId=${result?.keyId} messageType=${result?.messageType}`);
@@ -4791,17 +4901,111 @@ export class WAStartupService {
   }
 
   public async stickerMessage(data: SendStickerDto) {
+    if (isJidNewsletter(this.createJid(data.number))) {
+      return this.newsletterSticker(data);
+    }
     const generate = await this.prepareMediaMessage({
       media: data.stickerMessage.sticker,
       mediatype: 'sticker' as any,
       mimetype: 'image/webp',
     });
 
-    return await this.sendMessageWithTyping(
-      data.number,
-      { ...generate.message },
-      data?.options,
+    // A Lottie sticker goes inside lottieStickerMessage, as WhatsApp sends its own.
+    const message = generate.message.stickerMessage?.isLottie
+      ? { lottieStickerMessage: { message: { stickerMessage: generate.message.stickerMessage } } }
+      : { ...generate.message };
+
+    return await this.sendMessageWithTyping(data.number, message as any, data?.options);
+  }
+
+  /**
+   * A sticker posted to a channel. Channels reject the encrypted upload prepareMediaMessage does,
+   * so — as mediaMessage does for channel photos — the sticker goes to client.sendMessage as raw
+   * content, which takes Baileys' unencrypted channel upload. Same 512px WebP conversion as a
+   * chat sticker. WhatsApp's own .was stickers can't go this way: they are signed for the
+   * encrypted path, so a channel gets a clear refusal rather than a broken post.
+   */
+  private async newsletterSticker(data: SendStickerDto) {
+    const source = data.stickerMessage.sticker;
+    let input: Buffer;
+    if (/^https?:\/\//.test(source)) {
+      input = Buffer.from((await this.downloadMedia(source)).data);
+    } else {
+      input = Buffer.from(source.replace(/^data:[^,]*,/, ''), 'base64');
+    }
+    if (input.subarray(0, 4).toString('binary') === 'PK\x03\x04') {
+      throw new BadRequestException(
+        "WhatsApp's own animated stickers can't be posted to a channel. Pick another sticker.",
+      );
+    }
+    if (isHeicBuffer(input)) {
+      throw new BadRequestException(`${HEIC_UNSUPPORTED_MESSAGE}: "sticker"`);
+    }
+    const { media, animated } = await this.toStickerWebp(input);
+    // WhatsApp's own channel posts of a moving sticker carry firstFrameLength (the bytes up to
+    // the end of the first frame), and Baileys never sets it; without it the post is accepted
+    // but never shows in the channel.
+    const firstFrameLength = animated ? webpFirstFrameLength(media) : undefined;
+    this.logger.info(
+      `[newsletter-media] sending sticker to ${data.number} (${media.length} bytes, animated=${animated}, firstFrameLength=${firstFrameLength})`,
     );
+    const upload = await this.uploadNewsletterMedia(media, 'image');
+    const message: proto.IMessage = {
+      stickerMessage: {
+        url: upload.url,
+        directPath: upload.directPath,
+        fileSha256: upload.fileSha256,
+        fileLength: media.length,
+        mimetype: 'image/webp',
+        isAnimated: animated,
+        ...(firstFrameLength ? { firstFrameLength } : {}),
+        stickerSentTs: Date.now(),
+      },
+    };
+    return await this.sendMessageWithTyping(data.number, message, data?.options, {
+      handle: upload.handle,
+      mediatype: 'sticker',
+    });
+  }
+
+  /**
+   * Uploads channel media unencrypted to WhatsApp's channel endpoint
+   * (/newsletter/newsletter-<type>/<sha256>), as WhatsApp's own clients do. Its reply carries
+   * a handle that the post must cite; Baileys' upload drops it (and uses the chat endpoint).
+   * `type` is the upload kind: "image" for photos and stickers.
+   */
+  private async uploadNewsletterMedia(
+    data: Buffer,
+    type: 'image' | 'video' | 'document' | 'audio',
+  ): Promise<{ url: string; directPath: string; handle: string; fileSha256: Buffer }> {
+    const fileSha256 = createHash('sha256').update(data).digest();
+    const token = fileSha256.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    let conn = await (this.client as any).refreshMediaConn(false);
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      for (const { hostname } of conn.hosts ?? []) {
+        try {
+          const res = await axios.post(
+            `https://${hostname}/newsletter/newsletter-${type}/${token}?auth=${encodeURIComponent(conn.auth)}&token=${token}`,
+            data,
+            {
+              headers: { 'Content-Type': 'application/octet-stream', Origin: 'https://web.whatsapp.com' },
+              maxBodyLength: Infinity,
+              timeout: 60_000,
+            },
+          );
+          const body = res.data ?? {};
+          if (body.direct_path && body.handle) {
+            return { url: body.url, directPath: body.direct_path, handle: body.handle, fileSha256 };
+          }
+          lastError = new Error(`channel upload gave no handle: ${JSON.stringify(body).slice(0, 200)}`);
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      conn = await (this.client as any).refreshMediaConn(true);
+    }
+    throw new BadRequestException(`Channel media upload failed: ${(lastError as Error)?.message ?? lastError}`);
   }
 
   /**
@@ -5828,6 +6032,17 @@ export class WAStartupService {
 
       if (!mediaMessage) {
         return {};
+      }
+
+      // WhatsApp's own stickers carry a bare "https://a.whatsapp.net" url and the real
+      // location in directPath. Baileys downloads from directPath on the url's host, and
+      // that host doesn't serve media, so point it at the usual media host instead.
+      if (
+        mediaMessage.directPath &&
+        typeof mediaMessage.url === 'string' &&
+        !/^https?:\/\/[^/]+\/./.test(mediaMessage.url)
+      ) {
+        mediaMessage.url = `https://mmg.whatsapp.net${mediaMessage.directPath}`;
       }
 
       return { mediaMessage, mediaType, msg };
