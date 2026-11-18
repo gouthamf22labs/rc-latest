@@ -1582,7 +1582,7 @@ export class WAStartupService {
       userDevicesCache: this.userDevicesCache,
       transactionOpts: { maxCommitRetries: 5, delayBetweenTriesMs: 50 },
     };
-    // Off unless ACK_STATUS_INSTANCES lists this instance or ACK_STATUS_PERCENT covers it (utils/status-ack.ts).
+    // On for every instance unless ACK_STATUS_PERCENT turns it down (utils/status-ack.ts).
     this.ackStatusEnabled = shouldAckStatus(this.instance.name);
 
     const socket = makeWASocket(socketConfig);

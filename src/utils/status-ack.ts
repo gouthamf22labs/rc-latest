@@ -16,7 +16,7 @@ import { createHash } from 'crypto';
  *    incoming messages go quiet (at most `quietMaxMs` more). Never held indefinitely: a held one
  *    that is never acked is exactly the 50-minute drop (Nov 19 02:16, when release waited only
  *    for that signal).
- * Content is never read (we don't use Status updates). The first few arrivals per socket are
+ * Content is never read (we don't use Status updates). The first 3 arrivals per socket are
  * logged with their attributes, so a miss can be told apart from a hold.
  */
 
@@ -29,11 +29,12 @@ type SocketLike = {
 };
 
 /**
- * Which instances ack <status>. Off unless switched on:
- *  - ACK_STATUS_INSTANCES (comma list): on for these.
- *  - ACK_STATUS_PERCENT (0-100, default 0): on for that share of all instances, picked by a stable
- *    hash of the instance name (a partial rollout keeps the same accounts across restarts).
- *    100 = everyone.
+ * Which instances ack <status>: every instance by default, so it follows an account across a
+ * logout and re-link (a new instance name) with nothing to update. An account WhatsApp doesn't
+ * send <status> to never triggers the listener, so this costs nothing there.
+ *  - ACK_STATUS_PERCENT (0-100, default 100): share of instances, picked by a stable hash of the
+ *    instance name. 0 = kill switch (off for everyone not listed below).
+ *  - ACK_STATUS_INSTANCES (comma list, optional): always on for these, whatever the percent.
  */
 export function shouldAckStatus(instanceName: string, env: NodeJS.ProcessEnv = process.env): boolean {
   const listed = String(env.ACK_STATUS_INSTANCES ?? '')
@@ -41,8 +42,10 @@ export function shouldAckStatus(instanceName: string, env: NodeJS.ProcessEnv = p
     .map((v) => v.trim())
     .filter(Boolean);
   if (listed.includes(instanceName)) return true;
-  const parsed = Number(String(env.ACK_STATUS_PERCENT ?? '').trim() || 0);
-  const percent = Number.isFinite(parsed) ? Math.min(100, Math.max(0, parsed)) : 0;
+  const raw = String(env.ACK_STATUS_PERCENT ?? '').trim();
+  const parsed = raw === '' ? 100 : Number(raw);
+  // A typo shouldn't silently switch the fix off for everyone: anything unreadable means on.
+  const percent = Number.isFinite(parsed) ? Math.min(100, Math.max(0, parsed)) : 100;
   if (percent >= 100) return true;
   if (percent <= 0) return false;
   const bucket = createHash('sha1').update(instanceName).digest().readUInt16BE(0) % 100;
@@ -64,7 +67,7 @@ export function ackStatusStanzas(socket: SocketLike, log: Log, opts: StatusAckOp
   const quietMs = opts.quietMs ?? 3_000;
   const quietMaxMs = opts.quietMaxMs ?? 15_000;
   const pollMs = opts.pollMs ?? 250;
-  const logArrivals = opts.logArrivals ?? 10;
+  const logArrivals = opts.logArrivals ?? 3;
   const stats = { arrived: 0, live: 0, offline: 0, held: 0, failed: 0 };
 
   let offlineDone = false;
