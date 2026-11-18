@@ -2808,6 +2808,24 @@ export class WAStartupService {
   };
 
   private eventHandler() {
+    // WhatsApp now delivers contacts' Status updates as a top-level <status> stanza (rolled out
+    // account by account), and this Baileys version has no handler for it, so it is never acked.
+    // About 50 minutes later the server closes the stream ("Stream Errored (ack)", ack
+    // class="status", type media/text) and, until then, holds back the account's incoming events
+    // (replies, group joins) — they arrive in a burst after the reconnect. Prod, 24 h to Nov 19:
+    // ~6,600 of ~8,600 disconnects. Ack it like any other stanza (what WhatsApp Web does).
+    // Upstream: WhiskeySockets/Baileys#2858 (no released fix yet).
+    // On the socket the stanza came in on: this.client may already be a newer one by the time an
+    // old socket delivers its last frames, and the ack belongs to the old connection.
+    const socket = this.client;
+    socket.ws.on('CB:status', async (node: any) => {
+      try {
+        await socket.sendMessageAck(node);
+      } catch (error) {
+        this.logger.warn(`status stanza ack failed (${node?.attrs?.id}): ${(error as Error)?.message}`);
+      }
+    });
+
     // Baileys discards NotificationNewsletterJoin as "unhandled" without emitting any event.
     // We intercept the raw mex notification on the same ws event bus Baileys itself uses.
     //
