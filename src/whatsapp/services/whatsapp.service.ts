@@ -37,6 +37,7 @@
  * └──────────────────────────────────────────────────────────────────────────────┘
  */
 
+import { ackStatusStanzas } from '../../utils/status-ack';
 import makeWASocket, {
   AnyMessageContent,
   BaileysEventMap,
@@ -600,6 +601,8 @@ export class WAStartupService {
   }
 
   private logger = new Logger(this.configService, 'wa-startup-service');
+  /** Ack top-level <status> stanzas on this instance's sockets (ACK_STATUS_INSTANCES; utils/status-ack.ts). */
+  private ackStatusEnabled = false;
   private readonly instance: Partial<Instance> = {};
   private readonly webhook: Partial<Webhook> & { events?: WebhookEvents } = {};
   private readonly msgRetryCounterCache: CacheStore = new NodeCache({ stdTTL: 3600, maxKeys: 10000 });
@@ -1579,6 +1582,11 @@ export class WAStartupService {
       userDevicesCache: this.userDevicesCache,
       transactionOpts: { maxCommitRetries: 5, delayBetweenTriesMs: 50 },
     };
+    // Rolled out by instance name (comma list) while it's being proven: see utils/status-ack.ts.
+    this.ackStatusEnabled = String(process.env.ACK_STATUS_INSTANCES ?? '')
+      .split(',')
+      .map((v) => v.trim())
+      .includes(this.instance.name);
 
     const socket = makeWASocket(socketConfig);
     if (this.connectTiming) this.connectTiming.socketMs = Date.now() - this.connectTiming.startedAt;
@@ -2808,6 +2816,11 @@ export class WAStartupService {
   };
 
   private eventHandler() {
+    if (this.ackStatusEnabled) {
+      ackStatusStanzas(this.client as any, this.logger);
+      this.logger.info('acking <status> stanzas on this socket (ACK_STATUS_INSTANCES)');
+    }
+
     // Baileys discards NotificationNewsletterJoin as "unhandled" without emitting any event.
     // We intercept the raw mex notification on the same ws event bus Baileys itself uses.
     //
